@@ -1,0 +1,93 @@
+[project]
+name = "pocket-cc"
+version = "0.1.0"
+description = "Drive your remote Claude Code from Lark — a terminal mirror over Lark IM."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "zhenhua24", email = "wuzhenhua24@gmail.com" }
+]
+requires-python = ">=3.12"
+keywords = ["claude-code", "lark", "feishu", "tmux", "bot", "agent"]
+dependencies = [
+    "click>=8.3.3",
+    "lark-oapi>=1.6.5",
+    "pyte>=0.8.2",
+    "python-dotenv>=1.2.2",
+    "structlog>=25.5.0",
+]
+
+[project.scripts]
+pocket-cc = "pocket_cc.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pocket_cc"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/pocket_cc", "README.md", "LICENSE", "pyproject.toml"]
+exclude = ["ccgram/**", "examples/**", "tests/**", ".pocket-cc/**"]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.1.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.15.13",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["ccgram", ".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "TCH", # type-checking imports
+    "PTH", # use pathlib
+    "RUF",
+]
+ignore = [
+    "E501",    # line length handled by formatter
+    "RUF001",  # ambiguous unicode chars in strings — our content is bilingual zh/en
+    "RUF002",  # ambiguous unicode in docstrings — same as above
+    "RUF003",  # ambiguous unicode in comments — same as above
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B", "SIM"]
+"examples/**" = ["B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+exclude = ["ccgram/", ".venv/", "build/", "dist/"]
+
+[[tool.mypy.overrides]]
+module = ["lark_oapi.*", "pyte.*"]
+ignore_missing_imports = true
+
+# examples/ are exploratory scripts — keep them lintable but don't enforce
+# `--strict` (no `disallow_any_decorated`, etc.) — SDK return types like
+# `resp.data.message_id` are typed as Any in lark-oapi.
+[[tool.mypy.overrides]]
+module = "hello_lark"
+disable_error_code = ["no-any-return"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers"

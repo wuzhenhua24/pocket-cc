@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets / runtime
+.env
+.env.local
+
+# pocket-cc runtime state
+.pocket-cc/
+
+# Reference impl (not part of this project)
+ccgram/
+
+# Type checker / lint cache
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
