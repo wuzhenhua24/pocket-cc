@@ -1,0 +1,288 @@
+"""Claude Code JSONL transcript parser + incremental byte-offset reader.
+
+Source of truth for what Claude is doing — pocket-cc projects this stream into
+Lark cards (see DESIGN.md §2). This module does **structured parsing only**;
+rendering for Lark is the relay layer's job.
+
+Top-level JSONL record types we care about:
+  - `user`       → user text, or a list with `tool_result` blocks
+  - `assistant`  → list of `text` / `thinking` / `tool_use` blocks
+
+Other record types (`system`, `attachment`, `permission-mode`, `last-prompt`,
+`file-history-snapshot`, `summary`) are intentionally skipped at this layer —
+they have no direct UX in the Lark projection. Hook events (Stop /
+StopFailure / Notification) come from a separate `events.jsonl` channel,
+implemented in `claude/monitor.py` (later slice).
+
+Schema reference (empirically verified against Claude Code 2.1.x transcripts):
+
+    # user record (plain text)
+    {"type":"user","uuid":"...","timestamp":"...","message":{
+        "role":"user","content":"hello"}}
+
+    # user record (tool result return)
+    {"type":"user","uuid":"...","timestamp":"...","message":{
+        "role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_...",
+             "content":"...","is_error":false}]}}
+
+    # assistant record
+    {"type":"assistant","uuid":"...","timestamp":"...","message":{
+        "role":"assistant","content":[
+            {"type":"thinking","thinking":"...","signature":"..."},
+            {"type":"text","text":"..."},
+            {"type":"tool_use","id":"toolu_...","name":"Read",
+             "input":{"file_path":"..."}}]}}
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path  # noqa: TC003 — used as dataclass field type, must be eager
+from typing import Any, Final
+
+# JSONL records that carry no Lark-visible content. Skipped silently.
+_IGNORED_RECORD_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "system",
+        "attachment",
+        "permission-mode",
+        "last-prompt",
+        "file-history-snapshot",
+        "summary",
+    }
+)
+
+
+# ---------------------------------------------------------------- event types
+# Independent frozen dataclasses (no inheritance) to keep `slots=True` happy
+# and to let mypy do exhaustive union narrowing via isinstance.
+
+
+@dataclass(frozen=True, slots=True)
+class UserText:
+    uuid: str
+    timestamp: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class AssistantText:
+    uuid: str
+    timestamp: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class AssistantThinking:
+    uuid: str
+    timestamp: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolUse:
+    uuid: str
+    timestamp: str
+    tool_use_id: str
+    tool_name: str
+    tool_input: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResult:
+    uuid: str
+    timestamp: str
+    tool_use_id: str
+    content: str
+    is_error: bool
+
+
+Event = UserText | AssistantText | AssistantThinking | ToolUse | ToolResult
+
+
+# ----------------------------------------------------------------------- API
+
+
+def parse_record(record: dict[str, Any]) -> list[Event]:
+    """Parse one already-decoded JSONL record into 0..n events.
+
+    Unknown record types and malformed messages yield an empty list — this
+    module never raises on bad data, since transcripts are produced by a
+    third-party tool whose schema is allowed to evolve.
+    """
+    record_type = record.get("type")
+    if record_type in _IGNORED_RECORD_TYPES:
+        return []
+
+    uuid = record.get("uuid", "")
+    timestamp = record.get("timestamp", "")
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return []
+
+    if record_type == "user":
+        return _parse_user(uuid, timestamp, message)
+    if record_type == "assistant":
+        return _parse_assistant(uuid, timestamp, message)
+    return []
+
+
+def parse_line(line: str | bytes) -> list[Event]:
+    """Decode one JSONL line and parse it. Empty/invalid lines yield []."""
+    if isinstance(line, bytes):
+        try:
+            line = line.decode("utf-8")
+        except UnicodeDecodeError:
+            return []
+    line = line.strip()
+    if not line:
+        return []
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(record, dict):
+        return []
+    return parse_record(record)
+
+
+# ------------------------------------------------------------- record helpers
+
+
+def _parse_user(uuid: str, timestamp: str, message: dict[str, Any]) -> list[Event]:
+    content = message.get("content")
+    # plain text user message
+    if isinstance(content, str):
+        text = content.strip()
+        return [UserText(uuid=uuid, timestamp=timestamp, text=text)] if text else []
+
+    if not isinstance(content, list):
+        return []
+
+    events: list[Event] = []
+    for block in content:
+        if not isinstance(block, dict):
+            # raw strings inside content[] occasionally appear; treat as user text
+            if isinstance(block, str) and block.strip():
+                events.append(UserText(uuid=uuid, timestamp=timestamp, text=block.strip()))
+            continue
+        block_type = block.get("type")
+        if block_type == "tool_result":
+            events.append(_make_tool_result(uuid, timestamp, block))
+        elif block_type == "text":
+            text = (block.get("text") or "").strip()
+            if text:
+                events.append(UserText(uuid=uuid, timestamp=timestamp, text=text))
+        # other block types in a user turn are unusual; skip
+    return events
+
+
+def _parse_assistant(uuid: str, timestamp: str, message: dict[str, Any]) -> list[Event]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+
+    events: list[Event] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text = (block.get("text") or "").strip()
+            if text:
+                events.append(AssistantText(uuid=uuid, timestamp=timestamp, text=text))
+        elif block_type == "thinking":
+            text = (block.get("thinking") or "").strip()
+            if text:
+                events.append(AssistantThinking(uuid=uuid, timestamp=timestamp, text=text))
+        elif block_type == "tool_use":
+            events.append(_make_tool_use(uuid, timestamp, block))
+    return events
+
+
+def _make_tool_use(uuid: str, timestamp: str, block: dict[str, Any]) -> ToolUse:
+    raw_input = block.get("input")
+    tool_input: dict[str, Any] = raw_input if isinstance(raw_input, dict) else {}
+    return ToolUse(
+        uuid=uuid,
+        timestamp=timestamp,
+        tool_use_id=str(block.get("id", "")),
+        tool_name=str(block.get("name", "")),
+        tool_input=tool_input,
+    )
+
+
+def _make_tool_result(uuid: str, timestamp: str, block: dict[str, Any]) -> ToolResult:
+    raw_content = block.get("content", "")
+    # `content` may be a string or a list of {type:"text", text:"..."} blocks
+    if isinstance(raw_content, list):
+        parts: list[str] = []
+        for sub in raw_content:
+            if isinstance(sub, dict) and sub.get("type") == "text":
+                parts.append(str(sub.get("text", "")))
+            elif isinstance(sub, str):
+                parts.append(sub)
+        content_str = "\n".join(parts)
+    else:
+        content_str = str(raw_content)
+    return ToolResult(
+        uuid=uuid,
+        timestamp=timestamp,
+        tool_use_id=str(block.get("tool_use_id", "")),
+        content=content_str,
+        is_error=bool(block.get("is_error", False)),
+    )
+
+
+# ----------------------------------------------------------- incremental read
+
+
+@dataclass
+class TranscriptReader:
+    """Incremental JSONL reader keyed by byte offset.
+
+    Handles:
+      - Files that don't exist yet (no-op).
+      - Truncation (offset > file size → reset to 0, replay from start).
+      - Partial lines (chunk doesn't end with `\\n` → wait until next call).
+
+    Not thread-safe. Call from one polling task per file.
+    """
+
+    path: Path
+    byte_offset: int = 0
+    # Total events emitted so far — useful for cheap stats / logging.
+    events_emitted: int = field(default=0, init=False)
+
+    def read_new(self) -> list[Event]:
+        if not self.path.exists():
+            return []
+        size = self.path.stat().st_size
+        if size < self.byte_offset:
+            # File was truncated or replaced. Replay from start.
+            self.byte_offset = 0
+        if size == self.byte_offset:
+            return []
+
+        with self.path.open("rb") as fp:
+            fp.seek(self.byte_offset)
+            chunk = fp.read()
+
+        consumed = 0
+        events: list[Event] = []
+        for raw_line in chunk.splitlines(keepends=True):
+            if not raw_line.endswith(b"\n"):
+                # Incomplete line — leave for next call so we don't half-parse.
+                break
+            consumed += len(raw_line)
+            events.extend(parse_line(raw_line))
+        self.byte_offset += consumed
+        self.events_emitted += len(events)
+        return events
+
+    def reset(self) -> None:
+        """Forget read progress. Next `read_new()` re-parses from the top."""
+        self.byte_offset = 0
+        self.events_emitted = 0
