@@ -1,0 +1,66 @@
+# pocket-cc systemd unit (user-level)
+#
+# Install steps:
+#   1. Copy this file:
+#        mkdir -p ~/.config/systemd/user
+#        cp deploy/pocket-cc.service ~/.config/systemd/user/
+#   2. Replace the three {{...}} placeholders below with your real values:
+#        {{USERNAME}}        — your Linux user (output of `whoami`)
+#        {{POCKET_CC_DIR}}   — absolute path to the pocket-cc repo
+#                              (e.g. /home/zhenhua/pocket-cc)
+#        {{UV_BIN}}          — absolute path to `uv` (output of `which uv`,
+#                              typically /home/{{USERNAME}}/.local/bin/uv)
+#   3. Enable lingering so this keeps running after logout:
+#        loginctl enable-linger {{USERNAME}}
+#   4. Reload + enable + start:
+#        systemctl --user daemon-reload
+#        systemctl --user enable pocket-cc
+#        systemctl --user start pocket-cc
+#
+# Logs:  journalctl --user -u pocket-cc -f
+# Status: systemctl --user status pocket-cc
+#
+# DO NOT run this as root — pocket-cc spawns Claude Code with the unit's
+# user, and Claude writes files as that user. Running as root gives Claude
+# root, which is almost never what you want.
+
+[Unit]
+Description=pocket-cc — drive remote Claude Code from Lark
+Documentation=https://github.com/your-org/pocket-cc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{POCKET_CC_DIR}}
+
+# Drop any proxy that doesn't reach Lark. If your network REQUIRES a proxy
+# for outbound, replace this with `Environment=HTTPS_PROXY=...` instead.
+Environment="HTTP_PROXY="
+Environment="HTTPS_PROXY="
+Environment="ALL_PROXY="
+Environment="NO_PROXY=open.feishu.cn,*.feishu.cn,open.larksuite.com,*.larksuite.com"
+
+# Where uv keeps its global state — pin to user home so it stays writable
+# under DynamicUser-less setups.
+Environment="HOME=/home/{{USERNAME}}"
+Environment="PATH=/home/{{USERNAME}}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+# The actual command. `uv run` resolves Python + deps from .venv.
+ExecStart={{UV_BIN}} run pocket-cc run
+
+# Be polite on stop — SIGINT triggers the same Ctrl-C path as interactive use,
+# so pocket-cc seals any in-flight cards into ✅/❌ before exiting.
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+# Restart on crash, back off so we don't hammer Lark if creds are wrong.
+Restart=on-failure
+RestartSec=10s
+
+# Use journald for logs.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

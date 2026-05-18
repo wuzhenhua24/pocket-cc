@@ -91,20 +91,33 @@ uv lock --upgrade                    # 升级锁文件
 
 ### 1. 飞书自建应用申请
 
-1. 打开 [飞书开放平台](https://open.feishu.cn/app)（国际版用 [Lark](https://open.larksuite.com/app)），登录。
-2. 「创建企业自建应用」，填名称（如 `pocket-cc`）、图标、简介。
-3. 在「凭证与基础信息」记下 **App ID** 和 **App Secret**。
-4. 在「权限管理」→「机器人」开启 **添加机器人能力**。
-5. 在「权限管理」→「API 权限」勾选：
-   - `im:message`（发消息）
-   - `im:message.group_at_msg` / `im:message.group_at_msg:readonly`（群聊收 @）
-   - `im:message.p2p_msg` / `im:message.p2p_msg:readonly`（单聊收消息）
-   - `im:message:send_as_bot`（以应用身份发消息）
-6. 在「事件与回调」→「事件订阅」**模式选「长连接」**（不是 webhook），订阅事件：
-   - `im.message.receive_v1`（接收消息）
-   - `card.action.trigger`（卡片按钮回调）
-7. 「版本管理与发布」→ 创建版本 → **申请线上发布**（自建应用需要管理员批准）。
-8. 把机器人拉进一个测试群，或在飞书里搜应用名「pocket-cc」开私聊。
+到 [飞书开放平台](https://open.feishu.cn/app)（国际版 [Lark](https://open.larksuite.com/app)）创建企业自建应用，记下 **App ID** / **App Secret**，然后按下面 6 个开关全配 —— **缺一个 pocket-cc 都会半残**。
+
+| # | 位置 | 配什么 | 不配的后果 |
+|---|---|---|---|
+| 1 | 应用功能 → **机器人** | 启用机器人能力 | bot 完全不可用 |
+| 2 | 权限管理 → **API 权限** | 见下方权限清单 | 收不到 / 发不出消息 |
+| 3 | 事件与回调 → **事件订阅** | 模式 = **长连接**；订阅 `im.message.receive_v1` | 收不到用户消息 |
+| 4 | ⚠️ 事件与回调 → **回调** | 模式 = **长连接**（独立开关！） | 用户点卡片按钮报 **`200340`** |
+| 5 | 版本管理与发布 | 创建版本 + 申请线上发布 | WS 连不上 / 401 |
+| 6 | 飞书 App | 把 bot 拉进测试群，或搜应用名开私聊 | 没法测试 |
+
+**第 4 项是最容易漏的坑**：飞书把「事件订阅」和「卡片回调」当成两套独立配置，必须**各自**切到长连接模式。
+
+#### API 权限清单（第 2 项展开）
+
+最小自用集合（单聊场景）：
+- `im:message:send_as_bot`（**必填** — 以应用身份发消息）
+- `im:message`（消息读写伞形权限）
+- `im:message.p2p_msg` + `im:message.p2p_msg:readonly`（接收单聊消息）
+
+群聊场景再加：
+- `im:message.group_at_msg` + `im:message.group_at_msg:readonly`（群聊 `@bot` 消息）
+
+M2-D 文件回传时再加：
+- `im:resource`（上传/下载图片文件）
+
+完整、详细带「哪个功能依赖哪个权限点」的对照见 [`deploy/README.md` §5](./deploy/README.md#5-在飞书后台配应用)。
 
 ### 2. 配置本地环境
 
@@ -130,9 +143,18 @@ uv run python examples/hello_lark.py
 
 ### 常见问题
 
-- **WS 连不上 / 401**：检查 APP_ID/SECRET 是否对；应用是否已发布；长连接模式是否开启。
-- **收不到消息**：检查 API 权限是否勾对、事件订阅是否选了 `im.message.receive_v1`、bot 是否被拉进群（群聊场景）。
-- **PATCH 失败**：99991668 是消息不存在；230001 是没权限改这条消息；230002 是 24h 之外不可编辑（M0 阶段不会触发）。
+- **WS 连不上 / 401**：检查 APP_ID/SECRET 是否对；应用是否已发布；事件订阅模式是否开了长连接。
+- **收不到消息**：API 权限是否勾对；事件订阅是否选了 `im.message.receive_v1`；bot 是否被拉进群（群聊场景）。
+- **点卡片按钮报 200340**：上面第 4 项「卡片回调」没切到长连接 —— 它跟事件订阅是**独立开关**。
+- **PATCH 失败**：99991668 = 消息不存在；230001 = 没权限改这条消息；230002 = 24h 之外不可编辑。
+
+---
+
+## 生产部署（Linux）
+
+详见 [`deploy/README.md`](./deploy/README.md) — 完整的服务器部署清单（装依赖、配置 .env、装 hooks、systemd 常驻、故障排查、升级 / 卸载）。
+
+附带的 [`deploy/pocket-cc.service`](./deploy/pocket-cc.service) 是开箱即用的 systemd user unit 模板。
 
 ---
 
@@ -145,6 +167,7 @@ pocket-cc/
 ├── .python-version         # 3.12
 ├── DESIGN.md               # 设计文档
 ├── README.md
+├── deploy/                 # Linux 部署文档 + systemd unit 模板
 ├── examples/
 │   ├── hello_lark.py       # 飞书 API 烟测
 │   ├── hello_tmux.py       # tmux 烟测
