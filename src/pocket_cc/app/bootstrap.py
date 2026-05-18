@@ -36,6 +36,7 @@ from pocket_cc.relay.card_renderer import render_card
 from pocket_cc.relay.events_router import EventsPoller, HookEventsDispatcher
 from pocket_cc.relay.input import InputRouter
 from pocket_cc.relay.output import TranscriptPoller
+from pocket_cc.relay.pane_watcher import PaneWatcher
 from pocket_cc.tmux import TmuxManager
 
 if TYPE_CHECKING:
@@ -85,6 +86,17 @@ class Pocketcc:
             interval_s=config.events_poll_s,
         )
 
+        # M2-C: pane watcher detects Claude TUI permission prompts by reading
+        # the tmux pane (since they're not in the transcript). On transition
+        # (set / change / clear) it re-renders the card so the user sees a
+        # ❓ waiting card with option buttons.
+        self._pane_watcher = PaneWatcher(
+            registry=self._registry,
+            tmux=self._tmux,
+            on_change=self._handle_pane_state_change,
+            interval_s=config.pane_poll_s,
+        )
+
         self._loop.on_message(self._router.handle_message)
         self._loop.on_card_action(self._router.handle_card_action)
 
@@ -102,6 +114,7 @@ class Pocketcc:
             )
         self._poller.start()
         self._events_poller.start()
+        self._pane_watcher.start()
         logger.info(
             "pocket-cc starting",
             extra={
@@ -117,6 +130,7 @@ class Pocketcc:
 
     def shutdown(self) -> None:
         """Stop the pollers and seal every still-running turn card."""
+        self._pane_watcher.stop()
         self._events_poller.stop()
         self._poller.stop()
         for binding in self._registry.all():
@@ -141,13 +155,41 @@ class Pocketcc:
 
         Skips silently when there is no active turn (e.g. Claude emitted
         startup/clear-prompt records while no user message is pending).
+        Honors `turn.waiting_for` (set by PaneWatcher) so a transcript tick
+        arriving mid-prompt doesn't accidentally flip the card back to
+        running.
         """
         turn = binding.current_turn
         if turn is None:
             return
         for ev in events:
             turn.accumulator.ingest(ev)
-        snapshot = turn.accumulator.snapshot(state="running")
+        if turn.waiting_for is not None:
+            snapshot = turn.accumulator.snapshot(
+                state="waiting", waiting_for=turn.waiting_for
+            )
+        else:
+            snapshot = turn.accumulator.snapshot(state="running")
+        turn.card_stream.update(render_card(snapshot))
+
+    # ----------------------------------------------------- pane watcher (M2-C)
+
+    def _handle_pane_state_change(self, binding: ChatBinding) -> None:
+        """PaneWatcher detected a waiting_for transition (set/changed/cleared).
+
+        Re-render the card to reflect the new state. CardStream's throttle
+        + hash dedupe handles the case where the rendered content didn't
+        actually change.
+        """
+        turn = binding.current_turn
+        if turn is None:
+            return
+        if turn.waiting_for is not None:
+            snapshot = turn.accumulator.snapshot(
+                state="waiting", waiting_for=turn.waiting_for
+            )
+        else:
+            snapshot = turn.accumulator.snapshot(state="running")
         turn.card_stream.update(render_card(snapshot))
 
     # ---------------------------------------------------- hook event callbacks

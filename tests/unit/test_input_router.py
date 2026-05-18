@@ -15,6 +15,12 @@ from pocket_cc.app.persistence import Registry
 from pocket_cc.lark.client import FakeLarkClient
 from pocket_cc.lark.event_loop import CardAction, IncomingMessage
 from pocket_cc.relay.input import InputRouter
+from pocket_cc.relay.waiting import (
+    KeysResponse,
+    TextResponse,
+    WaitingFor,
+    WaitingOption,
+)
 from pocket_cc.tmux import TmuxError, WindowInfo
 
 # ----------------------------------------------------------------- fixtures
@@ -80,6 +86,7 @@ def _make_config(*, workspace: Path, whitelist: frozenset[str] = frozenset()) ->
         patch_interval_s=10.0,  # so the bg stream thread doesn't actually patch during tests
         transcript_poll_s=0.5,
         events_poll_s=0.5,
+        pane_poll_s=1.0,
     )
 
 
@@ -419,3 +426,229 @@ def test_card_action_unknown_card_id_is_no_op(tmp_path: Path) -> None:
     )
 
     assert tmux.calls == []
+
+
+# ============================================================== waiting (M2-0)
+
+
+def _set_waiting_on_active_turn(
+    registry: Registry, chat_id: str, options: tuple[WaitingOption, ...] = ()
+) -> WaitingFor:
+    """Pin a WaitingFor onto the active turn. Used by waiting-state tests."""
+    binding = registry.get(chat_id)
+    assert binding is not None
+    assert binding.current_turn is not None
+    if not options:
+        options = (
+            WaitingOption(label="Yes", response=TextResponse(text="1")),
+            WaitingOption(label="No", response=TextResponse(text="2")),
+        )
+    waiting = WaitingFor(
+        source="permission",
+        question="Do you want to proceed?",
+        options=options,
+    )
+    binding.current_turn.waiting_for = waiting
+    return waiting
+
+
+def test_message_during_waiting_does_not_open_new_card(tmp_path: Path) -> None:
+    """Continuation path: a Lark text reply while waiting must reuse the card."""
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    # First message: opens a turn and posts a card.
+    router.handle_message(_message(text="please run X"))
+    cards_after_open = sum(1 for s in lark.sent if s.kind == "card")
+    assert cards_after_open == 1
+
+    # Pin a waiting state on the active turn (simulating M2-A/C detection).
+    _set_waiting_on_active_turn(registry, "oc_chat1")
+
+    # User replies in Lark — should be treated as continuation, no new card.
+    router.handle_message(_message(text="1", message_id="om_reply"))
+
+    cards_after_reply = sum(1 for s in lark.sent if s.kind == "card")
+    assert cards_after_reply == 1, "no new card should be sent during waiting continuation"
+
+
+def test_message_during_waiting_clears_waiting_for_and_sends_text(tmp_path: Path) -> None:
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message(text="please run X"))
+    _set_waiting_on_active_turn(registry, "oc_chat1")
+
+    router.handle_message(_message(text="1", message_id="om_reply"))
+
+    binding = registry.get("oc_chat1")
+    assert binding is not None
+    assert binding.current_turn is not None
+    assert binding.current_turn.waiting_for is None
+
+    # The last send_text should be the reply text, going to the bound window.
+    send_texts = [c for c in tmux.calls if c.method == "send_text"]
+    assert send_texts[-1].kwargs == {"window_id": "@1", "text": "1"}
+
+
+def test_message_after_continuation_opens_new_turn_again(tmp_path: Path) -> None:
+    """Once continuation clears waiting_for, the next reply opens a new turn."""
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message(text="please run X"))
+    _set_waiting_on_active_turn(registry, "oc_chat1")
+    router.handle_message(_message(text="1", message_id="om_reply"))
+    # Continuation done → waiting cleared. A *new* message now should open
+    # a new turn (= new card).
+    router.handle_message(_message(text="next request", message_id="om_next"))
+    cards = [s for s in lark.sent if s.kind == "card"]
+    assert len(cards) == 2  # original + new turn
+
+
+def test_card_action_waiting_response_text_dispatches_send_text(tmp_path: Path) -> None:
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+    _set_waiting_on_active_turn(registry, "oc_chat1")
+
+    router.handle_card_action(
+        CardAction(
+            message_id=card_id,
+            chat_id="oc_chat1",
+            sender_open_id="ou_user1",
+            token="tok_w1",
+            tag="button",
+            value={"action": "waiting_response", "index": 1},
+        )
+    )
+
+    send_texts = [c for c in tmux.calls if c.method == "send_text"]
+    # Option index 1 → response TextResponse(text="2")
+    assert send_texts[-1].kwargs["text"] == "2"
+    binding = registry.get("oc_chat1")
+    assert binding is not None
+    assert binding.current_turn is not None
+    assert binding.current_turn.waiting_for is None
+
+
+def test_card_action_waiting_response_keys_dispatches_send_key_sequence(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+    options = (WaitingOption(label="Top", response=KeysResponse(keys=("Up", "Up", "Enter"))),)
+    _set_waiting_on_active_turn(registry, "oc_chat1", options=options)
+
+    router.handle_card_action(
+        CardAction(
+            message_id=card_id,
+            chat_id="oc_chat1",
+            sender_open_id="ou_user1",
+            token="tok_w2",
+            tag="button",
+            value={"action": "waiting_response", "index": 0},
+        )
+    )
+
+    keys = [c.kwargs["key"] for c in tmux.calls if c.method == "send_key"]
+    # The 3 keys we asked for, in order. send_text was not used.
+    assert keys[-3:] == ["Up", "Up", "Enter"]
+    assert all(c.method != "send_text" or c.kwargs["text"] != "Top" for c in tmux.calls)
+
+
+def test_card_action_waiting_response_index_out_of_range_is_noop(tmp_path: Path) -> None:
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+    _set_waiting_on_active_turn(registry, "oc_chat1")
+    tmux_calls_before = len(tmux.calls)
+
+    router.handle_card_action(
+        CardAction(
+            message_id=card_id,
+            chat_id="oc_chat1",
+            sender_open_id="ou_user1",
+            token="tok_oor",
+            tag="button",
+            value={"action": "waiting_response", "index": 99},
+        )
+    )
+
+    # No new tmux activity (no send_text, no send_key)
+    assert len(tmux.calls) == tmux_calls_before
+    # Waiting state preserved (we didn't clear it)
+    binding = registry.get("oc_chat1")
+    assert binding is not None
+    assert binding.current_turn is not None
+    assert binding.current_turn.waiting_for is not None
+
+
+def test_card_action_waiting_response_no_active_waiting_is_noop(tmp_path: Path) -> None:
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+    tmux_calls_before = len(tmux.calls)
+
+    # No waiting_for set — clicking the waiting button is a no-op
+    router.handle_card_action(
+        CardAction(
+            message_id=card_id,
+            chat_id="oc_chat1",
+            sender_open_id="ou_user1",
+            token="tok_no_w",
+            tag="button",
+            value={"action": "waiting_response", "index": 0},
+        )
+    )
+
+    assert len(tmux.calls) == tmux_calls_before
+
+
+def test_card_action_waiting_response_bad_index_type_is_noop(tmp_path: Path) -> None:
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+    _set_waiting_on_active_turn(registry, "oc_chat1")
+    tmux_calls_before = len(tmux.calls)
+
+    router.handle_card_action(
+        CardAction(
+            message_id=card_id,
+            chat_id="oc_chat1",
+            sender_open_id="ou_user1",
+            token="tok_bad",
+            tag="button",
+            value={"action": "waiting_response", "index": "not-an-int"},
+        )
+    )
+
+    assert len(tmux.calls) == tmux_calls_before

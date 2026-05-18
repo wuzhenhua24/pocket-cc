@@ -19,7 +19,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections import OrderedDict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pocket_cc.app.persistence import ChatBinding, TurnState
 from pocket_cc.claude.session_index import snapshot_existing_transcripts
@@ -27,6 +27,7 @@ from pocket_cc.lark.card import build_text_card
 from pocket_cc.lark.client import LarkApiError
 from pocket_cc.relay.card_renderer import TurnAccumulator, render_card
 from pocket_cc.relay.card_stream import CardStream
+from pocket_cc.relay.waiting import KeysResponse, TextResponse
 from pocket_cc.tmux import TmuxError
 
 if TYPE_CHECKING:
@@ -94,10 +95,20 @@ class InputRouter:
             if binding is None:
                 return
 
+        # **Continuation path** (M2-0): when the current turn is waiting on a
+        # user response (Permission / AskUserQuestion prompt detected by
+        # M2-A or M2-C), text from Lark is a *reply to that prompt*, not a
+        # new request. Don't open a new turn — keep the current card and
+        # send the text through. The waiting_for is cleared optimistically;
+        # the detector will re-set it if Claude actually re-prompts.
+        if binding.current_turn is not None and binding.current_turn.waiting_for is not None:
+            self._continue_waiting_turn(binding, msg.text)
+            return
+
         # Closing the previous turn is purely a UX seal — the *card* is
         # marked done, but Claude in the tmux pane is still running if it
-        # hasn't finished. M1-E will wire the Stop hook to drive this
-        # transition from the real session-end signal instead.
+        # hasn't finished. M1-E wires the Stop hook to drive this transition
+        # from the real session-end signal instead.
         if binding.current_turn is not None:
             self._close_turn(binding, state="done")
 
@@ -127,6 +138,8 @@ class InputRouter:
                     self._tmux.send_key(binding.window.window_id, key)
             elif cmd == "show_pane":
                 self._dump_pane(binding)
+            elif cmd == "waiting_response":
+                self._handle_waiting_response(binding, action.value)
             else:
                 logger.info("unknown card action", extra={"value": action.value})
         except TmuxError:
@@ -240,6 +253,61 @@ class InputRouter:
         except Exception:
             logger.warning("closing card stream failed", exc_info=True)
         binding.current_turn = None
+
+    def _continue_waiting_turn(self, binding: ChatBinding, text: str) -> None:
+        """User's text is a reply to Claude's waiting prompt.
+
+        Don't open a new turn — keep the same card. Clear ``waiting_for``
+        optimistically so the next render shows running state again; if
+        Claude re-prompts, the detector (M2-A/C) will set it back.
+        """
+        turn = binding.current_turn
+        if turn is None:  # defensive; caller checked
+            return
+        with binding.lock:
+            turn.waiting_for = None
+        try:
+            self._tmux.send_text(binding.window.window_id, text)
+        except TmuxError as e:
+            logger.exception("tmux send_text failed during continuation")
+            self._close_turn(binding, state="failed", error=str(e))
+
+    def _handle_waiting_response(self, binding: ChatBinding, value: dict[str, Any]) -> None:
+        """User tapped an option button on a waiting card."""
+        turn = binding.current_turn
+        if turn is None or turn.waiting_for is None:
+            logger.info(
+                "waiting_response on a turn without active waiting state",
+                extra={"chat_id": binding.chat_id},
+            )
+            return
+        try:
+            index = int(value.get("index", -1))
+        except (TypeError, ValueError):
+            logger.info("waiting_response with non-int index", extra={"value": value})
+            return
+        options = turn.waiting_for.options
+        if not (0 <= index < len(options)):
+            logger.info(
+                "waiting_response index out of range",
+                extra={"index": index, "n_options": len(options)},
+            )
+            return
+        option = options[index]
+        # Clear waiting state before sending — the detector will re-set it
+        # if needed. Holds the lock briefly.
+        with binding.lock:
+            turn.waiting_for = None
+        try:
+            response = option.response
+            if isinstance(response, TextResponse):
+                self._tmux.send_text(binding.window.window_id, response.text)
+            elif isinstance(response, KeysResponse):
+                for key in response.keys:
+                    self._tmux.send_key(binding.window.window_id, key)
+        except TmuxError as e:
+            logger.exception("tmux failure dispatching waiting_response")
+            self._close_turn(binding, state="failed", error=str(e))
 
     def _dump_pane(self, binding: ChatBinding) -> None:
         try:

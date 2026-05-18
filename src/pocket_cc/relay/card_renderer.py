@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import PurePath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pocket_cc.claude.transcript import (
     AssistantText,
@@ -28,10 +28,14 @@ from pocket_cc.claude.transcript import (
 )
 from pocket_cc.lark.card import (
     DEFAULT_RUNNING_ACTIONS,
+    CardButton,
     CardState,
     ExpandableSection,
     build_status_card,
 )
+
+if TYPE_CHECKING:
+    from pocket_cc.relay.waiting import WaitingFor
 
 # Lark cards larger than ~30KB get rejected; the body field is the long pole.
 # We trim aggressively because the user can use the [📜 内容] button to dump
@@ -39,11 +43,23 @@ from pocket_cc.lark.card import (
 _BODY_MAX_CHARS = 3000
 _THINKING_MAX_CHARS = 2000
 _TITLE_MAX_CHARS = 60
+# Lark renders action rows OK up to ~6 buttons on mobile; we reserve 2 slots
+# for ⏹ 中断 / ⎋ Esc and dedicate up to 4 to waiting-prompt options. Options
+# beyond this still appear in the body text (numbered), and the user can
+# reply with the number as free-form text.
+_WAITING_OPTION_BUTTONS_CAP = 4
+_WAITING_BUTTON_LABEL_MAX = 24
 
 
 @dataclass(frozen=True, slots=True)
 class TurnSnapshot:
-    """Render-ready summary of a turn. Pure data, no Lark concepts."""
+    """Render-ready summary of a turn. Pure data, no Lark concepts.
+
+    ``waiting_for`` is set when Claude is blocked on a user response
+    (Permission / AskUserQuestion / Plan). When present, ``state`` should
+    be "waiting" and :func:`render_card` produces an options card instead
+    of the normal running/done/failed layout.
+    """
 
     user_prompt: str
     assistant_text: str
@@ -51,6 +67,7 @@ class TurnSnapshot:
     thinking: str
     state: CardState
     error: str = ""
+    waiting_for: WaitingFor | None = None
 
 
 @dataclass
@@ -95,7 +112,12 @@ class TurnAccumulator:
             # branch here so future code can fold short results into detail.
             return
 
-    def snapshot(self, state: CardState = "running", error: str = "") -> TurnSnapshot:
+    def snapshot(
+        self,
+        state: CardState = "running",
+        error: str = "",
+        waiting_for: WaitingFor | None = None,
+    ) -> TurnSnapshot:
         return TurnSnapshot(
             user_prompt=self.user_prompt,
             assistant_text="\n\n".join(p for p in self._assistant_text_parts if p),
@@ -103,6 +125,7 @@ class TurnAccumulator:
             thinking="\n\n".join(p for p in self._thinking_parts if p),
             state=state,
             error=error,
+            waiting_for=waiting_for,
         )
 
 
@@ -116,8 +139,11 @@ def render_card(snapshot: TurnSnapshot) -> dict[str, Any]:
       - running: blue header, action row visible, "(运行中…)" placeholder if empty
       - done:    green header, no action row (turn is over)
       - failed:  red header, error in body
-      - waiting: orange header (reserved for future plan-mode / ask-user UX)
+      - waiting: orange header, prompt + option buttons (M2-0)
     """
+    if snapshot.waiting_for is not None:
+        return _render_waiting_card(snapshot, snapshot.waiting_for)
+
     title = _shorten(snapshot.user_prompt, _TITLE_MAX_CHARS) or "Claude"
     body = _render_body(snapshot)
     detail = _render_detail(snapshot)
@@ -127,6 +153,28 @@ def render_card(snapshot: TurnSnapshot) -> dict[str, Any]:
         title=title,
         body=body,
         state=snapshot.state,
+        detail=detail,
+        actions=actions,
+    )
+
+
+def _render_waiting_card(snapshot: TurnSnapshot, waiting: WaitingFor) -> dict[str, Any]:
+    """Render a ❓ waiting card with question + option buttons.
+
+    Options beyond `_WAITING_OPTION_BUTTONS_CAP` are still listed (numbered)
+    in the body so the user can reply with that number as free-form text —
+    this preserves the "everything passes through to Claude" contract for
+    long option lists where buttons would overflow.
+    """
+    title = _shorten(snapshot.user_prompt, _TITLE_MAX_CHARS) or "Claude"
+    body = _render_waiting_body(snapshot, waiting)
+    detail = _render_detail(snapshot)
+    actions = _render_waiting_actions(waiting)
+
+    return build_status_card(
+        title=title,
+        body=body,
+        state="waiting",
         detail=detail,
         actions=actions,
     )
@@ -160,6 +208,47 @@ def format_tool_call(name: str, input_data: dict[str, Any]) -> str:
 
 
 # -------------------------------------------------------------------- helpers
+
+
+def _render_waiting_body(snapshot: TurnSnapshot, waiting: WaitingFor) -> str:
+    sections: list[str] = []
+    if waiting.question:
+        sections.append(f"**{waiting.question}**")
+    if waiting.options:
+        bullets = []
+        for i, opt in enumerate(waiting.options, start=1):
+            line = f"**{i}.** {opt.label}"
+            if opt.description:
+                line += f" — {opt.description}"
+            bullets.append(line)
+        sections.append("\n".join(bullets))
+    # Show recent assistant text if any (gives context for what Claude was
+    # doing when the prompt fired).
+    if snapshot.assistant_text:
+        sections.append(snapshot.assistant_text)
+    body = "\n\n".join(sections) or "_（Claude 在等你响应）_"
+    if len(body) > _BODY_MAX_CHARS:
+        body = "…(已截断早期内容)…\n\n" + body[-(_BODY_MAX_CHARS - 30) :]
+    return body
+
+
+def _render_waiting_actions(waiting: WaitingFor) -> list[CardButton]:
+    """Buttons for a waiting card: up to 4 option buttons + ⏹ 中断 + ⎋ Esc."""
+    actions: list[CardButton] = []
+    for i, opt in enumerate(waiting.options[:_WAITING_OPTION_BUTTONS_CAP]):
+        label = f"{i + 1}. {opt.label}"
+        if len(label) > _WAITING_BUTTON_LABEL_MAX:
+            label = label[: _WAITING_BUTTON_LABEL_MAX - 1] + "…"
+        actions.append(
+            CardButton(
+                text=label,
+                value={"action": "waiting_response", "index": i},
+                style="primary" if i == 0 else "default",
+            )
+        )
+    actions.append(CardButton(text="⏹ 中断", value={"action": "cancel"}, style="danger"))
+    actions.append(CardButton(text="⎋ Esc", value={"action": "key", "key": "Escape"}))
+    return actions
 
 
 def _render_body(snapshot: TurnSnapshot) -> str:

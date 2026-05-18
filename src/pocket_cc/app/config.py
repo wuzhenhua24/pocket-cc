@@ -27,6 +27,7 @@ _DEFAULT_TMUX_SESSION = "pocket-cc"
 _DEFAULT_PATCH_INTERVAL_S = 1.5
 _DEFAULT_TRANSCRIPT_POLL_S = 0.5
 _DEFAULT_EVENTS_POLL_S = 0.5
+_DEFAULT_PANE_POLL_S = 1.0
 _DEFAULT_LARK_DOMAIN = "https://open.feishu.cn"
 
 
@@ -65,6 +66,7 @@ class Config:
     patch_interval_s: float
     transcript_poll_s: float
     events_poll_s: float
+    pane_poll_s: float
     claude_projects_dir: Path = field(default_factory=lambda: Path.home() / ".claude" / "projects")
 
     @property
@@ -111,6 +113,7 @@ def load(env_path: str | os.PathLike[str] | None = ".env") -> Config:
         events_poll_s=_parse_float(
             os.environ.get("POCKET_CC_EVENTS_POLL_S"), _DEFAULT_EVENTS_POLL_S
         ),
+        pane_poll_s=_parse_float(os.environ.get("POCKET_CC_PANE_POLL_S"), _DEFAULT_PANE_POLL_S),
     )
 
 

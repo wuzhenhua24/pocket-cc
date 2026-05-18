@@ -153,3 +153,152 @@ def test_render_card_title_shortened_for_long_prompt() -> None:
     title = card["header"]["title"]["content"]
     # emoji + space + title; title body itself bounded to ~60 chars
     assert len(title) < 80
+
+
+# ============================================================== waiting (M2-0)
+
+# Local imports kept inside the test section so the existing tests above remain
+# unaffected by any refactor of the waiting module location.
+
+from pocket_cc.relay.waiting import (  # noqa: E402 — keep waiting tests grouped
+    KeysResponse,
+    TextResponse,
+    WaitingFor,
+    WaitingOption,
+)
+
+
+def _waiting(question: str = "Pick one", n: int = 2) -> WaitingFor:
+    return WaitingFor(
+        source="permission",
+        question=question,
+        options=tuple(
+            WaitingOption(label=f"option-{i}", response=TextResponse(text=str(i + 1)))
+            for i in range(n)
+        ),
+    )
+
+
+def test_waiting_card_uses_orange_header_and_question_in_body() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "run dangerous"
+    card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(question="Proceed?")))
+    assert card["header"]["template"] == "orange"
+    assert "❓" in card["header"]["title"]["content"]
+    body = card["elements"][0]["content"]
+    assert "Proceed?" in body
+
+
+def test_waiting_card_lists_options_numbered_in_body() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(n=3)))
+    body = card["elements"][0]["content"]
+    assert "**1.** option-0" in body
+    assert "**2.** option-1" in body
+    assert "**3.** option-2" in body
+
+
+def test_waiting_card_option_descriptions_appear() -> None:
+    waiting = WaitingFor(
+        source="ask_user_question",
+        question="Network?",
+        options=(
+            WaitingOption(
+                label="Public",
+                response=TextResponse(text="1"),
+                description="Outbound to feishu.cn OK",
+            ),
+        ),
+    )
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    card = render_card(acc.snapshot(state="waiting", waiting_for=waiting))
+    body = card["elements"][0]["content"]
+    assert "Outbound to feishu.cn OK" in body
+
+
+def test_waiting_card_buttons_cap_options_at_4() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(n=10)))
+    action_row = card["elements"][-1]
+    assert action_row["tag"] == "action"
+    buttons = action_row["actions"]
+    # 4 option buttons + cancel + esc
+    assert len(buttons) == 6
+    # First 4 are options
+    option_btns = buttons[:4]
+    for i, btn in enumerate(option_btns):
+        assert btn["value"]["action"] == "waiting_response"
+        assert btn["value"]["index"] == i
+
+
+def test_waiting_card_first_option_is_primary() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(n=3)))
+    buttons = card["elements"][-1]["actions"]
+    assert buttons[0]["type"] == "primary"
+    assert buttons[1]["type"] == "default"
+    assert buttons[2]["type"] == "default"
+
+
+def test_waiting_card_always_has_cancel_and_esc() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(n=1)))
+    buttons = card["elements"][-1]["actions"]
+    cancel = [b for b in buttons if b["value"].get("action") == "cancel"]
+    esc = [b for b in buttons if b["value"].get("action") == "key"]
+    assert len(cancel) == 1
+    assert cancel[0]["type"] == "danger"
+    assert len(esc) == 1
+    assert esc[0]["value"]["key"] == "Escape"
+
+
+def test_waiting_card_truncates_long_button_label() -> None:
+    long_label = "X" * 200
+    waiting = WaitingFor(
+        source="permission",
+        question="q",
+        options=(WaitingOption(label=long_label, response=TextResponse(text="1")),),
+    )
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    card = render_card(acc.snapshot(state="waiting", waiting_for=waiting))
+    first_button = card["elements"][-1]["actions"][0]
+    assert len(first_button["text"]["content"]) <= 24
+
+
+def test_waiting_card_no_options_shows_placeholder_body() -> None:
+    waiting = WaitingFor(source="permission", question="")
+    acc = TurnAccumulator()
+    card = render_card(acc.snapshot(state="waiting", waiting_for=waiting))
+    body = card["elements"][0]["content"]
+    assert body == "_（Claude 在等你响应）_"
+
+
+def test_waiting_card_keeps_assistant_text_context() -> None:
+    """If Claude said something before the prompt fired, surface it."""
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="I'm about to run rm"))
+    card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(n=2)))
+    body = card["elements"][0]["content"]
+    assert "I'm about to run rm" in body
+
+
+def test_waiting_option_can_carry_keys_response() -> None:
+    """Renderer doesn't care about the response shape (that's for input.py)."""
+    waiting = WaitingFor(
+        source="ask_user_question",
+        question="Pick row",
+        options=(WaitingOption(label="Top", response=KeysResponse(keys=("Up", "Enter"))),),
+    )
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    card = render_card(acc.snapshot(state="waiting", waiting_for=waiting))
+    # Just verify it renders and includes the option label
+    buttons = card["elements"][-1]["actions"]
+    assert "Top" in buttons[0]["text"]["content"]

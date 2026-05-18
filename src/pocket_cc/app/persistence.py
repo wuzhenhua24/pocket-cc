@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from pocket_cc.claude.transcript import TranscriptReader
     from pocket_cc.relay.card_renderer import TurnAccumulator
     from pocket_cc.relay.card_stream import CardStream
+    from pocket_cc.relay.waiting import WaitingFor
     from pocket_cc.tmux import WindowInfo
 
 
@@ -43,11 +44,20 @@ class TurnState:
     Spans from the moment the user sends a message until either:
       - the next user message arrives (we close this turn, start a new one), or
       - shutdown.
+
+    The `waiting_for` field (None by default) flips this turn into a
+    "waiting on user response" state when Claude TUI shows a prompt
+    (Permission / AskUserQuestion / Plan). While non-None, an incoming Lark
+    text message is treated as a *continuation* of this turn (= user
+    answering the prompt) rather than a new turn. Cleared back to None
+    when the user responds, or when the detector notices the prompt is
+    gone. See `relay.waiting`.
     """
 
     card_message_id: str
     card_stream: CardStream
     accumulator: TurnAccumulator
+    waiting_for: WaitingFor | None = None
 
 
 @dataclass

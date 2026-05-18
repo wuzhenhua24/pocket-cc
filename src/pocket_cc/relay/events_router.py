@@ -134,10 +134,7 @@ class HookEventsDispatcher:
 
     def _find_binding_by_transcript(self, transcript_path: Path) -> ChatBinding | None:
         for binding in self._registry.all():
-            if (
-                binding.transcript_path is not None
-                and binding.transcript_path == transcript_path
-            ):
+            if binding.transcript_path is not None and binding.transcript_path == transcript_path:
                 if transcript_path in binding.excluded_transcripts:
                     # Defensive: shouldn't happen given the snapshot logic,
                     # but if it ever does, refuse to act.
@@ -160,9 +157,7 @@ class EventsPoller:
         self._dispatcher = dispatcher
         self._interval_s = interval_s
         self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run, name="events-poller", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, name="events-poller", daemon=True)
         self._started = False
 
     def start(self) -> None:
