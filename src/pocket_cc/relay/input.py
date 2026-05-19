@@ -266,6 +266,9 @@ class InputRouter:
             return
         with binding.lock:
             turn.waiting_for = None
+        # Flip card back to running *now* — otherwise the user sees the
+        # waiting buttons stuck on screen until the next poll tick.
+        self._rerender_running(turn)
         try:
             self._tmux.send_text(binding.window.window_id, text)
         except TmuxError as e:
@@ -298,6 +301,11 @@ class InputRouter:
         # if needed. Holds the lock briefly.
         with binding.lock:
             turn.waiting_for = None
+        # Flip card back to running *now* (before the tmux send, even),
+        # so the user sees the buttons disappear immediately when they tap.
+        # Otherwise the card sits in waiting state until the next poll tick
+        # — a noticeable lag in real-world testing.
+        self._rerender_running(turn)
         try:
             response = option.response
             if isinstance(response, TextResponse):
@@ -308,6 +316,21 @@ class InputRouter:
         except TmuxError as e:
             logger.exception("tmux failure dispatching waiting_response")
             self._close_turn(binding, state="failed", error=str(e))
+
+    def _rerender_running(self, turn: TurnState) -> None:
+        """Push an immediate running-state re-render of the current accumulator.
+
+        Used right after a user responds to a waiting prompt (button or
+        free-form text) so the card flips out of waiting state without
+        waiting for the next transcript-poller / pane-watcher tick.
+        CardStream's throttle still applies (~1.5s max), but it's much
+        better than waiting for two-stage polling to converge.
+        """
+        try:
+            snapshot = turn.accumulator.snapshot(state="running")
+            turn.card_stream.update(render_card(snapshot))
+        except Exception:
+            logger.warning("immediate card re-render failed", exc_info=True)
 
     def _dump_pane(self, binding: ChatBinding) -> None:
         try:
