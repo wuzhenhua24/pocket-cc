@@ -150,6 +150,52 @@ uv run python examples/hello_lark.py
 
 ---
 
+## 在飞书侧用 pocket-cc
+
+### 卡片头部颜色 = Claude 状态
+
+| 颜色 + emoji | 状态 | 含义 |
+|---|---|---|
+| 🟦 ⏳ | running | Claude 正在工作；内容在持续刷新 |
+| 🟩 ✅ | done | Claude 完成；卡片封板（Stop hook 触发） |
+| 🟥 ❌ | failed | Claude 异常结束（StopFailure / pocket-cc 内部错误） |
+| 🟧 ❓ | waiting | Claude 在等你回应（permission prompt / AskUserQuestion 等） |
+
+### Running 状态卡片底部 4 个按钮
+
+每个按钮对应一个 tmux 按键序列发给真实的 Claude TUI：
+
+| 按钮 | 实际发的 tmux 键 | 适用场景 |
+|---|---|---|
+| **⏹ 中断** | `C-c` + 200ms + `Escape`（**双连**） | **彻底停止当前任务**：break task → 退出 Claude 的「Interrupted · 你想改成什么？」redirect prompt → 清空输入框。**下次发新消息时不会拼接残留** |
+| **⎋ Esc** | `Escape`（单发） | **温和取消**：只退当前 prompt，**保留输入框文本**让你修改后重发（Claude TUI 默认行为）。如果想从飞书侧"修改后重发"用这个 |
+| **⇧⭾ Mode** | `BTab`（Shift-Tab） | 切换 Claude 权限模式（plan / acceptEdits / bypassPermissions），跟终端按 Shift-Tab 一样的效果 |
+| **📜 内容** | （不发键）抓 `tmux capture-pane` 文本 → 飞书发新一条卡片 | 想看 Claude TUI 当前完整的屏幕内容（pocket-cc 投影漏的、ANSI 渲染细节等） |
+
+### Waiting 状态卡片：选项按钮
+
+当 Claude 弹出 permission prompt 或问选择题时，卡片变 ❓ 橙色，按钮换成：
+
+| 按钮 | 发给 Claude | 说明 |
+|---|---|---|
+| **1. Yes / 2. No / …** | `"1"` / `"2"` / …（数字 + Enter） | 用 Claude TUI 的数字快捷键直接选。**前 4 个选项**有按钮；选项 ≥ 5 时在卡片 body 列出，飞书发数字也能响应（透传） |
+| **⏹ 中断** | C-c + Esc 双连 | 同 running 状态 |
+| **⎋ Esc** | Escape | **取消** prompt，回到 Claude TUI idle |
+
+### 飞书直接发文字 = 直接发给 Claude
+
+pocket-cc **零命令路由** —— 你发任何文字都原样 `send_text` 给 Claude TUI：
+- 普通问题 → Claude 当 prompt 处理
+- `/clear` / `/compact` / `/agents` 等斜杠命令 → 由 Claude 自己处理（pocket-cc 不截胡）
+- waiting 状态下发文字 → 当作 prompt 回答（continuation 路径，不开新卡片）
+- 单字符 `1` `2` 等 → waiting 状态下相当于按对应选项按钮
+
+### 长内容自动续卡
+
+单 turn 输出超过 ~2500 字符时，pocket-cc 自动 close 当前卡片（末尾「⏬ 内容续下条」），新发一张「(续) 原标题」卡片继续 patch。整段 Claude 回复完整保留，不丢早期内容。
+
+---
+
 ## 生产部署（Linux）
 
 详见 [`deploy/README.md`](./deploy/README.md) — 完整的服务器部署清单（装依赖、配置 .env、装 hooks、systemd 常驻、故障排查、升级 / 卸载）。
