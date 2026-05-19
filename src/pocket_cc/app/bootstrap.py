@@ -223,6 +223,7 @@ class Pocketcc:
             "Stop hook → sealing turn",
             extra={"chat_id": binding.chat_id, "session_id": event.session_id},
         )
+        self._drain_transcript_for_seal(binding)
         self._router.close_active_turn(binding, state="done")
 
     def _handle_stop_failure(self, binding: ChatBinding, event: HookEvent) -> None:
@@ -232,4 +233,37 @@ class Pocketcc:
             "StopFailure hook → sealing turn",
             extra={"chat_id": binding.chat_id, "session_id": event.session_id},
         )
+        self._drain_transcript_for_seal(binding)
         self._router.close_active_turn(binding, state="failed", error=error_msg)
+
+    def _drain_transcript_for_seal(self, binding: ChatBinding) -> None:
+        """Pull any pending transcript events into the accumulator before sealing.
+
+        Claude writes its final assistant message to the jsonl moments before
+        the Stop hook fires. The transcript poller's 0.5s tick is usually
+        too slow to catch it — by the time the poller next runs, we've
+        already closed the card stream and the final reply gets discarded.
+        Drain here ensures the final snapshot reflects whatever Claude
+        actually said. (M2-fix-seal-drain)
+        """
+        reader = binding.transcript_reader
+        turn = binding.current_turn
+        if reader is None or turn is None:
+            return
+        try:
+            events = reader.read_new()
+        except Exception:
+            logger.warning(
+                "final transcript drain failed",
+                extra={"chat_id": binding.chat_id},
+                exc_info=True,
+            )
+            return
+        if not events:
+            return
+        logger.info(
+            "drained transcript events on stop",
+            extra={"chat_id": binding.chat_id, "count": len(events)},
+        )
+        for ev in events:
+            turn.accumulator.ingest(ev)
