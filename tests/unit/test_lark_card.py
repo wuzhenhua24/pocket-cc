@@ -135,6 +135,40 @@ def test_normalize_only_touches_atx_headings() -> None:
     assert normalize_markdown_for_lark(src) == src
 
 
+def test_normalize_heading_with_existing_bold_is_unwrapped() -> None:
+    """Claude often writes `### **Section**` — don't double-bold."""
+    src = "### **测试环境配置专家**"
+    assert normalize_markdown_for_lark(src) == "**测试环境配置专家**"
+
+
+def test_normalize_heading_with_existing_underline_bold_is_unwrapped() -> None:
+    src = "## __Section__"
+    assert normalize_markdown_for_lark(src) == "**Section**"
+
+
+def test_normalize_heading_with_multiple_bold_layers_unwrapped() -> None:
+    """Adversarial: heading already double-wrapped — peel both layers."""
+    src = "### ****Title****"
+    assert normalize_markdown_for_lark(src) == "**Title**"
+
+
+def test_normalize_heading_with_empty_bold_drops_to_blank() -> None:
+    src = "### ****"
+    assert normalize_markdown_for_lark(src) == ""
+
+
+def test_normalize_heading_with_partial_bold_kept_verbatim() -> None:
+    """If only PART of the heading is bold, peel-unwrap doesn't fire (only
+    whole-string wraps are peeled). The result has nested `**` which Lark
+    may render imperfectly — but this case is rare in Claude output and
+    we deliberately stay conservative."""
+    src = "### **lead** rest"
+    out = normalize_markdown_for_lark(src)
+    # `**` + (`**lead** rest`) + `**` — nested bold; Lark renders imperfectly
+    # but the heading is at least visible. Stays conservative on purpose.
+    assert out == "****lead** rest**"
+
+
 def test_normalize_is_idempotent() -> None:
     src = "## hello\n| a | b |\n|---|---|\n| 1 | 2 |\n"
     once = normalize_markdown_for_lark(src)

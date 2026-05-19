@@ -149,9 +149,32 @@ def normalize_markdown_for_lark(text: str) -> str:
     """
     if not text:
         return text
-    text = _HEADING_RE.sub(lambda m: f"{m.group(1)}**{m.group(2)}**", text)
+    text = _HEADING_RE.sub(_heading_to_bold, text)
     text = _convert_tables(text)
     return text
+
+
+def _heading_to_bold(match: re.Match[str]) -> str:
+    """Replace `## content` with `**content**`, defensively unwrapping any
+    bold/underline markers Claude already put around the heading text.
+
+    Claude Code commonly writes `### **Section Title**` — naively re-bolding
+    that yields `****Section Title****` which Lark renders as a literal
+    `****` trailing the title. We strip whole-string `**…**` / `__…__`
+    layers before re-wrapping so the final markup is always exactly one
+    pair of `**`.
+    """
+    indent = match.group(1)
+    content = match.group(2).strip()
+    # Peel any number of whole-string bold/underline wrappers
+    while len(content) >= 4 and (
+        (content.startswith("**") and content.endswith("**"))
+        or (content.startswith("__") and content.endswith("__"))
+    ):
+        content = content[2:-2].strip()
+    if not content:
+        return indent  # weird input like `### ****` → drop to just whitespace
+    return f"{indent}**{content}**"
 
 
 def _convert_tables(text: str) -> str:
