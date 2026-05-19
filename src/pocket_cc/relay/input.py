@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +48,11 @@ _PANE_TAIL_CHARS = 2000
 # with the same `message_id` / card `token`. We keep an LRU of recently-seen
 # IDs so a single user action only triggers one tmux side effect / one card.
 _DEDUPE_CAPACITY = 256
+
+# Pause between C-c and the follow-up Escape on the cancel button so Claude
+# TUI has time to enter its "Interrupted · redirect" state before we abort
+# *out* of it. See _handle_cancel docstring.
+_CANCEL_ESCAPE_DELAY_S = 0.2
 
 
 class InputRouter:
@@ -131,7 +137,7 @@ class InputRouter:
         cmd = action.value.get("action", "")
         try:
             if cmd == "cancel":
-                self._tmux.send_key(binding.window.window_id, "C-c")
+                self._handle_cancel(binding)
             elif cmd == "key":
                 key = str(action.value.get("key", ""))
                 if key:
@@ -316,6 +322,26 @@ class InputRouter:
         except TmuxError as e:
             logger.exception("tmux failure dispatching waiting_response")
             self._close_turn(binding, state="failed", error=str(e))
+
+    def _handle_cancel(self, binding: ChatBinding) -> None:
+        """The "⏹ 中断" button: stop Claude's task AND clear the input box.
+
+        Just sending C-c isn't enough — when Claude is mid-task, C-c lands
+        it in "Interrupted · What should Claude do instead?" redirect mode
+        with the user's *original prompt text* retained in the input box
+        for editing. That's a nice tmux affordance but a UX trap through
+        Lark: the user sees ✅ done on their card and assumes everything's
+        gone, but the next message they send gets appended onto the
+        leftover text (visible in the tmux pane, but not on the card).
+
+        Two-stage cancel fixes it: C-c first to break the task, brief
+        pause for Claude TUI to enter the redirect prompt, then Escape to
+        fully abort that prompt and return to a clean idle input.
+        """
+        window_id = binding.window.window_id
+        self._tmux.send_key(window_id, "C-c")
+        time.sleep(_CANCEL_ESCAPE_DELAY_S)
+        self._tmux.send_key(window_id, "Escape")
 
     def _rerender_running(self, turn: TurnState) -> None:
         """Push an immediate running-state re-render of the current accumulator.

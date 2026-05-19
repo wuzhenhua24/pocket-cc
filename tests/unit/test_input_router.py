@@ -262,7 +262,10 @@ def test_slash_commands_are_passed_through_verbatim(tmp_path: Path) -> None:
 # ----------------------------------------------------------- card actions
 
 
-def test_card_action_cancel_sends_ctrl_c(tmp_path: Path) -> None:
+def test_card_action_cancel_sends_ctrl_c_then_escape(tmp_path: Path) -> None:
+    """⏹ 中断 should fire both C-c (break task) and Escape (exit redirect
+    mode + clear input). Sending just C-c leaves stale input text on the
+    pane, which the next user message would silently concatenate to."""
     cfg = _make_config(workspace=tmp_path)
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
@@ -270,6 +273,7 @@ def test_card_action_cancel_sends_ctrl_c(tmp_path: Path) -> None:
     router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
     router.handle_message(_message())
     card_id = lark.last_sent().message_id
+    pre_calls = len(tmux.calls)
 
     router.handle_card_action(
         CardAction(
@@ -282,8 +286,13 @@ def test_card_action_cancel_sends_ctrl_c(tmp_path: Path) -> None:
         )
     )
 
-    key_calls = [c for c in tmux.calls if c.method == "send_key"]
-    assert key_calls and key_calls[-1].kwargs == {"window_id": "@1", "key": "C-c"}
+    cancel_keys = [
+        c for c in tmux.calls[pre_calls:] if c.method == "send_key"
+    ]
+    # First key is C-c (break Claude's task), second is Escape (exit the
+    # "Interrupted · redirect" prompt + clear the leftover input box)
+    assert [k.kwargs["key"] for k in cancel_keys] == ["C-c", "Escape"]
+    assert all(k.kwargs["window_id"] == "@1" for k in cancel_keys)
 
 
 def test_card_action_key_sends_named_key(tmp_path: Path) -> None:
