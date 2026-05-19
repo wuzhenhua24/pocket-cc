@@ -251,11 +251,13 @@ def test_waiting_card_always_has_cancel_and_esc() -> None:
     card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(n=1)))
     buttons = card["elements"][-1]["actions"]
     cancel = [b for b in buttons if b["value"].get("action") == "cancel"]
-    esc = [b for b in buttons if b["value"].get("action") == "key"]
+    # Esc button uses key_sequence (double-Escape to avoid Lark's
+    # "操作太频繁" rate limit on consecutive single-Esc taps)
+    esc = [b for b in buttons if b["value"].get("action") == "key_sequence"]
     assert len(cancel) == 1
     assert cancel[0]["type"] == "danger"
     assert len(esc) == 1
-    assert esc[0]["value"]["key"] == "Escape"
+    assert esc[0]["value"]["keys"] == ["Escape", "Escape"]
 
 
 def test_waiting_card_truncates_long_button_label() -> None:

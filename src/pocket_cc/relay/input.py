@@ -142,6 +142,8 @@ class InputRouter:
                 key = str(action.value.get("key", ""))
                 if key:
                     self._tmux.send_key(binding.window.window_id, key)
+            elif cmd == "key_sequence":
+                self._handle_key_sequence(binding, action.value)
             elif cmd == "show_pane":
                 self._dump_pane(binding)
             elif cmd == "waiting_response":
@@ -322,6 +324,28 @@ class InputRouter:
         except TmuxError as e:
             logger.exception("tmux failure dispatching waiting_response")
             self._close_turn(binding, state="failed", error=str(e))
+
+    def _handle_key_sequence(self, binding: ChatBinding, value: dict[str, Any]) -> None:
+        """Send multiple tmux keys with optional delay between them.
+
+        Used by buttons that need a multi-key combo to do their job — most
+        notably the ⎋ Esc button which fires two Escape keys ~100ms apart
+        (Claude TUI requires double-Esc to fully clear the input box, and
+        sending both from one Lark click avoids Lark's "操作太频繁" rate
+        limit on rapid card action callbacks).
+        """
+        raw_keys = value.get("keys")
+        if not isinstance(raw_keys, list):
+            logger.info("key_sequence with non-list keys", extra={"value": value})
+            return
+        delay_s = float(value.get("delay_ms", 0)) / 1000.0
+        window_id = binding.window.window_id
+        for i, key in enumerate(raw_keys):
+            if not isinstance(key, str) or not key:
+                continue
+            if i > 0 and delay_s > 0:
+                time.sleep(delay_s)
+            self._tmux.send_key(window_id, key)
 
     def _handle_cancel(self, binding: ChatBinding) -> None:
         """The "⏹ 中断" button: stop Claude's task AND clear the input box.

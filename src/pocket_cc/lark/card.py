@@ -267,7 +267,18 @@ def _render_button(button: CardButton) -> dict[str, Any]:
 # Keep this list short — every new button is one more route in the relay layer.
 DEFAULT_RUNNING_ACTIONS: tuple[CardButton, ...] = (
     CardButton(text="⏹ 中断", value={"action": "cancel"}, style="danger"),
-    CardButton(text="⎋ Esc", value={"action": "key", "key": "Escape"}),
+    # ⎋ Esc fires *two* Escape keys 100ms apart. Claude TUI requires double
+    # Esc to fully abort a prompt + clear the input box; firing it from a
+    # single Lark button click avoids the user having to double-tap (which
+    # Lark rate-limits with "操作太频繁了" after the second click).
+    CardButton(
+        text="⎋ Esc",
+        value={
+            "action": "key_sequence",
+            "keys": ["Escape", "Escape"],
+            "delay_ms": 100,
+        },
+    ),
     CardButton(text="⇧⭾ Mode", value={"action": "key", "key": "BTab"}),
     CardButton(text="📜 内容", value={"action": "show_pane"}),
 )

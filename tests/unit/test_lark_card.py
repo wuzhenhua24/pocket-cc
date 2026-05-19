@@ -98,10 +98,16 @@ def test_default_running_actions_shape() -> None:
     assert all(isinstance(b, CardButton) for b in DEFAULT_RUNNING_ACTIONS)
     cancel = next(b for b in DEFAULT_RUNNING_ACTIONS if b.value.get("action") == "cancel")
     assert cancel.style == "danger"
-    # key buttons carry a `key` field so the relay can translate to tmux keys
-    keys = [b.value["key"] for b in DEFAULT_RUNNING_ACTIONS if b.value.get("action") == "key"]
-    assert "Escape" in keys
-    assert "BTab" in keys
+    # `key` action: single keystroke (e.g. BTab for mode toggle)
+    single_keys = [
+        b.value["key"] for b in DEFAULT_RUNNING_ACTIONS if b.value.get("action") == "key"
+    ]
+    assert "BTab" in single_keys
+    # `key_sequence` action: multiple keys with optional delay (e.g. ⎋ Esc
+    # is double-Escape to dodge Lark's rate limit on consecutive callbacks)
+    seq_buttons = [b for b in DEFAULT_RUNNING_ACTIONS if b.value.get("action") == "key_sequence"]
+    assert len(seq_buttons) == 1
+    assert seq_buttons[0].value["keys"] == ["Escape", "Escape"]
 
 
 # =================================================== normalize_markdown_for_lark

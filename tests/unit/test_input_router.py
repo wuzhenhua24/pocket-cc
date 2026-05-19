@@ -286,9 +286,7 @@ def test_card_action_cancel_sends_ctrl_c_then_escape(tmp_path: Path) -> None:
         )
     )
 
-    cancel_keys = [
-        c for c in tmux.calls[pre_calls:] if c.method == "send_key"
-    ]
+    cancel_keys = [c for c in tmux.calls[pre_calls:] if c.method == "send_key"]
     # First key is C-c (break Claude's task), second is Escape (exit the
     # "Interrupted · redirect" prompt + clear the leftover input box)
     assert [k.kwargs["key"] for k in cancel_keys] == ["C-c", "Escape"]
@@ -661,3 +659,89 @@ def test_card_action_waiting_response_bad_index_type_is_noop(tmp_path: Path) -> 
     )
 
     assert len(tmux.calls) == tmux_calls_before
+
+
+# ============================================================ key_sequence
+
+
+def test_card_action_key_sequence_sends_each_key_in_order(tmp_path: Path) -> None:
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+    pre = len(tmux.calls)
+
+    router.handle_card_action(
+        CardAction(
+            message_id=card_id,
+            chat_id="oc_chat1",
+            sender_open_id="ou_user1",
+            token="tok_seq",
+            tag="button",
+            value={
+                "action": "key_sequence",
+                "keys": ["Escape", "Escape"],
+                "delay_ms": 1,  # tiny so tests stay fast
+            },
+        )
+    )
+
+    keys = [c.kwargs["key"] for c in tmux.calls[pre:] if c.method == "send_key"]
+    assert keys == ["Escape", "Escape"]
+
+
+def test_card_action_key_sequence_skips_non_string_keys(tmp_path: Path) -> None:
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+    pre = len(tmux.calls)
+
+    router.handle_card_action(
+        CardAction(
+            message_id=card_id,
+            chat_id="oc_chat1",
+            sender_open_id="ou_user1",
+            token="tok_skip",
+            tag="button",
+            value={
+                "action": "key_sequence",
+                "keys": ["Up", None, "", 42, "Enter"],  # mixed garbage
+                "delay_ms": 0,
+            },
+        )
+    )
+
+    keys = [c.kwargs["key"] for c in tmux.calls[pre:] if c.method == "send_key"]
+    assert keys == ["Up", "Enter"]
+
+
+def test_card_action_key_sequence_with_non_list_keys_is_noop(tmp_path: Path) -> None:
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+    pre = len(tmux.calls)
+
+    router.handle_card_action(
+        CardAction(
+            message_id=card_id,
+            chat_id="oc_chat1",
+            sender_open_id="ou_user1",
+            token="tok_noseq",
+            tag="button",
+            value={"action": "key_sequence", "keys": "not-a-list"},
+        )
+    )
+
+    new_calls = tmux.calls[pre:]
+    assert all(c.method != "send_key" for c in new_calls)
