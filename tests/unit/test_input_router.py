@@ -262,10 +262,12 @@ def test_slash_commands_are_passed_through_verbatim(tmp_path: Path) -> None:
 # ----------------------------------------------------------- card actions
 
 
-def test_card_action_cancel_sends_ctrl_c_then_escape(tmp_path: Path) -> None:
-    """⏹ 中断 should fire both C-c (break task) and Escape (exit redirect
-    mode + clear input). Sending just C-c leaves stale input text on the
-    pane, which the next user message would silently concatenate to."""
+def test_card_action_cancel_sends_ctrl_c_then_double_escape(tmp_path: Path) -> None:
+    """⏹ 中断 fires C-c then *two* Escapes to cover all Claude TUI states:
+    running (C-c → redirect, Esc → exits redirect / clears input), or idle
+    with leftover input (double-Esc clears the input box). Sending just
+    C-c + one Esc misses the leftover-input case, where the next user
+    message would silently concatenate to the unsent prompt."""
     cfg = _make_config(workspace=tmp_path)
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
@@ -287,10 +289,69 @@ def test_card_action_cancel_sends_ctrl_c_then_escape(tmp_path: Path) -> None:
     )
 
     cancel_keys = [c for c in tmux.calls[pre_calls:] if c.method == "send_key"]
-    # First key is C-c (break Claude's task), second is Escape (exit the
-    # "Interrupted · redirect" prompt + clear the leftover input box)
-    assert [k.kwargs["key"] for k in cancel_keys] == ["C-c", "Escape"]
+    # C-c → interrupt running task (or clear pending text); Escape ×2 →
+    # exit "Interrupted · redirect" mode AND clear any leftover input.
+    assert [k.kwargs["key"] for k in cancel_keys] == ["C-c", "Escape", "Escape"]
     assert all(k.kwargs["window_id"] == "@1" for k in cancel_keys)
+
+
+def test_cancel_skips_deferred_enter_so_prompt_is_not_submitted(
+    tmp_path: Path,
+) -> None:
+    """Early ⏹ 中断 must abort the deferred Enter before it submits the prompt.
+
+    Regression: send_text (text-only) injects the user's text into the
+    pane, then a worker thread sleeps `_DEFERRED_ENTER_DELAY_S` and fires
+    Enter. If cancel runs during that grace window, the cancel handler
+    sets `turn.cancel_event` — the worker wakes early on the event and
+    skips Enter, so Claude never receives the prompt. Without this, the
+    Enter fires after C-c/Escape ran, leaving Claude actually running.
+    """
+    import pocket_cc.relay.input as input_module
+
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    # Stretch the grace window so the test can race cancel against it
+    # without flakiness; the production value (0.5s) is way too long for
+    # a unit test, but we need it non-zero to exercise the wait path.
+    orig_delay = input_module._DEFERRED_ENTER_DELAY_S
+    input_module._DEFERRED_ENTER_DELAY_S = 2.0
+    try:
+        router.handle_message(_message())
+        card_id = lark.last_sent().message_id
+
+        router.handle_card_action(
+            CardAction(
+                message_id=card_id,
+                chat_id="oc_chat1",
+                sender_open_id="ou_user1",
+                token="tok",
+                tag="button",
+                value={"action": "cancel"},
+            )
+        )
+    finally:
+        input_module._DEFERRED_ENTER_DELAY_S = orig_delay
+
+    # Wait briefly for the deferred-Enter worker to observe cancel_event
+    # and exit. Without sleeping, the assertion could race the worker
+    # thread; the cancel_event.set() in _handle_cancel wakes it almost
+    # immediately, so 100ms is plenty.
+    import time
+
+    time.sleep(0.1)
+
+    enter_keys = [
+        c for c in tmux.calls if c.method == "send_key" and c.kwargs["key"] == "Enter"
+    ]
+    assert enter_keys == [], (
+        "deferred Enter must NOT fire after cancel — would re-submit the user's "
+        "prompt to Claude after the cancel handler already cleared the pane"
+    )
 
 
 def test_card_action_key_sends_named_key(tmp_path: Path) -> None:

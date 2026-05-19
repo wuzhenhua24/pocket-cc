@@ -471,3 +471,144 @@ def test_rotation_dataflow_end_to_end() -> None:
     new_snap = acc.snapshot(state="running", from_committed=True)
     assert "brand new content" in new_snap.assistant_text
     assert "A" * 100 not in new_snap.assistant_text  # not in committed view
+
+
+# ============================================================ chunked rotation
+
+
+def test_find_fit_window_returns_full_window_when_content_fits() -> None:
+    """When uncommitted content already fits within max_chars, no shrinking."""
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="short content"))
+    acc.ingest(
+        ToolUse(
+            uuid="t1",
+            timestamp="t",
+            tool_use_id="u1",
+            tool_name="Read",
+            tool_input={"file_path": "/x/y/a.py"},
+        )
+    )
+    text_end, tool_end, thinking_end = acc.find_fit_window(max_chars=2500)
+    assert text_end == 1
+    assert tool_end == 1
+    assert thinking_end == 0
+
+
+def test_find_fit_window_shrinks_tool_calls_first() -> None:
+    """When body is over budget, trim tool_calls before assistant_text —
+    text renders at the top of the card, so the user sees the *earliest*
+    content (= assistant_text) in the sealed card and the *later* content
+    (= tool_calls) on the next card. Trimming text-first would invert that."""
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    # One small assistant_text + many tool_calls; aggregate body > 200 chars
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="hi"))
+    for i in range(30):
+        acc.ingest(
+            ToolUse(
+                uuid=f"t{i}",
+                timestamp="t",
+                tool_use_id=f"u{i}",
+                tool_name="Read",
+                tool_input={"file_path": f"/some/path/file_with_long_name_{i}.py"},
+            )
+        )
+    text_end, tool_end, _ = acc.find_fit_window(max_chars=200)
+    # Assistant text kept; tool_calls shrunk
+    assert text_end == 1
+    assert tool_end < 30
+
+
+def test_find_fit_window_forces_progress_on_oversize_single_part() -> None:
+    """When even one leading part exceeds max_chars, include it anyway —
+    the body-level truncation handles the oversized single-part case, so
+    rotation never gets stuck reporting "zero progress" indefinitely."""
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    # One huge assistant_text (way over budget)
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="A" * 5000))
+    text_end, tool_end, thinking_end = acc.find_fit_window(max_chars=500)
+    # Forced inclusion of 1 leading text part — guarantees forward progress
+    assert text_end == 1
+    assert tool_end == 0
+    assert thinking_end == 0
+
+
+def test_commit_to_advances_only_to_specified_indices() -> None:
+    """Partial commit lets chunked rotation seal a prefix and leave the rest."""
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a1", timestamp="t", text="first"))
+    acc.ingest(AssistantText(uuid="a2", timestamp="t", text="second"))
+    acc.ingest(AssistantText(uuid="a3", timestamp="t", text="third"))
+
+    acc.commit_to(text_end=2, tool_end=0, thinking_end=0)
+
+    leftover = acc.snapshot(state="running", from_committed=True)
+    assert "first" not in leftover.assistant_text
+    assert "second" not in leftover.assistant_text
+    assert "third" in leftover.assistant_text
+
+
+def test_snapshot_window_returns_only_committed_to_end_slice() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a1", timestamp="t", text="first"))
+    acc.ingest(AssistantText(uuid="a2", timestamp="t", text="second"))
+    acc.ingest(AssistantText(uuid="a3", timestamp="t", text="third"))
+
+    snap = acc.snapshot_window(text_end=2, tool_end=0, thinking_end=0)
+    assert "first" in snap.assistant_text
+    assert "second" in snap.assistant_text
+    assert "third" not in snap.assistant_text
+
+
+def test_chunked_rotation_no_truncation_message_when_split() -> None:
+    """End-to-end: a single big batch that would have shown the
+    "已截断早期内容" message under the old rotation logic should now
+    split cleanly across multiple sealed cards with no truncation hint.
+    """
+    from pocket_cc.relay.card_renderer import ROTATE_AT_CHARS
+
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    # Several medium-sized assistant text parts whose total exceeds the
+    # rotate threshold but each one comfortably fits in a card on its own.
+    for i in range(6):
+        acc.ingest(AssistantText(uuid=f"a{i}", timestamp="t", text=f"part {i}: " + "A" * 800))
+
+    # Simulate the bootstrap loop: rotate until content fits.
+    sealed_cards: list[str] = []
+    iterations = 0
+    while iterations < 16:
+        iterations += 1
+        snap = acc.snapshot(state="running", from_committed=True)
+        if not should_rotate(snap):
+            break
+        text_end, tool_end, thinking_end = acc.find_fit_window(ROTATE_AT_CHARS)
+        seal_snap = acc.snapshot_window(
+            text_end=text_end, tool_end=tool_end, thinking_end=thinking_end
+        )
+        sealed = render_card(seal_snap, ends_with_continuation_marker=True)
+        sealed_cards.append(sealed["elements"][0]["content"])
+        acc.commit_to(text_end=text_end, tool_end=tool_end, thinking_end=thinking_end)
+
+    # Final (open) card should fit without rotation.
+    final_card = render_card(
+        acc.snapshot(state="running", from_committed=True), is_continuation=True
+    )
+    final_body = final_card["elements"][0]["content"]
+
+    # Must have produced at least one sealed card (otherwise rotation didn't fire)
+    assert sealed_cards, "expected at least one sealed card from chunked rotation"
+    # The bug: under the old logic, the sealed card body included
+    # "…(已截断早期内容)…" because the whole uncommitted slice was rendered
+    # at once and tail-truncated. Chunked rotation must never show that.
+    for body in sealed_cards:
+        assert "截断" not in body, (
+            f"sealed card should not contain truncation hint — content was split "
+            f"across rotations, not truncated. Got:\n{body}"
+        )
+    assert "截断" not in final_body

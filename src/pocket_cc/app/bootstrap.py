@@ -32,7 +32,7 @@ from pocket_cc.claude.hooks import all_installed as hooks_all_installed
 from pocket_cc.claude.transcript import TranscriptReader
 from pocket_cc.lark.client import LarkApiError, LarkOapiClient
 from pocket_cc.lark.event_loop import LarkEventLoop
-from pocket_cc.relay.card_renderer import render_card, should_rotate
+from pocket_cc.relay.card_renderer import ROTATE_AT_CHARS, render_card, should_rotate
 from pocket_cc.relay.card_stream import CardStream
 from pocket_cc.relay.events_router import EventsPoller, HookEventsDispatcher
 from pocket_cc.relay.input import InputRouter
@@ -162,7 +162,7 @@ class Pocketcc:
         running.
 
         Card rotation (M2-F): if the body of the current card grew past
-        ``_ROTATE_AT_CHARS``, seal it and start a fresh "(续)" card before
+        ``ROTATE_AT_CHARS``, seal it and start a fresh "(续)" card before
         rendering. Rotation is **disabled while waiting** to avoid the
         weird UX of rotating mid-prompt.
         """
@@ -191,14 +191,24 @@ class Pocketcc:
         Single re-render path used by both the transcript-poller callback
         and the pane-watcher callback. Owns the rotation decision so both
         paths get the same long-content handling.
+
+        Loops the rotation step: when one transcript batch ingests enough
+        content to fill *several* cards (e.g. one long assistant response
+        plus a flurry of tool calls), each iteration seals the largest
+        prefix that fits without tail-truncation, then re-checks. Without
+        the loop, a single oversized batch produces one truncated sealed
+        card + one fresh card holding the leftover — losing the early
+        content the user expected to see across multiple "(续)" cards.
         """
-        snapshot = self._snapshot_active(turn)
-        if should_rotate(snapshot):
-            self._rotate_card(binding, turn)
-            # Re-snapshot: accumulator's committed cursor moved, so the
-            # new snapshot reflects only post-rotation content (likely
-            # empty until the next ingest).
+        # Safety cap so a logic bug in find_fit_window can't busy-loop
+        # forever. Number of cards a single batch could *plausibly* need
+        # is bounded by (max batch size) / ROTATE_AT_CHARS; 32 is far
+        # past any realistic value and below the Lark per-chat send rate.
+        for _ in range(32):
             snapshot = self._snapshot_active(turn)
+            if not should_rotate(snapshot):
+                break
+            self._rotate_card(binding, turn)
         card = render_card(snapshot, is_continuation=turn.is_continuation)
         turn.card_stream.update(card)
 
@@ -213,10 +223,27 @@ class Pocketcc:
         return turn.accumulator.snapshot(state="running", from_committed=True)
 
     def _rotate_card(self, binding: ChatBinding, turn: TurnState) -> None:
-        """Seal the current card with a "⏬ 续下条" footer and open a new one."""
-        # Render the sealing body from whatever's *currently* committed-onward.
-        sealing_snapshot = turn.accumulator.snapshot(
-            state="running", from_committed=True
+        """Seal the current card with a "⏬ 续下条" footer and open a new one.
+
+        Chunked rotation: instead of dumping the entire uncommitted slice
+        into the sealed card (which then tail-truncates with "…(已截断早
+        期内容)…" when the slice is bigger than `_BODY_MAX_CHARS`), we ask
+        the accumulator for the largest split point that fits within
+        ``ROTATE_AT_CHARS``. Only that prefix is sealed + committed;
+        the rest stays uncommitted and gets picked up by `_publish_card`'s
+        loop, which calls back into here for another rotation. End result:
+        a long batch becomes N "(续)" cards instead of one truncated card.
+        """
+        # Find the largest commit-onward prefix that renders within the
+        # rotation budget. Forward progress is guaranteed by the
+        # accumulator (see `find_fit_window` docstring).
+        text_end, tool_end, thinking_end = turn.accumulator.find_fit_window(ROTATE_AT_CHARS)
+
+        sealing_snapshot = turn.accumulator.snapshot_window(
+            text_end=text_end,
+            tool_end=tool_end,
+            thinking_end=thinking_end,
+            state="running",
         )
         sealing_card = render_card(
             sealing_snapshot,
@@ -232,9 +259,14 @@ class Pocketcc:
                 exc_info=True,
             )
 
-        # Mark everything we just sealed as committed — the next card
-        # starts fresh.
-        turn.accumulator.commit()
+        # Commit *only* what we just sealed. Any leftover uncommitted
+        # parts will show up on the next card (and trigger another
+        # rotation iteration in `_publish_card` if they're still too big).
+        turn.accumulator.commit_to(
+            text_end=text_end,
+            tool_end=tool_end,
+            thinking_end=thinking_end,
+        )
 
         # Open a fresh continuation card.
         starter_snapshot = turn.accumulator.snapshot(

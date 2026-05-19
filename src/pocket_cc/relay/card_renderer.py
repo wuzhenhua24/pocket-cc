@@ -42,11 +42,12 @@ if TYPE_CHECKING:
 #   _BODY_MAX_CHARS  — soft cap; over this we tail-truncate within a single
 #                      card (used when M2-F rotation isn't applicable, e.g.
 #                      waiting cards, failed-state error dumps).
-#   _ROTATE_AT_CHARS — bootstrap watches this; once a card's rendered body
+#   ROTATE_AT_CHARS — bootstrap watches this; once a card's rendered body
 #                      passes it, the card is sealed with a "⏬ 续下条" footer
-#                      and a fresh card begins (M2-F).
+#                      and a fresh card begins (M2-F). Bootstrap also uses
+#                      this as `max_chars` for chunked rotation's fit window.
 _BODY_MAX_CHARS = 3000
-_ROTATE_AT_CHARS = 2500
+ROTATE_AT_CHARS = 2500
 _THINKING_MAX_CHARS = 2000
 _TITLE_MAX_CHARS = 60
 # Continuation marker appended to the body of a card we're about to close
@@ -150,6 +151,29 @@ class TurnAccumulator:
         self._committed_tool_calls = len(self._tool_calls)
         self._committed_thinking_parts = len(self._thinking_parts)
 
+    def commit_to(self, *, text_end: int, tool_end: int, thinking_end: int) -> None:
+        """Commit up to specific indices instead of "everything seen so far".
+
+        Used by chunked rotation: when the uncommitted slice is too big to
+        fit in one Lark card, we seal only parts[committed:end] into the
+        current card and leave parts[end:] uncommitted for the next card.
+        Indices are clamped to the valid range so callers can pass the
+        output of :meth:`find_fit_window` without worrying about new parts
+        that may have been ingested in the meantime.
+        """
+        self._committed_text_parts = max(
+            self._committed_text_parts,
+            min(text_end, len(self._assistant_text_parts)),
+        )
+        self._committed_tool_calls = max(
+            self._committed_tool_calls,
+            min(tool_end, len(self._tool_calls)),
+        )
+        self._committed_thinking_parts = max(
+            self._committed_thinking_parts,
+            min(thinking_end, len(self._thinking_parts)),
+        )
+
     def snapshot(
         self,
         state: CardState = "running",
@@ -183,6 +207,89 @@ class TurnAccumulator:
             waiting_for=waiting_for,
         )
 
+    def snapshot_window(
+        self,
+        *,
+        text_end: int,
+        tool_end: int,
+        thinking_end: int,
+        state: CardState = "running",
+        error: str = "",
+        waiting_for: WaitingFor | None = None,
+    ) -> TurnSnapshot:
+        """Render a snapshot of parts[committed:end] for each list.
+
+        Used by chunked rotation to render the *exact* slice that's about
+        to be sealed into the current card (which may be a strict prefix
+        of the uncommitted content when the full slice is too big to fit).
+        """
+        text_parts = self._assistant_text_parts[self._committed_text_parts : text_end]
+        tool_calls = self._tool_calls[self._committed_tool_calls : tool_end]
+        thinking_parts = self._thinking_parts[self._committed_thinking_parts : thinking_end]
+        return TurnSnapshot(
+            user_prompt=self.user_prompt,
+            assistant_text="\n\n".join(p for p in text_parts if p),
+            tool_calls=list(tool_calls),
+            thinking="\n\n".join(p for p in thinking_parts if p),
+            state=state,
+            error=error,
+            waiting_for=waiting_for,
+        )
+
+    def find_fit_window(self, max_chars: int) -> tuple[int, int, int]:
+        """Find the largest split such that snapshot_window renders ≤ max_chars.
+
+        Returns ``(text_end, tool_end, thinking_end)`` indices into the
+        respective full part lists. The window is parts[committed:end].
+
+        Shrinks from the *end* of the rendered body — tool_calls first
+        (since they render at the bottom), then assistant_text — so the
+        sealed card holds the *earliest* uncommitted content and the
+        leftover goes onto the next card. Thinking is only trimmed when
+        the body alone is fine but the detail (thinking) puts us over.
+
+        Forward-progress guarantee: when uncommitted content exists, this
+        never returns the empty (zero-progress) window. If even a single
+        leading part exceeds ``max_chars`` on its own, that part is still
+        included — `_render_body`'s tail-truncation handles the oversized
+        single-part case, so rotation can't get stuck.
+        """
+        text_end = len(self._assistant_text_parts)
+        tool_end = len(self._tool_calls)
+        thinking_end = len(self._thinking_parts)
+        text_lo = self._committed_text_parts
+        tool_lo = self._committed_tool_calls
+        thinking_lo = self._committed_thinking_parts
+
+        while True:
+            snap = self.snapshot_window(
+                text_end=text_end, tool_end=tool_end, thinking_end=thinking_end
+            )
+            if len(_render_body(snap)) <= max_chars:
+                # Empty window only ever wins when nothing is uncommitted.
+                # When there *is* uncommitted content but it doesn't fit,
+                # force one leading part in so rotation makes progress.
+                if (
+                    text_end == text_lo
+                    and tool_end == tool_lo
+                    and thinking_end == thinking_lo
+                ):
+                    if text_lo < len(self._assistant_text_parts):
+                        return text_lo + 1, tool_lo, thinking_lo
+                    if tool_lo < len(self._tool_calls):
+                        return text_lo, tool_lo + 1, thinking_lo
+                    if thinking_lo < len(self._thinking_parts):
+                        return text_lo, tool_lo, thinking_lo + 1
+                return text_end, tool_end, thinking_end
+            if tool_end > tool_lo:
+                tool_end -= 1
+            elif text_end > text_lo:
+                text_end -= 1
+            elif thinking_end > thinking_lo:
+                thinking_end -= 1
+            else:  # unreachable — empty body always fits, see "Empty window" branch above
+                return text_lo, tool_lo, thinking_lo
+
 
 # --------------------------------------------------------------- render layer
 
@@ -199,7 +306,7 @@ def should_rotate(snapshot: TurnSnapshot) -> bool:
     """
     if snapshot.waiting_for is not None:
         return False
-    return len(_render_body(snapshot)) > _ROTATE_AT_CHARS
+    return len(_render_body(snapshot)) > ROTATE_AT_CHARS
 
 
 def render_card(

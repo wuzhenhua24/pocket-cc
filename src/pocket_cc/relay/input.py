@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
@@ -53,6 +54,17 @@ _DEDUPE_CAPACITY = 256
 # TUI has time to enter its "Interrupted · redirect" state before we abort
 # *out* of it. See _handle_cancel docstring.
 _CANCEL_ESCAPE_DELAY_S = 0.2
+# Pause between the two Escapes in the cancel sequence. The first Escape exits
+# "Interrupted · redirect" state; the second clears any leftover input text
+# (Claude TUI's Esc clears the input box). 100ms matches the dedicated
+# ⎋ Esc button's `delay_ms` so we don't hit Lark's "操作太频繁" rate limit.
+_CANCEL_BETWEEN_ESCAPES_S = 0.1
+# How long `_open_turn` waits between injecting the user's text into the
+# tmux pane and sending Enter. Mirrors `tmux.manager._ENTER_DELAY_S` (the
+# pty batching workaround) — by running this wait *here* instead of inside
+# tmux.send_text, we can interrupt it on cancel and drop the Enter before
+# it submits the prompt. Module-level so tests can monkeypatch it to 0.
+_DEFERRED_ENTER_DELAY_S = 0.5
 
 
 class InputRouter:
@@ -227,17 +239,59 @@ class InputRouter:
 
         stream = CardStream(self._lark, message_id, interval_s=self._config.patch_interval_s)
         stream.start()
-        binding.current_turn = TurnState(
+        turn = TurnState(
             card_message_id=message_id,
             card_stream=stream,
             accumulator=accumulator,
         )
+        binding.current_turn = turn
 
         try:
-            self._tmux.send_text(binding.window.window_id, user_text)
+            # Inject the text only — Enter is sent on a separate worker
+            # after a brief grace period during which `_handle_cancel` can
+            # set `turn.cancel_event` to abort the submission. Without this
+            # split, an early ⏹ 中断 races send_text's internal Enter delay
+            # and the prompt still gets submitted to Claude.
+            self._tmux.send_text(binding.window.window_id, user_text, with_enter=False)
         except TmuxError as e:
             logger.exception("tmux send_text failed")
             self._close_turn(binding, state="failed", error=str(e))
+            return
+
+        threading.Thread(
+            target=self._deferred_enter,
+            args=(binding, turn),
+            name=f"deferred-enter-{binding.window.window_id}",
+            daemon=True,
+        ).start()
+
+    def _deferred_enter(self, binding: ChatBinding, turn: TurnState) -> None:
+        """Send Enter after the grace period, unless cancel fired first.
+
+        `wait(timeout=…)` returns True iff the event was set before timeout,
+        i.e. the user clicked ⏹ 中断 during the grace window. In that case
+        we skip Enter entirely — Claude never sees the prompt, so the cancel
+        sequence only has to clear the input box (no "Interrupted · redirect"
+        to escape out of).
+        """
+        if turn.cancel_event.wait(timeout=_DEFERRED_ENTER_DELAY_S):
+            logger.info(
+                "deferred Enter skipped — cancel signaled before grace period elapsed",
+                extra={"chat_id": binding.chat_id, "window_id": binding.window.window_id},
+            )
+            return
+        if binding.current_turn is not turn:
+            # Turn was closed between scheduling and firing — drop the Enter
+            # to avoid submitting an empty / stale prompt against whatever
+            # state Claude is in now.
+            return
+        try:
+            self._tmux.send_key(binding.window.window_id, "Enter")
+        except TmuxError:
+            logger.exception(
+                "deferred Enter send failed",
+                extra={"chat_id": binding.chat_id},
+            )
 
     def close_active_turn(
         self, binding: ChatBinding, *, state: CardState = "done", error: str = ""
@@ -350,21 +404,47 @@ class InputRouter:
     def _handle_cancel(self, binding: ChatBinding) -> None:
         """The "⏹ 中断" button: stop Claude's task AND clear the input box.
 
-        Just sending C-c isn't enough — when Claude is mid-task, C-c lands
-        it in "Interrupted · What should Claude do instead?" redirect mode
-        with the user's *original prompt text* retained in the input box
-        for editing. That's a nice tmux affordance but a UX trap through
-        Lark: the user sees ✅ done on their card and assumes everything's
-        gone, but the next message they send gets appended onto the
-        leftover text (visible in the tmux pane, but not on the card).
+        This has to cover three different states Claude TUI can be in when
+        the button fires:
 
-        Two-stage cancel fixes it: C-c first to break the task, brief
-        pause for Claude TUI to enter the redirect prompt, then Escape to
-        fully abort that prompt and return to a clean idle input.
+        1. **Running** — Claude is mid-task. C-c lands it in "Interrupted ·
+           redirect" mode with the original prompt text retained in the
+           input box; Escape then exits redirect and clears the input.
+
+        2. **Just-submitted-but-deferred-Enter-not-yet-fired** — the user
+           hit cancel during `_open_turn`'s grace period. Setting
+           `cancel_event` makes the deferred-Enter worker drop the Enter
+           before it ever reaches Claude, so the prompt never gets
+           submitted. The C-c + Escapes still run to clear any text the
+           `send-keys -l` already injected into the input box.
+
+        3. **Idle with leftover input** — defense-in-depth for cases where
+           something slipped through (e.g. a previous turn left text on
+           the pane). Double-Escape clears the input regardless of state.
+
+        Without (2)'s cancel_event signal, an early cancel races send_text's
+        500ms internal Enter delay: C-c+Escape clears the visible input,
+        but the queued Enter fires afterwards and submits the prompt
+        anyway, leaving Claude actually running with no way to interrupt
+        from the user's perspective.
         """
         window_id = binding.window.window_id
+        turn = binding.current_turn
+        if turn is not None:
+            # Tell the deferred-Enter worker (if any) to abort. This is
+            # *the* fix for the early-cancel race — the C-c/Escape keys
+            # below can't catch an Enter that fires after they ran.
+            turn.cancel_event.set()
+        # 1. Interrupt any running Claude task / clear pending text.
         self._tmux.send_key(window_id, "C-c")
+        # 2. Let Claude TUI render its "Interrupted · redirect" state.
         time.sleep(_CANCEL_ESCAPE_DELAY_S)
+        # 3. Exit redirect mode — or clear input if we weren't in redirect.
+        self._tmux.send_key(window_id, "Escape")
+        # 4. Brief pause + second Escape. Covers the state where the input
+        #    box still has text (Claude TUI's Esc clears input); matches
+        #    the dedicated ⎋ Esc button's two-Escape sequence.
+        time.sleep(_CANCEL_BETWEEN_ESCAPES_S)
         self._tmux.send_key(window_id, "Escape")
 
     def _rerender_running(self, turn: TurnState) -> None:

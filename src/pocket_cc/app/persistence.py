@@ -66,6 +66,14 @@ class TurnState:
     accumulator: TurnAccumulator
     waiting_for: WaitingFor | None = None
     is_continuation: bool = False
+    # Set when the user clicks ⏹ 中断 *before* `_open_turn`'s deferred Enter
+    # has fired. The Enter worker (in `relay.input._open_turn`) checks this
+    # flag right before sending Enter — if set, the prompt is dropped so it
+    # never reaches Claude. Without this, an early cancel races with the
+    # send_text Enter and the prompt gets submitted anyway (visible as
+    # "leftover text in input" after C-c + Escape ran but couldn't clean
+    # what hadn't yet been submitted).
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
