@@ -263,22 +263,40 @@ def _render_button(button: CardButton) -> dict[str, Any]:
     }
 
 
-# Re-export the default action set we'll need everywhere as a convenience.
-# Keep this list short — every new button is one more route in the relay layer.
-DEFAULT_RUNNING_ACTIONS: tuple[CardButton, ...] = (
-    CardButton(text="⏹ 中断", value={"action": "cancel"}, style="danger"),
-    # ⎋ Esc fires *two* Escape keys 100ms apart. Claude TUI requires double
-    # Esc to fully abort a prompt + clear the input box; firing it from a
-    # single Lark button click avoids the user having to double-tap (which
-    # Lark rate-limits with "操作太频繁了" after the second click).
-    CardButton(
-        text="⎋ Esc",
-        value={
-            "action": "key_sequence",
-            "keys": ["Escape", "Escape"],
-            "delay_ms": 100,
-        },
-    ),
-    CardButton(text="⇧⭾ Mode", value={"action": "key", "key": "BTab"}),
-    CardButton(text="📜 内容", value={"action": "show_pane"}),
-)
+def build_running_actions(mode_suffix: str = "") -> tuple[CardButton, ...]:
+    """Return the running-state action row, with an optional Mode-button suffix.
+
+    The Mode button cycles Claude's permission mode via Shift-Tab (BTab).
+    Without feedback, users in Lark have no way to tell which mode Claude
+    is in — passing the current mode label here surfaces it as
+    "⇧⭾ Mode · 自动接受" / "…计划" / etc. The relay's card renderer
+    builds this per-card using the latest transcript-derived mode.
+
+    Other buttons are static — neither their behavior nor their label
+    depends on per-turn state, so keeping them defined inline here makes
+    the action row trivial to inspect.
+    """
+    mode_text = "⇧⭾ Mode" if not mode_suffix else f"⇧⭾ Mode · {mode_suffix}"
+    return (
+        CardButton(text="⏹ 中断", value={"action": "cancel"}, style="danger"),
+        # ⎋ Esc fires *two* Escape keys 100ms apart. Claude TUI requires double
+        # Esc to fully abort a prompt + clear the input box; firing it from a
+        # single Lark button click avoids the user having to double-tap (which
+        # Lark rate-limits with "操作太频繁了" after the second click).
+        CardButton(
+            text="⎋ Esc",
+            value={
+                "action": "key_sequence",
+                "keys": ["Escape", "Escape"],
+                "delay_ms": 100,
+            },
+        ),
+        CardButton(text=mode_text, value={"action": "key", "key": "BTab"}),
+        CardButton(text="📜 内容", value={"action": "show_pane"}),
+    )
+
+
+# Generic action set used by callers that don't care about the current
+# permission mode (e.g. quick utility cards). The relay layer prefers
+# `build_running_actions(mode_label(...))` so the Mode button reflects state.
+DEFAULT_RUNNING_ACTIONS: tuple[CardButton, ...] = build_running_actions()

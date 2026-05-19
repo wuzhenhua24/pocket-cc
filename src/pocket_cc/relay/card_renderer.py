@@ -22,15 +22,16 @@ from pocket_cc.claude.transcript import (
     AssistantText,
     AssistantThinking,
     Event,
+    ModeChange,
     ToolResult,
     ToolUse,
     UserText,
 )
 from pocket_cc.lark.card import (
-    DEFAULT_RUNNING_ACTIONS,
     CardButton,
     CardState,
     ExpandableSection,
+    build_running_actions,
     build_status_card,
 )
 
@@ -62,6 +63,30 @@ _CONTINUATION_TITLE_PREFIX = "(续) "
 _WAITING_OPTION_BUTTONS_CAP = 4
 _WAITING_BUTTON_LABEL_MAX = 24
 
+# Default Claude permission mode at session start. Used when no
+# `permission-mode` record has been seen yet (e.g. transcript drained
+# mid-session, or initial card before first poll tick).
+DEFAULT_PERMISSION_MODE = "default"
+
+# permissionMode key → user-facing Chinese label for the Mode button.
+# Unknown modes fall back to the raw mode string (see `mode_label`).
+_MODE_LABELS: dict[str, str] = {
+    "default": "默认",
+    "acceptEdits": "自动接受",
+    "plan": "计划",
+    "bypassPermissions": "跳过权限",
+}
+
+
+def mode_label(mode: str) -> str:
+    """Friendly label for a permission mode; falls back to raw if unknown.
+
+    Public so the card layer can format the Mode button consistently. We
+    accept unknown values verbatim rather than masking schema drift —
+    surfacing the raw key tells us a new Claude mode shipped.
+    """
+    return _MODE_LABELS.get(mode, mode)
+
 
 @dataclass(frozen=True, slots=True)
 class TurnSnapshot:
@@ -80,6 +105,11 @@ class TurnSnapshot:
     state: CardState
     error: str = ""
     waiting_for: WaitingFor | None = None
+    # Latest permission mode known for this turn — set by ingesting
+    # transcript `permission-mode` records (see :class:`ModeChange`). The
+    # renderer mirrors this onto the Mode button label so users in Lark
+    # can see at a glance which mode Claude is in.
+    current_mode: str = DEFAULT_PERMISSION_MODE
 
 
 @dataclass
@@ -107,6 +137,11 @@ class TurnAccumulator:
     _committed_text_parts: int = 0
     _committed_tool_calls: int = 0
     _committed_thinking_parts: int = 0
+    # Latest permission mode seen on this turn's transcript. The bootstrap
+    # initializes this from the binding's carry-over so a new turn opening
+    # while Claude is in (say) acceptEdits doesn't briefly flash "default"
+    # on the button before the next permission-mode record lands.
+    current_mode: str = DEFAULT_PERMISSION_MODE
 
     def ingest(self, event: Event) -> None:
         """Fold a single Event into the running snapshot.
@@ -138,6 +173,13 @@ class TurnAccumulator:
             # users can use the show_pane button to see raw output, and the
             # final transcript view is in the desktop's tmux. Keeping the
             # branch here so future code can fold short results into detail.
+            return
+        if isinstance(event, ModeChange):
+            # Track the latest mode — the renderer reads `current_mode`
+            # on every snapshot and labels the Mode button accordingly.
+            # We don't add a UI marker for the *change* itself (would be
+            # noisy across a session); just keep the value current.
+            self.current_mode = event.mode
             return
 
     def commit(self) -> None:
@@ -205,6 +247,7 @@ class TurnAccumulator:
             state=state,
             error=error,
             waiting_for=waiting_for,
+            current_mode=self.current_mode,
         )
 
     def snapshot_window(
@@ -234,6 +277,7 @@ class TurnAccumulator:
             state=state,
             error=error,
             waiting_for=waiting_for,
+            current_mode=self.current_mode,
         )
 
     def find_fit_window(self, max_chars: int) -> tuple[int, int, int]:
@@ -338,7 +382,12 @@ def render_card(
     if ends_with_continuation_marker:
         body = body + _CONTINUATION_FOOTER
     detail = _render_detail(snapshot)
-    actions = list(DEFAULT_RUNNING_ACTIONS) if snapshot.state == "running" else None
+    actions: list[CardButton] | None = None
+    if snapshot.state == "running":
+        # Build a per-card action row so the Mode button can carry the
+        # current permission mode as a suffix. The body of the action row
+        # is otherwise static — only the Mode button label is dynamic.
+        actions = list(build_running_actions(mode_label(snapshot.current_mode)))
 
     return build_status_card(
         title=title,

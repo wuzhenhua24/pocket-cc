@@ -29,7 +29,7 @@ from pocket_cc.app.config import events_jsonl_path
 from pocket_cc.app.persistence import Registry
 from pocket_cc.claude.events import EventsReader
 from pocket_cc.claude.hooks import all_installed as hooks_all_installed
-from pocket_cc.claude.transcript import TranscriptReader
+from pocket_cc.claude.transcript import ModeChange, TranscriptReader
 from pocket_cc.lark.client import LarkApiError, LarkOapiClient
 from pocket_cc.lark.event_loop import LarkEventLoop
 from pocket_cc.relay.card_renderer import ROTATE_AT_CHARS, render_card, should_rotate
@@ -166,6 +166,14 @@ class Pocketcc:
         rendering. Rotation is **disabled while waiting** to avoid the
         weird UX of rotating mid-prompt.
         """
+        # Permission-mode records can arrive between turns (e.g. user
+        # pressed Shift-Tab in the tmux pane while no Lark turn was open)
+        # — keep the binding's mode current regardless, so the next turn
+        # that opens initializes its accumulator with the right mode.
+        for ev in events:
+            if isinstance(ev, ModeChange):
+                binding.current_mode = ev.mode
+
         turn = binding.current_turn
         if turn is None:
             logger.debug(

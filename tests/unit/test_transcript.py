@@ -166,15 +166,40 @@ def test_parse_skips_empty_strings() -> None:
 
 
 def test_parse_ignores_known_metadata_records() -> None:
+    # `permission-mode` is intentionally NOT in this list — see
+    # test_parse_permission_mode_yields_mode_change_event.
     for record_type in [
         "system",
         "attachment",
-        "permission-mode",
         "last-prompt",
         "file-history-snapshot",
         "summary",
     ]:
         assert parse_record({"type": record_type, "uuid": "x"}) == []
+
+
+def test_parse_permission_mode_yields_mode_change_event() -> None:
+    from pocket_cc.claude.transcript import ModeChange
+
+    record = {
+        "type": "permission-mode",
+        "permissionMode": "acceptEdits",
+        "sessionId": "abc",
+    }
+    events = parse_record(record)
+    assert len(events) == 1
+    ev = events[0]
+    assert isinstance(ev, ModeChange)
+    assert ev.mode == "acceptEdits"
+
+
+def test_parse_permission_mode_with_missing_field_is_skipped() -> None:
+    # No `permissionMode` key → no event (silent skip on schema drift).
+    assert parse_record({"type": "permission-mode", "sessionId": "abc"}) == []
+    # `permissionMode` not a string → also skipped.
+    assert parse_record({"type": "permission-mode", "permissionMode": 7}) == []
+    # Empty string → skipped (treat as no useful signal).
+    assert parse_record({"type": "permission-mode", "permissionMode": ""}) == []
 
 
 def test_parse_unknown_record_type() -> None:

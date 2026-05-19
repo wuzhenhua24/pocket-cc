@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pocket_cc.claude.transcript import (
     AssistantText,
     AssistantThinking,
+    ModeChange,
     ToolResult,
     ToolUse,
     UserText,
@@ -12,6 +15,7 @@ from pocket_cc.claude.transcript import (
 from pocket_cc.relay.card_renderer import (
     TurnAccumulator,
     format_tool_call,
+    mode_label,
     render_card,
     should_rotate,
 )
@@ -612,3 +616,92 @@ def test_chunked_rotation_no_truncation_message_when_split() -> None:
             f"across rotations, not truncated. Got:\n{body}"
         )
     assert "截断" not in final_body
+
+
+# =============================================================== permission mode
+
+
+def _mode_button_text(card: dict[str, Any]) -> str:
+    """Pull the Mode button's text content out of a rendered running card."""
+    action_row = card["elements"][-1]
+    assert action_row["tag"] == "action"
+    buttons = action_row["actions"]
+    mode_buttons = [
+        b for b in buttons if b["value"].get("action") == "key" and b["value"].get("key") == "BTab"
+    ]
+    assert len(mode_buttons) == 1, "expected exactly one Mode (BTab) button"
+    return str(mode_buttons[0]["text"]["content"])
+
+
+def test_mode_label_friendly_chinese_for_known_modes() -> None:
+    assert mode_label("default") == "默认"
+    assert mode_label("acceptEdits") == "自动接受"
+    assert mode_label("plan") == "计划"
+    assert mode_label("bypassPermissions") == "跳过权限"
+
+
+def test_mode_label_unknown_falls_back_to_raw() -> None:
+    """Unknown modes return the raw string so schema drift is visible
+    (rather than silently masked behind a generic label)."""
+    assert mode_label("newFancyMode") == "newFancyMode"
+
+
+def test_accumulator_ingests_mode_change_event() -> None:
+    acc = TurnAccumulator()
+    assert acc.current_mode == "default"
+    acc.ingest(ModeChange(uuid="m1", timestamp="t", mode="acceptEdits"))
+    assert acc.current_mode == "acceptEdits"
+    # Subsequent change overrides
+    acc.ingest(ModeChange(uuid="m2", timestamp="t", mode="plan"))
+    assert acc.current_mode == "plan"
+
+
+def test_snapshot_propagates_current_mode() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(ModeChange(uuid="m1", timestamp="t", mode="acceptEdits"))
+    snap = acc.snapshot(state="running")
+    assert snap.current_mode == "acceptEdits"
+
+
+def test_running_card_mode_button_shows_default_label_by_default() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "demo"
+    card = render_card(acc.snapshot(state="running"))
+    text = _mode_button_text(card)
+    # Suffix is shown — gives users an immediate "I can see what mode I'm in"
+    # without having to click the button to find out.
+    assert "默认" in text
+    assert "⇧⭾" in text
+
+
+def test_running_card_mode_button_reflects_current_mode() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "demo"
+    acc.ingest(ModeChange(uuid="m1", timestamp="t", mode="acceptEdits"))
+    card = render_card(acc.snapshot(state="running"))
+    text = _mode_button_text(card)
+    assert "自动接受" in text
+
+
+def test_running_card_mode_button_shows_raw_for_unknown_mode() -> None:
+    """If Claude ships a new permission mode we haven't mapped, the button
+    surfaces the raw key — the user still sees something useful, and we
+    can spot the new mode in transcripts to add a friendly label."""
+    acc = TurnAccumulator()
+    acc.user_prompt = "demo"
+    acc.ingest(ModeChange(uuid="m1", timestamp="t", mode="someFutureMode"))
+    card = render_card(acc.snapshot(state="running"))
+    assert "someFutureMode" in _mode_button_text(card)
+
+
+def test_done_card_has_no_action_row() -> None:
+    """Sanity check — only running cards carry the action row, so mode
+    label only appears on cards that have buttons. Done/failed cards
+    don't have a Mode button at all (turn is over, can't change modes
+    from a sealed card)."""
+    acc = TurnAccumulator()
+    acc.user_prompt = "done thing"
+    card = render_card(acc.snapshot(state="done"))
+    tags = [e.get("tag") for e in card["elements"]]
+    assert "action" not in tags

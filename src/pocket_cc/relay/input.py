@@ -227,6 +227,10 @@ class InputRouter:
     def _open_turn(self, binding: ChatBinding, user_text: str) -> None:
         accumulator = TurnAccumulator()
         accumulator.user_prompt = user_text  # show immediately, transcript will confirm
+        # Carry over the session-level permission mode so the Mode button
+        # on the very first card render doesn't flash "默认" before the
+        # next transcript `permission-mode` record lands.
+        accumulator.current_mode = binding.current_mode
 
         try:
             message_id = self._lark.send_card(

@@ -103,6 +103,13 @@ class ChatBinding:
     # We expose a per-binding sentinel so future hooks can serialize updates
     # without forcing all callers through the registry lock.
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Latest permission mode seen on this binding's transcript (session-
+    # scoped). The bootstrap updates this on every `permission-mode`
+    # record (including ones that arrive between turns, when no
+    # accumulator is around to absorb them). New turns inherit it on
+    # open so the Mode button label doesn't briefly flash "默认" when a
+    # session is already in (e.g.) acceptEdits.
+    current_mode: str = "default"
 
 
 class Registry:

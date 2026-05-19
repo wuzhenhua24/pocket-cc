@@ -8,11 +8,16 @@ Top-level JSONL record types we care about:
   - `user`       → user text, or a list with `tool_result` blocks
   - `assistant`  → list of `text` / `thinking` / `tool_use` blocks
 
-Other record types (`system`, `attachment`, `permission-mode`, `last-prompt`,
+Other record types (`system`, `attachment`, `last-prompt`,
 `file-history-snapshot`, `summary`) are intentionally skipped at this layer —
 they have no direct UX in the Lark projection. Hook events (Stop /
 StopFailure / Notification) come from a separate `events.jsonl` channel,
 implemented in `claude/monitor.py` (later slice).
+
+The `permission-mode` record IS surfaced — Claude writes one every time the
+user presses Shift-Tab (cycles default/acceptEdits/plan/bypassPermissions),
+and pocket-cc reflects the current mode in the Lark card's Mode button label
+so the user can tell which mode they're in without staring at tmux.
 
 Schema reference (empirically verified against Claude Code 2.1.x transcripts):
 
@@ -43,11 +48,11 @@ from pathlib import Path  # noqa: TC003 — used as dataclass field type, must b
 from typing import Any, Final
 
 # JSONL records that carry no Lark-visible content. Skipped silently.
+# `permission-mode` is intentionally *not* here — see `_parse_permission_mode`.
 _IGNORED_RECORD_TYPES: Final[frozenset[str]] = frozenset(
     {
         "system",
         "attachment",
-        "permission-mode",
         "last-prompt",
         "file-history-snapshot",
         "summary",
@@ -99,7 +104,25 @@ class ToolResult:
     is_error: bool
 
 
-Event = UserText | AssistantText | AssistantThinking | ToolUse | ToolResult
+@dataclass(frozen=True, slots=True)
+class ModeChange:
+    """Permission-mode change emitted on Shift-Tab cycling.
+
+    Record shape (no ``message`` envelope, unlike user/assistant):
+        {"type":"permission-mode","permissionMode":"acceptEdits","sessionId":"..."}
+
+    Claude writes one of these at session start (mode == "default") and on
+    every subsequent mode toggle. The relay layer uses the latest-seen value
+    to label the Mode button so users in Lark know which mode is active
+    without checking the tmux pane.
+    """
+
+    uuid: str
+    timestamp: str
+    mode: str  # "default" | "acceptEdits" | "plan" | "bypassPermissions" | ...
+
+
+Event = UserText | AssistantText | AssistantThinking | ToolUse | ToolResult | ModeChange
 
 
 # ----------------------------------------------------------------------- API
@@ -118,6 +141,12 @@ def parse_record(record: dict[str, Any]) -> list[Event]:
 
     uuid = record.get("uuid", "")
     timestamp = record.get("timestamp", "")
+
+    # permission-mode records have no `message` envelope — handle before the
+    # isinstance(message, dict) guard below so they don't get dropped.
+    if record_type == "permission-mode":
+        return _parse_permission_mode(uuid, timestamp, record)
+
     message = record.get("message")
     if not isinstance(message, dict):
         return []
@@ -200,6 +229,22 @@ def _parse_assistant(uuid: str, timestamp: str, message: dict[str, Any]) -> list
         elif block_type == "tool_use":
             events.append(_make_tool_use(uuid, timestamp, block))
     return events
+
+
+def _parse_permission_mode(
+    uuid: str, timestamp: str, record: dict[str, Any]
+) -> list[Event]:
+    """permission-mode records have no `message`; the mode is at the top level.
+
+    Example: ``{"type":"permission-mode","permissionMode":"acceptEdits", ...}``.
+    Records missing or with a non-str ``permissionMode`` yield no event
+    (rather than raising) — schema drift in third-party transcripts
+    shouldn't crash the bot.
+    """
+    mode = record.get("permissionMode")
+    if not isinstance(mode, str) or not mode:
+        return []
+    return [ModeChange(uuid=uuid, timestamp=timestamp, mode=mode)]
 
 
 def _make_tool_use(uuid: str, timestamp: str, block: dict[str, Any]) -> ToolUse:
