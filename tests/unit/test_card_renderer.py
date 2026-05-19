@@ -13,6 +13,7 @@ from pocket_cc.relay.card_renderer import (
     TurnAccumulator,
     format_tool_call,
     render_card,
+    should_rotate,
 )
 
 
@@ -302,3 +303,169 @@ def test_waiting_option_can_carry_keys_response() -> None:
     # Just verify it renders and includes the option label
     buttons = card["elements"][-1]["actions"]
     assert "Top" in buttons[0]["text"]["content"]
+
+
+# ============================================================ rotation (M2-F)
+
+
+def test_should_rotate_false_for_short_body() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="short"))
+    assert should_rotate(acc.snapshot(state="running")) is False
+
+
+def test_should_rotate_true_for_long_body() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="A" * 3500))
+    assert should_rotate(acc.snapshot(state="running")) is True
+
+
+def test_should_rotate_false_when_waiting() -> None:
+    """Waiting cards never rotate — option buttons stay on the current card."""
+    from pocket_cc.relay.waiting import (
+        TextResponse,
+        WaitingFor,
+        WaitingOption,
+    )
+
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="A" * 5000))
+    waiting = WaitingFor(
+        source="permission",
+        question="q",
+        options=(WaitingOption(label="Yes", response=TextResponse(text="1")),),
+    )
+    snap = acc.snapshot(state="waiting", waiting_for=waiting)
+    assert should_rotate(snap) is False
+
+
+def test_accumulator_commit_starts_from_committed_fresh() -> None:
+    """After commit(), from_committed=True hides what was committed."""
+    acc = TurnAccumulator()
+    acc.ingest(UserText(uuid="u", timestamp="t", text="ask"))
+    acc.ingest(AssistantText(uuid="a1", timestamp="t", text="first chunk"))
+    acc.commit()
+    acc.ingest(AssistantText(uuid="a2", timestamp="t", text="second chunk"))
+
+    fresh = acc.snapshot(state="running", from_committed=True)
+    full = acc.snapshot(state="running", from_committed=False)
+
+    # Committed view sees only the post-commit text
+    assert "second chunk" in fresh.assistant_text
+    assert "first chunk" not in fresh.assistant_text
+    # Full view still has everything
+    assert "first chunk" in full.assistant_text
+    assert "second chunk" in full.assistant_text
+
+
+def test_accumulator_commit_also_partitions_tool_calls() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(
+        ToolUse(
+            uuid="t1",
+            timestamp="t",
+            tool_use_id="u1",
+            tool_name="Read",
+            tool_input={"file_path": "/a/b/before.py"},
+        )
+    )
+    acc.commit()
+    acc.ingest(
+        ToolUse(
+            uuid="t2",
+            timestamp="t",
+            tool_use_id="u2",
+            tool_name="Read",
+            tool_input={"file_path": "/a/b/after.py"},
+        )
+    )
+
+    fresh = acc.snapshot(state="running", from_committed=True)
+    assert len(fresh.tool_calls) == 1
+    assert "after.py" in fresh.tool_calls[0]
+    full = acc.snapshot(state="running", from_committed=False)
+    assert len(full.tool_calls) == 2
+
+
+def test_accumulator_commit_partitions_thinking() -> None:
+    acc = TurnAccumulator()
+    acc.ingest(AssistantThinking(uuid="th1", timestamp="t", text="early thoughts"))
+    acc.commit()
+    acc.ingest(AssistantThinking(uuid="th2", timestamp="t", text="later thoughts"))
+
+    fresh = acc.snapshot(state="running", from_committed=True)
+    assert "early thoughts" not in fresh.thinking
+    assert "later thoughts" in fresh.thinking
+
+
+def test_render_card_continuation_title_has_prefix() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "原始提问"
+    card = render_card(acc.snapshot(state="running"), is_continuation=True)
+    title = card["header"]["title"]["content"]
+    assert "(续)" in title
+    assert "原始提问" in title
+
+
+def test_render_card_with_continuation_marker_appends_footer() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="some content"))
+    card = render_card(
+        acc.snapshot(state="running"),
+        ends_with_continuation_marker=True,
+    )
+    body = card["elements"][0]["content"]
+    assert "续下条" in body
+    assert "⏬" in body
+
+
+def test_render_card_no_continuation_marker_by_default() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="some content"))
+    card = render_card(acc.snapshot(state="running"))
+    body = card["elements"][0]["content"]
+    assert "续下条" not in body
+
+
+def test_rotation_dataflow_end_to_end() -> None:
+    """Simulate the bootstrap rotation flow against the accumulator/renderer.
+
+    1. Ingest enough to trigger rotation.
+    2. Render the "sealing" card (with continuation marker).
+    3. commit() the accumulator.
+    4. Render the "starter" card (continuation prefix, ~empty body).
+    5. Ingest more content; new card body should only contain *new* content.
+    """
+    acc = TurnAccumulator()
+    acc.user_prompt = "long task"
+    acc.ingest(AssistantText(uuid="a1", timestamp="t", text="A" * 3000))
+
+    # Step 1: confirm rotation needed
+    pre_snap = acc.snapshot(state="running", from_committed=True)
+    assert should_rotate(pre_snap)
+
+    # Step 2: render sealing card
+    sealing = render_card(pre_snap, ends_with_continuation_marker=True)
+    assert "续下条" in sealing["elements"][0]["content"]
+
+    # Step 3: commit
+    acc.commit()
+    starter_snap = acc.snapshot(state="running", from_committed=True)
+    assert starter_snap.assistant_text == ""
+    assert should_rotate(starter_snap) is False
+
+    # Step 4: render continuation starter
+    starter_card = render_card(starter_snap, is_continuation=True)
+    assert "(续)" in starter_card["header"]["title"]["content"]
+
+    # Step 5: new content shows only on the new card
+    acc.ingest(AssistantText(uuid="a2", timestamp="t", text="brand new content"))
+    new_snap = acc.snapshot(state="running", from_committed=True)
+    assert "brand new content" in new_snap.assistant_text
+    assert "A" * 100 not in new_snap.assistant_text  # not in committed view

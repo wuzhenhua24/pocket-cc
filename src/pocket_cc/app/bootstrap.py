@@ -30,9 +30,10 @@ from pocket_cc.app.persistence import Registry
 from pocket_cc.claude.events import EventsReader
 from pocket_cc.claude.hooks import all_installed as hooks_all_installed
 from pocket_cc.claude.transcript import TranscriptReader
-from pocket_cc.lark.client import LarkOapiClient
+from pocket_cc.lark.client import LarkApiError, LarkOapiClient
 from pocket_cc.lark.event_loop import LarkEventLoop
-from pocket_cc.relay.card_renderer import render_card
+from pocket_cc.relay.card_renderer import render_card, should_rotate
+from pocket_cc.relay.card_stream import CardStream
 from pocket_cc.relay.events_router import EventsPoller, HookEventsDispatcher
 from pocket_cc.relay.input import InputRouter
 from pocket_cc.relay.output import TranscriptPoller
@@ -41,9 +42,10 @@ from pocket_cc.tmux import TmuxManager
 
 if TYPE_CHECKING:
     from pocket_cc.app.config import Config
-    from pocket_cc.app.persistence import ChatBinding
+    from pocket_cc.app.persistence import ChatBinding, TurnState
     from pocket_cc.claude.events import HookEvent
     from pocket_cc.claude.transcript import Event
+    from pocket_cc.relay.card_renderer import TurnSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -151,13 +153,18 @@ class Pocketcc:
     # -------------------------------------------------------------- internal
 
     def _handle_events(self, binding: ChatBinding, events: list[Event]) -> None:
-        """Poller → accumulator → re-render → throttled patch.
+        """Poller → accumulator → maybe rotate → re-render → throttled patch.
 
         Skips silently when there is no active turn (e.g. Claude emitted
         startup/clear-prompt records while no user message is pending).
         Honors `turn.waiting_for` (set by PaneWatcher) so a transcript tick
         arriving mid-prompt doesn't accidentally flip the card back to
         running.
+
+        Card rotation (M2-F): if the body of the current card grew past
+        ``_ROTATE_AT_CHARS``, seal it and start a fresh "(续)" card before
+        rendering. Rotation is **disabled while waiting** to avoid the
+        weird UX of rotating mid-prompt.
         """
         turn = binding.current_turn
         if turn is None:
@@ -176,11 +183,89 @@ class Pocketcc:
         )
         for ev in events:
             turn.accumulator.ingest(ev)
+        self._publish_card(binding, turn)
+
+    def _publish_card(self, binding: ChatBinding, turn: TurnState) -> None:
+        """Render the current accumulator state to a card and patch it.
+
+        Single re-render path used by both the transcript-poller callback
+        and the pane-watcher callback. Owns the rotation decision so both
+        paths get the same long-content handling.
+        """
+        snapshot = self._snapshot_active(turn)
+        if should_rotate(snapshot):
+            self._rotate_card(binding, turn)
+            # Re-snapshot: accumulator's committed cursor moved, so the
+            # new snapshot reflects only post-rotation content (likely
+            # empty until the next ingest).
+            snapshot = self._snapshot_active(turn)
+        card = render_card(snapshot, is_continuation=turn.is_continuation)
+        turn.card_stream.update(card)
+
+    def _snapshot_active(self, turn: TurnState) -> TurnSnapshot:
+        """Snapshot helper that respects waiting_for + from_committed."""
         if turn.waiting_for is not None:
-            snapshot = turn.accumulator.snapshot(state="waiting", waiting_for=turn.waiting_for)
-        else:
-            snapshot = turn.accumulator.snapshot(state="running")
-        turn.card_stream.update(render_card(snapshot))
+            return turn.accumulator.snapshot(
+                state="waiting",
+                waiting_for=turn.waiting_for,
+                from_committed=True,
+            )
+        return turn.accumulator.snapshot(state="running", from_committed=True)
+
+    def _rotate_card(self, binding: ChatBinding, turn: TurnState) -> None:
+        """Seal the current card with a "⏬ 续下条" footer and open a new one."""
+        # Render the sealing body from whatever's *currently* committed-onward.
+        sealing_snapshot = turn.accumulator.snapshot(
+            state="running", from_committed=True
+        )
+        sealing_card = render_card(
+            sealing_snapshot,
+            is_continuation=turn.is_continuation,
+            ends_with_continuation_marker=True,
+        )
+        try:
+            turn.card_stream.close(sealing_card)
+        except Exception:
+            logger.warning(
+                "rotation: closing sealed card failed",
+                extra={"chat_id": binding.chat_id},
+                exc_info=True,
+            )
+
+        # Mark everything we just sealed as committed — the next card
+        # starts fresh.
+        turn.accumulator.commit()
+
+        # Open a fresh continuation card.
+        starter_snapshot = turn.accumulator.snapshot(
+            state="running", from_committed=True
+        )
+        new_card = render_card(starter_snapshot, is_continuation=True)
+        try:
+            new_message_id = self._lark.send_card(binding.chat_id, new_card)
+        except LarkApiError:
+            logger.exception(
+                "rotation: failed to send continuation card — turn is now orphaned",
+                extra={"chat_id": binding.chat_id},
+            )
+            # Leave the old (closed) card_stream in place. Subsequent
+            # updates will be no-ops; that's at least better than crashing.
+            return
+
+        new_stream = CardStream(
+            self._lark, new_message_id, interval_s=self._config.patch_interval_s
+        )
+        new_stream.start()
+        turn.card_stream = new_stream
+        turn.card_message_id = new_message_id
+        turn.is_continuation = True
+        logger.info(
+            "rotated card (continuation)",
+            extra={
+                "chat_id": binding.chat_id,
+                "new_card_id": new_message_id,
+            },
+        )
 
     # ----------------------------------------------------- pane watcher (M2-C)
 
@@ -189,16 +274,13 @@ class Pocketcc:
 
         Re-render the card to reflect the new state. CardStream's throttle
         + hash dedupe handles the case where the rendered content didn't
-        actually change.
+        actually change. Goes through the same rotation-aware path as
+        transcript updates.
         """
         turn = binding.current_turn
         if turn is None:
             return
-        if turn.waiting_for is not None:
-            snapshot = turn.accumulator.snapshot(state="waiting", waiting_for=turn.waiting_for)
-        else:
-            snapshot = turn.accumulator.snapshot(state="running")
-        turn.card_stream.update(render_card(snapshot))
+        self._publish_card(binding, turn)
 
     # ---------------------------------------------------- hook event callbacks
 

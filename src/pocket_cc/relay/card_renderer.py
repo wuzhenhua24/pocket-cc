@@ -38,11 +38,22 @@ if TYPE_CHECKING:
     from pocket_cc.relay.waiting import WaitingFor
 
 # Lark cards larger than ~30KB get rejected; the body field is the long pole.
-# We trim aggressively because the user can use the [📜 内容] button to dump
-# the raw pane for full context.
+# These two thresholds:
+#   _BODY_MAX_CHARS  — soft cap; over this we tail-truncate within a single
+#                      card (used when M2-F rotation isn't applicable, e.g.
+#                      waiting cards, failed-state error dumps).
+#   _ROTATE_AT_CHARS — bootstrap watches this; once a card's rendered body
+#                      passes it, the card is sealed with a "⏬ 续下条" footer
+#                      and a fresh card begins (M2-F).
 _BODY_MAX_CHARS = 3000
+_ROTATE_AT_CHARS = 2500
 _THINKING_MAX_CHARS = 2000
 _TITLE_MAX_CHARS = 60
+# Continuation marker appended to the body of a card we're about to close
+# because its content reached the rotation threshold. The next card carries
+# `_CONTINUATION_TITLE_PREFIX` so the user can visually thread them together.
+_CONTINUATION_FOOTER = "\n\n_⏬ 内容续下条_"
+_CONTINUATION_TITLE_PREFIX = "(续) "
 # Lark renders action rows OK up to ~6 buttons on mobile; we reserve 2 slots
 # for ⏹ 中断 / ⎋ Esc and dedicate up to 4 to waiting-prompt options. Options
 # beyond this still appear in the body text (numbered), and the user can
@@ -72,13 +83,29 @@ class TurnSnapshot:
 
 @dataclass
 class TurnAccumulator:
-    """Stateful aggregator — fed Events, emits TurnSnapshot."""
+    """Stateful aggregator — fed Events, emits TurnSnapshot.
+
+    Supports **card rotation** (M2-F): when a single Lark card's body grows
+    past the rotation threshold, the bootstrap layer seals it and starts a
+    fresh card. Call :meth:`commit` after sealing — subsequent
+    ``snapshot(from_committed=True)`` calls yield only the new content that
+    hasn't been shown yet.
+
+    The accumulator itself keeps the **full** history so the final summary
+    (or a "show everything" feature later) can still see the whole turn.
+    """
 
     user_prompt: str = ""
     _assistant_text_parts: list[str] = field(default_factory=list)
     _tool_calls: list[str] = field(default_factory=list)
     _thinking_parts: list[str] = field(default_factory=list)
     _seen_uuids: set[str] = field(default_factory=set)
+    # M2-F rotation cursors — number of parts/calls already shown in
+    # previous cards (closed). snapshot(from_committed=True) returns only
+    # items past these indices.
+    _committed_text_parts: int = 0
+    _committed_tool_calls: int = 0
+    _committed_thinking_parts: int = 0
 
     def ingest(self, event: Event) -> None:
         """Fold a single Event into the running snapshot.
@@ -112,17 +139,45 @@ class TurnAccumulator:
             # branch here so future code can fold short results into detail.
             return
 
+    def commit(self) -> None:
+        """Mark everything currently in the accumulator as "already shown".
+
+        Called by the bootstrap when it seals an oversized card and opens
+        a new one. The next ``snapshot(from_committed=True)`` will only
+        contain text/tool_calls/thinking that arrived **after** this commit.
+        """
+        self._committed_text_parts = len(self._assistant_text_parts)
+        self._committed_tool_calls = len(self._tool_calls)
+        self._committed_thinking_parts = len(self._thinking_parts)
+
     def snapshot(
         self,
         state: CardState = "running",
         error: str = "",
         waiting_for: WaitingFor | None = None,
+        *,
+        from_committed: bool = False,
     ) -> TurnSnapshot:
+        """Render a TurnSnapshot of the current state.
+
+        Args:
+            from_committed: When True, returns only content that arrived
+                **after** the last :meth:`commit`. Used for the active
+                (in-progress) card during M2-F rotation. False (default)
+                yields the full turn — used for final / shutdown snapshots.
+        """
+        text_parts = self._assistant_text_parts
+        tool_calls = self._tool_calls
+        thinking_parts = self._thinking_parts
+        if from_committed:
+            text_parts = text_parts[self._committed_text_parts :]
+            tool_calls = tool_calls[self._committed_tool_calls :]
+            thinking_parts = thinking_parts[self._committed_thinking_parts :]
         return TurnSnapshot(
             user_prompt=self.user_prompt,
-            assistant_text="\n\n".join(p for p in self._assistant_text_parts if p),
-            tool_calls=list(self._tool_calls),
-            thinking="\n\n".join(p for p in self._thinking_parts if p),
+            assistant_text="\n\n".join(p for p in text_parts if p),
+            tool_calls=list(tool_calls),
+            thinking="\n\n".join(p for p in thinking_parts if p),
             state=state,
             error=error,
             waiting_for=waiting_for,
@@ -132,7 +187,27 @@ class TurnAccumulator:
 # --------------------------------------------------------------- render layer
 
 
-def render_card(snapshot: TurnSnapshot) -> dict[str, Any]:
+def should_rotate(snapshot: TurnSnapshot) -> bool:
+    """Whether this snapshot's body already exceeds the rotation threshold.
+
+    Used by the bootstrap to decide if it's time to seal the current card
+    and start a "(续)" continuation card. Centralized here so the threshold
+    constant stays private to this module.
+
+    Waiting cards never rotate — the option buttons need to stay on the
+    user's active card.
+    """
+    if snapshot.waiting_for is not None:
+        return False
+    return len(_render_body(snapshot)) > _ROTATE_AT_CHARS
+
+
+def render_card(
+    snapshot: TurnSnapshot,
+    *,
+    is_continuation: bool = False,
+    ends_with_continuation_marker: bool = False,
+) -> dict[str, Any]:
     """Render a TurnSnapshot to the Lark card dict.
 
     State-driven shape:
@@ -140,12 +215,21 @@ def render_card(snapshot: TurnSnapshot) -> dict[str, Any]:
       - done:    green header, no action row (turn is over)
       - failed:  red header, error in body
       - waiting: orange header, prompt + option buttons (M2-0)
+
+    M2-F rotation parameters:
+      - ``is_continuation``: render with "(续)" prefix on the title (used
+        for the 2nd+ card in a rotated turn).
+      - ``ends_with_continuation_marker``: append "⏬ 内容续下条" footer
+        (used when sealing a card because the next card is starting).
     """
     if snapshot.waiting_for is not None:
         return _render_waiting_card(snapshot, snapshot.waiting_for)
 
-    title = _shorten(snapshot.user_prompt, _TITLE_MAX_CHARS) or "Claude"
+    title_body = _shorten(snapshot.user_prompt, _TITLE_MAX_CHARS) or "Claude"
+    title = f"{_CONTINUATION_TITLE_PREFIX}{title_body}" if is_continuation else title_body
     body = _render_body(snapshot)
+    if ends_with_continuation_marker:
+        body = body + _CONTINUATION_FOOTER
     detail = _render_detail(snapshot)
     actions = list(DEFAULT_RUNNING_ACTIONS) if snapshot.state == "running" else None
 

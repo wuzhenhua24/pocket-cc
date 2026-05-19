@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class TurnState:
-    """One user message → one card → one accumulator + stream.
+    """One user message → (possibly several) cards → one accumulator + stream.
 
     Spans from the moment the user sends a message until either:
       - the next user message arrives (we close this turn, start a new one), or
@@ -52,12 +52,20 @@ class TurnState:
     answering the prompt) rather than a new turn. Cleared back to None
     when the user responds, or when the detector notices the prompt is
     gone. See `relay.waiting`.
+
+    Card rotation (M2-F): when an active card's body grows past the
+    rotation threshold, the bootstrap seals it (with a "⏬ 续下条" footer)
+    and opens a fresh card. ``card_message_id`` and ``card_stream`` are
+    replaced in place. ``is_continuation`` flips True after the first
+    rotation so subsequent cards get the "(续)" title prefix. The
+    accumulator's commit cursor tracks what's already been sealed.
     """
 
     card_message_id: str
     card_stream: CardStream
     accumulator: TurnAccumulator
     waiting_for: WaitingFor | None = None
+    is_continuation: bool = False
 
 
 @dataclass
