@@ -8,6 +8,7 @@ from pocket_cc.lark.card import (
     ExpandableSection,
     build_status_card,
     build_text_card,
+    normalize_markdown_for_lark,
 )
 
 
@@ -101,3 +102,137 @@ def test_default_running_actions_shape() -> None:
     keys = [b.value["key"] for b in DEFAULT_RUNNING_ACTIONS if b.value.get("action") == "key"]
     assert "Escape" in keys
     assert "BTab" in keys
+
+
+# =================================================== normalize_markdown_for_lark
+
+
+def test_normalize_passes_through_already_compatible_markdown() -> None:
+    src = "**bold** and *italic* with `code` and [link](https://x)\n- a\n- b\n"
+    assert normalize_markdown_for_lark(src) == src
+
+
+def test_normalize_empty_string_is_noop() -> None:
+    assert normalize_markdown_for_lark("") == ""
+
+
+def test_normalize_converts_headings_to_bold() -> None:
+    src = "# Title\n## Section\n### Sub\nbody"
+    out = normalize_markdown_for_lark(src)
+    assert out == "**Title**\n**Section**\n**Sub**\nbody"
+
+
+def test_normalize_preserves_heading_indentation() -> None:
+    src = "  ## indented heading"
+    out = normalize_markdown_for_lark(src)
+    assert out == "  **indented heading**"
+
+
+def test_normalize_only_touches_atx_headings() -> None:
+    """`#tag` (no space) is NOT a heading — must stay as-is.
+    Same for `text # not-a-heading` mid-line."""
+    src = "#tag should-stay\nfoo #not heading"
+    assert normalize_markdown_for_lark(src) == src
+
+
+def test_normalize_is_idempotent() -> None:
+    src = "## hello\n| a | b |\n|---|---|\n| 1 | 2 |\n"
+    once = normalize_markdown_for_lark(src)
+    twice = normalize_markdown_for_lark(once)
+    assert once == twice
+
+
+def test_normalize_converts_two_column_table() -> None:
+    src = (
+        "| 模块 | 说明 |\n"
+        "|---|---|\n"
+        "| ploto-bff | Backend for Frontend 层 |\n"
+        "| ploto-monitor | 监控指标功能 |\n"
+    )
+    out = normalize_markdown_for_lark(src)
+    assert "**模块**: ploto-bff" in out
+    assert "**说明**: Backend for Frontend 层" in out
+    assert "**模块**: ploto-monitor" in out
+    # No leftover GFM table syntax in output
+    assert "|---" not in out
+    assert "| 模块 | 说明 |" not in out
+    # Each row becomes a list item
+    rows = [line for line in out.splitlines() if line.startswith("- ")]
+    assert len(rows) == 2
+
+
+def test_normalize_converts_three_column_table() -> None:
+    src = "| h1 | h2 | h3 |\n|---|---|---|\n| a | b | c |\n"
+    out = normalize_markdown_for_lark(src)
+    assert "**h1**: a" in out
+    assert "**h2**: b" in out
+    assert "**h3**: c" in out
+    assert " · " in out  # multi-column separator
+
+
+def test_normalize_handles_separator_with_alignment() -> None:
+    """GFM tables may use `:---:` / `:---` / `---:` for alignment."""
+    src = "| a | b |\n| :--- | ---: |\n| 1 | 2 |\n"
+    out = normalize_markdown_for_lark(src)
+    assert "**a**: 1" in out
+    assert "**b**: 2" in out
+
+
+def test_normalize_leaves_non_table_pipes_alone() -> None:
+    """A line with `|` but no separator-row underneath isn't a table."""
+    src = "you can use `a | b` syntax in shell pipes\nand `find . | grep foo`"
+    assert normalize_markdown_for_lark(src) == src
+
+
+def test_normalize_mixed_content() -> None:
+    """A realistic Claude response — heading + para + table + list."""
+    src = (
+        "## 核心信息\n"
+        "- **技术栈**: Java 8\n"
+        "\n"
+        "## 主要模块\n"
+        "| 模块 | 说明 |\n"
+        "|---|---|\n"
+        "| ploto-bff | BFF 层 |\n"
+        "\n"
+        "结束。\n"
+    )
+    out = normalize_markdown_for_lark(src)
+    # Headings → bold
+    assert "**核心信息**" in out
+    assert "**主要模块**" in out
+    assert "## " not in out
+    # Existing bold list item stays
+    assert "- **技术栈**: Java 8" in out
+    # Table → bulleted row
+    assert "- **模块**: ploto-bff · **说明**: BFF 层" in out
+    # Trailing text stays
+    assert "结束。" in out
+
+
+def test_build_status_card_normalizes_body() -> None:
+    """End-to-end: heading in body → bold in rendered card content."""
+    card = build_status_card(
+        title="hello",
+        body="## Result\nAll good.",
+    )
+    body_content = card["elements"][0]["content"]
+    assert "**Result**" in body_content
+    assert "## " not in body_content
+
+
+def test_build_status_card_normalizes_detail_content() -> None:
+    card = build_status_card(
+        title="x",
+        body="b",
+        detail=ExpandableSection(label="More", content="## Detail\nbody"),
+    )
+    # Detail markdown is the 4th element (body, hr, note, markdown)
+    detail_md = card["elements"][3]
+    assert detail_md["tag"] == "markdown"
+    assert "**Detail**" in detail_md["content"]
+
+
+def test_build_text_card_normalizes_body() -> None:
+    card = build_text_card(body="## Note\n- one")
+    assert "**Note**" in card["elements"][0]["content"]

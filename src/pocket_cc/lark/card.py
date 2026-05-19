@@ -15,8 +15,9 @@ Schema docs: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/im-v1/message
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 CardState = Literal["running", "done", "failed", "waiting"]
 
@@ -77,7 +78,7 @@ def build_status_card(
     """
     color, emoji = _STATE_STYLE[state]
     elements: list[dict[str, Any]] = [
-        {"tag": "markdown", "content": body},
+        {"tag": "markdown", "content": normalize_markdown_for_lark(body)},
     ]
 
     if detail is not None:
@@ -88,7 +89,7 @@ def build_status_card(
                 "elements": [{"tag": "plain_text", "content": f"▸ {detail.label}"}],
             }
         )
-        elements.append({"tag": "markdown", "content": detail.content})
+        elements.append({"tag": "markdown", "content": normalize_markdown_for_lark(detail.content)})
 
     if actions:
         elements.append({"tag": "hr"})
@@ -116,8 +117,115 @@ def build_text_card(*, body: str) -> dict[str, Any]:
     """
     return {
         "config": {"wide_screen_mode": True},
-        "elements": [{"tag": "markdown", "content": body}],
+        "elements": [{"tag": "markdown", "content": normalize_markdown_for_lark(body)}],
     }
+
+
+# ----------------------------------------------------------- markdown normalize
+# Lark's interactive-card `markdown` tag renders only a subset of GFM:
+#   ✓ **bold** / *italic* / `code` / ```code block``` / [link](…) / - lists /
+#     ~~strikethrough~~ / line breaks / <font color="…">
+#   ✗ # / ## / ### headings (rendered as literal text)
+#   ✗ GFM tables `| a | b |` (rendered as literal text)
+# Claude Code's responses use both freely (especially when summarizing a
+# project — headings + tables). Without normalization the user sees the
+# raw markdown source, which is what triggered this fix. Anything the user
+# really needs in original form is still available via the [📜 内容] button.
+
+_HEADING_RE: Final[re.Pattern[str]] = re.compile(r"^(\s*)#{1,6}\s+(.+?)\s*$", re.MULTILINE)
+_TABLE_ROW_RE: Final[re.Pattern[str]] = re.compile(r"^\s*\|.*\|\s*$")
+# Separator row: `|---|---|` or `| :--- | ---: |` etc.
+_TABLE_SEP_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$"
+)
+
+
+def normalize_markdown_for_lark(text: str) -> str:
+    """Rewrite Claude/GFM-style markdown into Lark-renderable equivalents.
+
+    Idempotent — calling twice yields the same result as once. Safe to apply
+    to already-Lark-compatible text (no-op for content without headings or
+    tables).
+    """
+    if not text:
+        return text
+    text = _HEADING_RE.sub(lambda m: f"{m.group(1)}**{m.group(2)}**", text)
+    text = _convert_tables(text)
+    return text
+
+
+def _convert_tables(text: str) -> str:
+    """Walk the text line-by-line; replace GFM tables with bulleted lists.
+
+    A GFM table = header row + separator row (---) + zero or more data rows.
+    We render each data row as a list item, with the header-named cells
+    folded in as `**Header**: value` pairs. 2-column key/value tables get
+    the cleanest output; wider tables fall back to ` · ` separated.
+
+    Preserves a trailing newline if the input had one (splitlines + join
+    would otherwise eat it).
+    """
+    if not text:
+        return text
+    has_trailing_newline = text.endswith("\n")
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        # Look for header + separator pattern starting at i.
+        if i + 1 < n and _TABLE_ROW_RE.match(lines[i]) and _TABLE_SEP_RE.match(lines[i + 1]):
+            header = _parse_row(lines[i])
+            i += 2  # consume header + separator
+            while i < n and _TABLE_ROW_RE.match(lines[i]):
+                row = _parse_row(lines[i])
+                if row:
+                    out.append(_render_row_as_list_item(header, row))
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    result = "\n".join(out)
+    return result + "\n" if has_trailing_newline else result
+
+
+def _parse_row(line: str) -> list[str]:
+    """Split `| a | b | c |` into ['a', 'b', 'c']. Empty trailing cells dropped."""
+    stripped = line.strip()
+    # Strip leading + trailing |
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    cells = [c.strip() for c in stripped.split("|")]
+    # Drop empty trailing cells (some tables pad with empty columns)
+    while cells and not cells[-1]:
+        cells.pop()
+    return cells
+
+
+def _render_row_as_list_item(header: list[str], row: list[str]) -> str:
+    """Render one table row as a markdown list item.
+
+    Examples:
+        header=['模块', '说明'], row=['ploto-bff', 'Backend for Frontend 层']
+          → '- **模块**: ploto-bff · **说明**: Backend for Frontend 层'
+        header=['x'], row=['hello']
+          → '- **x**: hello'
+        header=[], row=['hello']
+          → '- hello'
+    """
+    if not row:
+        return ""
+    if not header:
+        return "- " + " · ".join(row)
+    pairs: list[str] = []
+    for i, value in enumerate(row):
+        if i < len(header) and header[i]:
+            pairs.append(f"**{header[i]}**: {value}")
+        else:
+            pairs.append(value)
+    return "- " + " · ".join(pairs)
 
 
 # -------------------------------------------------------------------- helpers

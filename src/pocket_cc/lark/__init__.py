@@ -7,6 +7,7 @@ from pocket_cc.lark.card import (
     ExpandableSection,
     build_status_card,
     build_text_card,
+    normalize_markdown_for_lark,
 )
 from pocket_cc.lark.client import (
     FakeLarkClient,
@@ -38,4 +39,5 @@ __all__ = [
     "MessageHandler",
     "build_status_card",
     "build_text_card",
+    "normalize_markdown_for_lark",
 ]
