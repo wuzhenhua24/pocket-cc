@@ -161,13 +161,23 @@ class Pocketcc:
         """
         turn = binding.current_turn
         if turn is None:
+            logger.debug(
+                "_handle_events skipped — no active turn",
+                extra={"chat_id": binding.chat_id, "event_count": len(events)},
+            )
             return
+        logger.debug(
+            "_handle_events ingesting",
+            extra={
+                "chat_id": binding.chat_id,
+                "event_count": len(events),
+                "kinds": [type(e).__name__ for e in events],
+            },
+        )
         for ev in events:
             turn.accumulator.ingest(ev)
         if turn.waiting_for is not None:
-            snapshot = turn.accumulator.snapshot(
-                state="waiting", waiting_for=turn.waiting_for
-            )
+            snapshot = turn.accumulator.snapshot(state="waiting", waiting_for=turn.waiting_for)
         else:
             snapshot = turn.accumulator.snapshot(state="running")
         turn.card_stream.update(render_card(snapshot))
@@ -185,9 +195,7 @@ class Pocketcc:
         if turn is None:
             return
         if turn.waiting_for is not None:
-            snapshot = turn.accumulator.snapshot(
-                state="waiting", waiting_for=turn.waiting_for
-            )
+            snapshot = turn.accumulator.snapshot(state="waiting", waiting_for=turn.waiting_for)
         else:
             snapshot = turn.accumulator.snapshot(state="running")
         turn.card_stream.update(render_card(snapshot))

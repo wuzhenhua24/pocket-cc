@@ -93,6 +93,16 @@ class TranscriptPoller:
                 exclude=binding.excluded_transcripts,
             )
             if current is None:
+                logger.debug(
+                    "no active transcript found",
+                    extra={
+                        "chat_id": binding.chat_id,
+                        "cwd": str(binding.cwd),
+                        "after_ts": binding.created_at,
+                        "excluded_count": len(binding.excluded_transcripts),
+                        "has_hook_path": binding.transcript_path is not None,
+                    },
+                )
                 return
             if binding.transcript_path != current:
                 # First time, or Claude rotated session (e.g. `/clear`).
@@ -107,6 +117,15 @@ class TranscriptPoller:
             if reader is None:
                 return
             events = reader.read_new()
+            logger.debug(
+                "transcript poll tick",
+                extra={
+                    "chat_id": binding.chat_id,
+                    "path": str(binding.transcript_path),
+                    "offset": reader.byte_offset,
+                    "new_events": len(events),
+                },
+            )
 
         if events:
             try:
