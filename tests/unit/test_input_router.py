@@ -660,6 +660,61 @@ def test_message_during_waiting_clears_waiting_for_and_sends_text(tmp_path: Path
     assert send_texts[-1].kwargs == {"window_id": "@1", "text": "1"}
 
 
+def test_waiting_reply_text_uses_rotation_aware_rerender(tmp_path: Path) -> None:
+    """Replying to a waiting prompt must flip the card back to running via the
+    injected rotation-aware callback — not a direct full-history render that
+    would re-dump (and tail-truncate) an already-rotated turn."""
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    rerendered: list[str] = []
+    router = _make_router(
+        tmux=tmux,
+        lark=lark,
+        registry=registry,
+        config=cfg,
+        rerender_active=lambda b: rerendered.append(b.chat_id),
+    )
+    router.handle_message(_message(text="please run X"))
+    _set_waiting_on_active_turn(registry, "oc_chat1")
+
+    router.handle_message(_message(text="1", message_id="om_reply"))
+
+    assert rerendered == ["oc_chat1"]
+
+
+def test_waiting_response_button_uses_rotation_aware_rerender(tmp_path: Path) -> None:
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    rerendered: list[str] = []
+    router = _make_router(
+        tmux=tmux,
+        lark=lark,
+        registry=registry,
+        config=cfg,
+        rerender_active=lambda b: rerendered.append(b.chat_id),
+    )
+    router.handle_message(_message(text="please run X"))
+    card_id = lark.last_sent().message_id
+    _set_waiting_on_active_turn(registry, "oc_chat1")
+
+    router.handle_card_action(
+        CardAction(
+            message_id=card_id,
+            chat_id="oc_chat1",
+            sender_open_id="ou_user1",
+            token="tok",
+            tag="button",
+            value={"action": "waiting_response", "index": 0},
+        )
+    )
+
+    assert rerendered == ["oc_chat1"]
+
+
 def test_message_after_continuation_opens_new_turn_again(tmp_path: Path) -> None:
     """Once continuation clears waiting_for, the next reply opens a new turn."""
     cfg = _make_config(workspace=tmp_path)

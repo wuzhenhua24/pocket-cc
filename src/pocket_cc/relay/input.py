@@ -372,7 +372,7 @@ class InputRouter:
             turn.waiting_for = None
         # Flip card back to running *now* — otherwise the user sees the
         # waiting buttons stuck on screen until the next poll tick.
-        self._rerender_running(turn)
+        self._rerender_running(binding)
         try:
             self._tmux.send_text(binding.window.window_id, text)
         except TmuxError as e:
@@ -409,7 +409,7 @@ class InputRouter:
         # so the user sees the buttons disappear immediately when they tap.
         # Otherwise the card sits in waiting state until the next poll tick
         # — a noticeable lag in real-world testing.
-        self._rerender_running(turn)
+        self._rerender_running(binding)
         try:
             response = option.response
             if isinstance(response, TextResponse):
@@ -519,18 +519,33 @@ class InputRouter:
         if changed and turn is not None and self._rerender_active is not None:
             self._rerender_active(binding)
 
-    def _rerender_running(self, turn: TurnState) -> None:
-        """Push an immediate running-state re-render of the current accumulator.
+    def _rerender_running(self, binding: ChatBinding) -> None:
+        """Push an immediate running-state re-render of the active card.
 
         Used right after a user responds to a waiting prompt (button or
         free-form text) so the card flips out of waiting state without
         waiting for the next transcript-poller / pane-watcher tick.
         CardStream's throttle still applies (~1.5s max), but it's much
         better than waiting for two-stage polling to converge.
+
+        Goes through the bootstrap-owned rotation-aware path (``rerender_active``
+        → ``_publish_card``) when injected, so a turn that already rotated to a
+        "(续)" card doesn't re-dump full history onto the current card and
+        tail-truncate ("已截断早期内容"). The local render below is a fallback
+        for tests without that callback — it uses ``from_committed=True`` for
+        the same reason.
         """
+        if self._rerender_active is not None:
+            self._rerender_active(binding)
+            return
+        turn = binding.current_turn
+        if turn is None:
+            return
         try:
-            snapshot = turn.accumulator.snapshot(state="running")
-            turn.card_stream.update(render_card(snapshot))
+            snapshot = turn.accumulator.snapshot(state="running", from_committed=True)
+            turn.card_stream.update(
+                render_card(snapshot, is_continuation=turn.is_continuation)
+            )
         except Exception:
             logger.warning("immediate card re-render failed", exc_info=True)
 
