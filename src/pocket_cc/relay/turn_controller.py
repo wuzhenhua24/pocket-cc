@@ -45,10 +45,32 @@ class TurnController:
         self._binding = binding
         self._lark = lark
         self._config = config
+        # Turn generation — a fencing token. Each opened turn gets a fresh,
+        # monotonically increasing id; `_active_gen` is the id of the turn
+        # that's current right now (None once it's sealed). Deferred/async
+        # work (the deferred Enter today; Stop-hook attribution in a later
+        # step) captures the gen at schedule time and re-checks
+        # `is_current_gen` before acting, so it can't operate on a turn that
+        # has since been superseded or sealed. No lock yet — that lands in a
+        # later step alongside the rest of the lifecycle serialization.
+        self._next_gen = 0
+        self._active_gen: int | None = None
 
     @property
     def binding(self) -> ChatBinding:
         return self._binding
+
+    # ------------------------------------------------------------- generation
+
+    def begin_turn(self) -> int:
+        """Mark a freshly opened turn as current and return its generation."""
+        self._next_gen += 1
+        self._active_gen = self._next_gen
+        return self._active_gen
+
+    def is_current_gen(self, gen: int) -> bool:
+        """True iff ``gen`` is still the active turn (not superseded/sealed)."""
+        return self._active_gen == gen
 
     # --------------------------------------------------------------- public API
 
@@ -142,6 +164,10 @@ class TurnController:
                 exc_info=True,
             )
         binding.current_turn = None
+        # Retire the generation so any in-flight deferred work (e.g. a
+        # deferred Enter that was scheduled for this turn) sees a stale gen
+        # and aborts instead of acting on a closed/next turn.
+        self._active_gen = None
 
     def clear_waiting_and_rerender(self) -> None:
         """Clear the active turn's waiting state and re-render it as running.

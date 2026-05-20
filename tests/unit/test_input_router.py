@@ -110,10 +110,22 @@ def _make_router(
 
 def _real_controller_for(lark: FakeLarkClient, config: Config) -> Any:
     """Provider that hands the router a real TurnController per binding —
-    exercises the rotation-aware clear-waiting / mode-update paths."""
-    return lambda binding: TurnController(
-        binding=binding, lark=cast("Any", lark), config=config
-    )
+    exercises the rotation-aware clear-waiting / mode-update paths.
+
+    Caches by chat_id (like bootstrap) so generation state (begin_turn /
+    is_current_gen) is stable across calls within a test."""
+    cache: dict[str, TurnController] = {}
+
+    def provider(binding: ChatBinding) -> TurnController:
+        controller = cache.get(binding.chat_id)
+        if controller is None or controller.binding is not binding:
+            controller = TurnController(
+                binding=binding, lark=cast("Any", lark), config=config
+            )
+            cache[binding.chat_id] = controller
+        return controller
+
+    return provider
 
 
 class _RecordingController:
@@ -122,6 +134,13 @@ class _RecordingController:
     def __init__(self, binding: ChatBinding, calls: list[tuple[str, str]]) -> None:
         self._binding = binding
         self._calls = calls
+
+    def begin_turn(self) -> int:
+        self._calls.append((self._binding.chat_id, "begin_turn"))
+        return 1
+
+    def is_current_gen(self, gen: int) -> bool:
+        return True
 
     def clear_waiting_and_rerender(self) -> None:
         self._calls.append((self._binding.chat_id, "clear_waiting"))
@@ -706,7 +725,7 @@ def test_waiting_reply_text_uses_rotation_aware_rerender(tmp_path: Path) -> None
 
     router.handle_message(_message(text="1", message_id="om_reply"))
 
-    assert calls == [("oc_chat1", "clear_waiting")]
+    assert calls == [("oc_chat1", "begin_turn"), ("oc_chat1", "clear_waiting")]
 
 
 def test_waiting_response_button_uses_rotation_aware_rerender(tmp_path: Path) -> None:
@@ -737,7 +756,7 @@ def test_waiting_response_button_uses_rotation_aware_rerender(tmp_path: Path) ->
         )
     )
 
-    assert calls == [("oc_chat1", "clear_waiting")]
+    assert calls == [("oc_chat1", "begin_turn"), ("oc_chat1", "clear_waiting")]
 
 
 def test_message_after_continuation_opens_new_turn_again(tmp_path: Path) -> None:

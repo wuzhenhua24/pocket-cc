@@ -277,6 +277,11 @@ class InputRouter:
             accumulator=accumulator,
         )
         binding.current_turn = turn
+        # Register the new turn with its controller and capture the generation
+        # so the deferred-Enter worker can tell if this turn is still current
+        # when it fires. None when no controller is injected (tests) → the
+        # worker falls back to an object-identity check.
+        gen = self._controller_for(binding).begin_turn() if self._controller_for else None
 
         try:
             # Inject the text only — Enter is sent on a separate worker
@@ -292,12 +297,14 @@ class InputRouter:
 
         threading.Thread(
             target=self._deferred_enter,
-            args=(binding, turn),
+            args=(binding, turn, gen),
             name=f"deferred-enter-{binding.window.window_id}",
             daemon=True,
         ).start()
 
-    def _deferred_enter(self, binding: ChatBinding, turn: TurnState) -> None:
+    def _deferred_enter(
+        self, binding: ChatBinding, turn: TurnState, gen: int | None
+    ) -> None:
         """Send Enter after the grace period, unless cancel fired first.
 
         `wait(timeout=…)` returns True iff the event was set before timeout,
@@ -312,10 +319,14 @@ class InputRouter:
                 extra={"chat_id": binding.chat_id, "window_id": binding.window.window_id},
             )
             return
-        if binding.current_turn is not turn:
-            # Turn was closed between scheduling and firing — drop the Enter
-            # to avoid submitting an empty / stale prompt against whatever
-            # state Claude is in now.
+        # Turn was sealed or superseded between scheduling and firing — drop
+        # the Enter to avoid submitting a stale prompt against whatever state
+        # Claude is in now. Generation fence when a controller is present;
+        # object-identity fallback otherwise.
+        if self._controller_for is not None and gen is not None:
+            if not self._controller_for(binding).is_current_gen(gen):
+                return
+        elif binding.current_turn is not turn:
             return
         try:
             self._tmux.send_key(binding.window.window_id, "Enter")
