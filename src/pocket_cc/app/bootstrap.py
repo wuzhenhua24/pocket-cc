@@ -22,6 +22,7 @@ is registered as the poller's `on_events` callback.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -29,24 +30,22 @@ from pocket_cc.app.config import events_jsonl_path
 from pocket_cc.app.persistence import Registry
 from pocket_cc.claude.events import EventsReader
 from pocket_cc.claude.hooks import all_installed as hooks_all_installed
-from pocket_cc.claude.transcript import ModeChange, TranscriptReader
-from pocket_cc.lark.client import LarkApiError, LarkOapiClient
+from pocket_cc.claude.transcript import TranscriptReader
+from pocket_cc.lark.client import LarkOapiClient
 from pocket_cc.lark.event_loop import LarkEventLoop
-from pocket_cc.relay.card_renderer import ROTATE_AT_CHARS, render_card, should_rotate
-from pocket_cc.relay.card_stream import CardStream
 from pocket_cc.relay.events_router import EventsPoller, HookEventsDispatcher
 from pocket_cc.relay.input import InputRouter
 from pocket_cc.relay.output import TranscriptPoller
 from pocket_cc.relay.pane_watcher import PaneWatcher
+from pocket_cc.relay.turn_controller import TurnController
 from pocket_cc.tmux import TmuxManager
 
 if TYPE_CHECKING:
     from pocket_cc.app.config import Config
-    from pocket_cc.app.persistence import ChatBinding, TurnState
+    from pocket_cc.app.persistence import ChatBinding
     from pocket_cc.claude.events import HookEvent
     from pocket_cc.claude.transcript import Event
     from pocket_cc.lark.card import CardState
-    from pocket_cc.relay.card_renderer import TurnSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +60,12 @@ class Pocketcc:
         self._lark = LarkOapiClient(config.app_id, config.app_secret, domain=config.lark_domain)
         self._loop = LarkEventLoop(config.app_id, config.app_secret, domain=config.lark_domain)
         self._registry = Registry()
+        # One TurnController per binding (keyed by chat_id), created lazily on
+        # first use. Bootstrap owns construction so InputRouter / pollers never
+        # build one themselves — they only ever reach a controller via the
+        # callbacks below. Guarded so concurrent callbacks don't double-create.
+        self._controllers: dict[str, TurnController] = {}
+        self._controllers_lock = threading.Lock()
         self._router = InputRouter(
             config=config,
             tmux=self._tmux,
@@ -154,246 +159,50 @@ class Pocketcc:
 
     # -------------------------------------------------------------- internal
 
+    def _controller_for(self, binding: ChatBinding) -> TurnController:
+        """Get-or-create the binding's TurnController.
+
+        Bindings are created once per chat_id and reused, so a controller
+        keyed by chat_id is stable. We still verify identity and refresh if
+        a binding object was somehow replaced, so the controller never holds
+        a stale binding reference.
+        """
+        with self._controllers_lock:
+            controller = self._controllers.get(binding.chat_id)
+            if controller is None or controller.binding is not binding:
+                controller = TurnController(binding=binding, lark=self._lark, config=self._config)
+                self._controllers[binding.chat_id] = controller
+            return controller
+
     def _handle_events(self, binding: ChatBinding, events: list[Event]) -> None:
-        """Poller → accumulator → maybe rotate → re-render → throttled patch.
-
-        Skips silently when there is no active turn (e.g. Claude emitted
-        startup/clear-prompt records while no user message is pending).
-        Honors `turn.waiting_for` (set by PaneWatcher) so a transcript tick
-        arriving mid-prompt doesn't accidentally flip the card back to
-        running.
-
-        Card rotation (M2-F): if the body of the current card grew past
-        ``ROTATE_AT_CHARS``, seal it and start a fresh "(续)" card before
-        rendering. Rotation is **disabled while waiting** to avoid the
-        weird UX of rotating mid-prompt.
-        """
-        # Permission-mode records can arrive between turns (e.g. user
-        # pressed Shift-Tab in the tmux pane while no Lark turn was open)
-        # — keep the binding's mode current regardless, so the next turn
-        # that opens initializes its accumulator with the right mode.
-        for ev in events:
-            if isinstance(ev, ModeChange):
-                binding.current_mode = ev.mode
-
-        turn = binding.current_turn
-        if turn is None:
-            logger.debug(
-                "_handle_events skipped — no active turn",
-                extra={"chat_id": binding.chat_id, "event_count": len(events)},
-            )
-            return
-        logger.debug(
-            "_handle_events ingesting",
-            extra={
-                "chat_id": binding.chat_id,
-                "event_count": len(events),
-                "kinds": [type(e).__name__ for e in events],
-            },
-        )
-        for ev in events:
-            turn.accumulator.ingest(ev)
-        self._publish_card(binding, turn)
-
-    def _publish_card(self, binding: ChatBinding, turn: TurnState) -> None:
-        """Render the current accumulator state to a card and patch it.
-
-        Single re-render path used by both the transcript-poller callback
-        and the pane-watcher callback. Owns the rotation decision so both
-        paths get the same long-content handling.
-
-        Loops the rotation step: when one transcript batch ingests enough
-        content to fill *several* cards (e.g. one long assistant response
-        plus a flurry of tool calls), each iteration seals the largest
-        prefix that fits without tail-truncation, then re-checks. Without
-        the loop, a single oversized batch produces one truncated sealed
-        card + one fresh card holding the leftover — losing the early
-        content the user expected to see across multiple "(续)" cards.
-        """
-        # Safety cap so a logic bug in find_fit_window can't busy-loop
-        # forever. Number of cards a single batch could *plausibly* need
-        # is bounded by (max batch size) / ROTATE_AT_CHARS; 32 is far
-        # past any realistic value and below the Lark per-chat send rate.
-        for _ in range(32):
-            snapshot = self._snapshot_active(turn)
-            if not should_rotate(snapshot):
-                break
-            self._rotate_card(binding, turn)
-        card = render_card(
-            snapshot,
-            is_continuation=turn.is_continuation,
-            show_thinking=self._config.show_thinking,
-        )
-        turn.card_stream.update(card)
-
-    def _snapshot_active(self, turn: TurnState) -> TurnSnapshot:
-        """Snapshot helper that respects waiting_for + from_committed."""
-        if turn.waiting_for is not None:
-            return turn.accumulator.snapshot(
-                state="waiting",
-                waiting_for=turn.waiting_for,
-                from_committed=True,
-            )
-        return turn.accumulator.snapshot(state="running", from_committed=True)
-
-    def _rotate_card(self, binding: ChatBinding, turn: TurnState) -> None:
-        """Seal the current card with a "⏬ 续下条" footer and open a new one.
-
-        Chunked rotation: instead of dumping the entire uncommitted slice
-        into the sealed card (which then tail-truncates with "…(已截断早
-        期内容)…" when the slice is bigger than `_BODY_MAX_CHARS`), we ask
-        the accumulator for the largest split point that fits within
-        ``ROTATE_AT_CHARS``. Only that prefix is sealed + committed;
-        the rest stays uncommitted and gets picked up by `_publish_card`'s
-        loop, which calls back into here for another rotation. End result:
-        a long batch becomes N "(续)" cards instead of one truncated card.
-        """
-        # Find the largest commit-onward prefix that renders within the
-        # rotation budget. Forward progress is guaranteed by the
-        # accumulator (see `find_fit_window` docstring).
-        text_end, tool_end, thinking_end = turn.accumulator.find_fit_window(ROTATE_AT_CHARS)
-
-        sealing_snapshot = turn.accumulator.snapshot_window(
-            text_end=text_end,
-            tool_end=tool_end,
-            thinking_end=thinking_end,
-            state="running",
-        )
-        sealing_card = render_card(
-            sealing_snapshot,
-            is_continuation=turn.is_continuation,
-            ends_with_continuation_marker=True,
-            show_thinking=self._config.show_thinking,
-        )
-        try:
-            turn.card_stream.close(sealing_card)
-        except Exception:
-            logger.warning(
-                "rotation: closing sealed card failed",
-                extra={"chat_id": binding.chat_id},
-                exc_info=True,
-            )
-
-        # Commit *only* what we just sealed. Any leftover uncommitted
-        # parts will show up on the next card (and trigger another
-        # rotation iteration in `_publish_card` if they're still too big).
-        turn.accumulator.commit_to(
-            text_end=text_end,
-            tool_end=tool_end,
-            thinking_end=thinking_end,
-        )
-
-        # Open a fresh continuation card.
-        starter_snapshot = turn.accumulator.snapshot(
-            state="running", from_committed=True
-        )
-        new_card = render_card(
-            starter_snapshot, is_continuation=True, show_thinking=self._config.show_thinking
-        )
-        try:
-            new_message_id = self._lark.send_card(binding.chat_id, new_card)
-        except LarkApiError:
-            logger.exception(
-                "rotation: failed to send continuation card — turn is now orphaned",
-                extra={"chat_id": binding.chat_id},
-            )
-            # Leave the old (closed) card_stream in place. Subsequent
-            # updates will be no-ops; that's at least better than crashing.
-            return
-
-        new_stream = CardStream(
-            self._lark, new_message_id, interval_s=self._config.patch_interval_s
-        )
-        new_stream.start()
-        turn.card_stream = new_stream
-        turn.card_message_id = new_message_id
-        turn.is_continuation = True
-        logger.info(
-            "rotated card (continuation)",
-            extra={
-                "chat_id": binding.chat_id,
-                "new_card_id": new_message_id,
-            },
-        )
+        """Poller callback → binding's TurnController."""
+        self._controller_for(binding).ingest_events(events)
 
     def _seal_active(
         self, binding: ChatBinding, state: CardState = "done", error: str = ""
     ) -> None:
-        """Rotation-aware seal of the binding's active turn.
-
-        The seal counterpart of :meth:`_publish_card`. Naively closing the
-        card with a full-history snapshot re-dumps the whole turn onto the
-        *current* (possibly already-rotated) card, where it tail-truncates
-        ("已截断早期内容") — the bug we keep hitting. Instead we run the same
-        rotation loop on the **uncommitted tail**: any content beyond one
-        card's worth is rolled across "(续)" continuation cards first, then
-        the remaining tail (≤ one card) is closed with the terminal
-        done/failed state and the correct ``is_continuation`` flag.
+        """Rotation-aware seal — delegates to the binding's TurnController.
 
         Handed to :class:`InputRouter` as ``seal_active`` so every close
         path (Stop / StopFailure hooks via ``close_active_turn``, the
         new-message-closes-prior path, error paths) seals the same way.
         Also used directly by :meth:`shutdown`.
         """
-        turn = binding.current_turn
-        if turn is None:
-            return
-        # Roll the oversized uncommitted tail across continuation cards. We
-        # check the *running* snapshot (content only) so the loop stops once
-        # the remaining tail fits — that tail is then closed below with the
-        # terminal state. Same 32-iteration safety cap as _publish_card.
-        for _ in range(32):
-            if not should_rotate(
-                turn.accumulator.snapshot(state="running", from_committed=True)
-            ):
-                break
-            self._rotate_card(binding, turn)
-        final_snapshot = turn.accumulator.snapshot(
-            state=state, error=error, from_committed=True
-        )
-        try:
-            turn.card_stream.close(
-                render_card(
-                    final_snapshot,
-                    is_continuation=turn.is_continuation,
-                    show_thinking=self._config.show_thinking,
-                )
-            )
-        except Exception:
-            logger.warning(
-                "seal: closing final card failed",
-                extra={"chat_id": binding.chat_id},
-                exc_info=True,
-            )
-        binding.current_turn = None
+        self._controller_for(binding).seal(state=state, error=error)
 
     # ----------------------------------------------------- pane watcher (M2-C)
 
     def _rerender_active(self, binding: ChatBinding) -> None:
-        """Re-render the binding's active card via the rotation-aware path.
+        """Re-render the binding's active card — delegates to TurnController.
 
         Handed to :class:`InputRouter` so a card-action (e.g. the ⇧⭾ Mode
-        readback) can refresh the card immediately without duplicating the
-        from_committed / is_continuation / waiting logic that lives in
-        :meth:`_publish_card`. No-op when the turn has already ended.
+        readback) can refresh the card immediately.
         """
-        turn = binding.current_turn
-        if turn is None:
-            return
-        self._publish_card(binding, turn)
+        self._controller_for(binding).rerender()
 
     def _handle_pane_state_change(self, binding: ChatBinding) -> None:
-        """PaneWatcher detected a waiting_for transition (set/changed/cleared).
-
-        Re-render the card to reflect the new state. CardStream's throttle
-        + hash dedupe handles the case where the rendered content didn't
-        actually change. Goes through the same rotation-aware path as
-        transcript updates.
-        """
-        turn = binding.current_turn
-        if turn is None:
-            return
-        self._publish_card(binding, turn)
+        """PaneWatcher detected a waiting_for transition — delegates to TurnController."""
+        self._controller_for(binding).on_pane_change()
 
     # ---------------------------------------------------- hook event callbacks
 
