@@ -33,6 +33,29 @@ from typing import Final, Literal
 
 PromptKind = Literal["permission"]
 
+# --- Permission-mode (Shift-Tab) detection -------------------------------
+# Claude Code's bottom chrome shows the active permission mode on its own
+# line, e.g. "⏵⏵ accept edits on" / "⏸ plan mode" / "⏵⏵ bypass permissions".
+# Shift-Tab redraws this line *instantly*, so it's the real-time source of
+# truth — unlike the transcript's `permission-mode` record, which Claude
+# only writes at turn boundaries (too late for the running card). Strings
+# verified against the predecessor ccgram's Claude provider fixtures.
+_MODE_MARKERS: Final[tuple[str, ...]] = ("⏵⏵", "⏸")  # ⏵⏵ , ⏸
+# (substring, canonical mode) — checked in order, first hit wins. Canonical
+# keys match the transcript's `permissionMode` values so the card renderer's
+# `mode_label` maps both sources uniformly.
+_MODE_HINTS: Final[tuple[tuple[str, str], ...]] = (
+    ("bypass", "bypassPermissions"),
+    ("yolo", "bypassPermissions"),
+    ("plan", "plan"),
+    ("accept edits", "acceptEdits"),
+    ("auto-accept", "acceptEdits"),
+)
+# How many lines up from the bottom to scan for the mode-line. The footer
+# fits well within this; keeping it small avoids matching stale banners or
+# the word "plan" sitting in scrolled-up content.
+_MODE_SCAN_LINES: Final[int] = 20
+
 # Core sentinel for the Permission prompt. Match-exact (whole line) on
 # the visible question text — Claude emits it on its own line.
 _PERMISSION_QUESTION_RE: Final[re.Pattern[str]] = re.compile(r"^\s*Do you want to proceed\?\s*$")
@@ -116,6 +139,53 @@ def inspect_pane(pane_text: str) -> ParsedPrompt | None:
         options=options,
         fingerprint=fingerprint,
     )
+
+
+def detect_mode(pane_text: str) -> str | None:
+    """Return the canonical permission mode from the TUI footer, or None.
+
+    Canonical keys match the transcript's ``permissionMode`` values:
+    ``"acceptEdits"``, ``"plan"``, ``"bypassPermissions"``. Returns None
+    when no mode banner is present — which in Claude's TUI means **default
+    mode** (the banner only appears for non-default modes). Callers decide
+    whether to treat None as "default": the immediate post-Shift-Tab readback
+    can (the footer just redrew), but the periodic pane watcher should ignore
+    None to avoid flapping on a transient capture miss.
+
+    Two passes, mirroring ccgram: marker lines (``⏵⏵`` / ``⏸``) are
+    unambiguous chrome and win; a hint-only fallback catches versions that
+    render the text without the glyph. Never raises.
+    """
+    if not pane_text:
+        return None
+    lines = pane_text.rstrip("\n").splitlines()
+    tail = lines[-_MODE_SCAN_LINES:]
+
+    # Pass 1: a marker line is *the* mode banner — map it (None if its text
+    # is some future mode we don't recognize; don't guess).
+    for line in reversed(tail):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(marker in stripped for marker in _MODE_MARKERS):
+            return _match_mode_hint(stripped.lower())
+
+    # Pass 2: hint-only fallback (no glyph), e.g. "plan mode on (shift+tab…)".
+    for line in reversed(tail):
+        lower = line.strip().lower()
+        if not lower:
+            continue
+        mode = _match_mode_hint(lower)
+        if mode is not None:
+            return mode
+    return None
+
+
+def _match_mode_hint(lower_line: str) -> str | None:
+    for hint, mode in _MODE_HINTS:
+        if hint in lower_line:
+            return mode
+    return None
 
 
 # -------------------------------------------------------------------- helpers

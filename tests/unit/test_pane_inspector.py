@@ -7,6 +7,7 @@ import textwrap
 from pocket_cc.claude.pane_inspector import (
     ParsedOption,
     ParsedPrompt,
+    detect_mode,
     inspect_pane,
 )
 
@@ -186,3 +187,54 @@ def test_parsed_dataclasses_are_frozen() -> None:
 
     assert dataclasses.is_dataclass(ParsedPrompt)
     assert dataclasses.is_dataclass(ParsedOption)
+
+
+# ============================================================== detect_mode
+
+
+def test_detect_mode_accept_edits_marker_line() -> None:
+    pane = "some output\n> the input box\n⏵⏵ accept edits on (shift+tab to cycle)"
+    assert detect_mode(pane) == "acceptEdits"
+
+
+def test_detect_mode_auto_accept_phrasing() -> None:
+    pane = "output\n⏵⏵ auto-accept edits on  >"
+    assert detect_mode(pane) == "acceptEdits"
+
+
+def test_detect_mode_plan_marker_line() -> None:
+    pane = "output\n⏸ plan mode on (shift+tab to cycle)"
+    assert detect_mode(pane) == "plan"
+
+
+def test_detect_mode_bypass_marker_line() -> None:
+    pane = "output\n⏵⏵ bypass permissions  >"
+    assert detect_mode(pane) == "bypassPermissions"
+
+
+def test_detect_mode_default_has_no_banner() -> None:
+    """Default mode shows no mode-line → None (callers map to 'default')."""
+    pane = "some output\n╭─────────╮\n│ > type here │\n╰─────────╯\n  ? for shortcuts"
+    assert detect_mode(pane) is None
+
+
+def test_detect_mode_empty_pane() -> None:
+    assert detect_mode("") is None
+
+
+def test_detect_mode_hint_only_fallback_without_glyph() -> None:
+    """Some renders show the text without the ⏵⏵/⏸ glyph — still detected."""
+    pane = "output\nplan mode on (shift+tab to cycle)"
+    assert detect_mode(pane) == "plan"
+
+
+def test_detect_mode_marker_with_unknown_text_is_none() -> None:
+    """A mode banner we can't map → None, rather than guessing wrong."""
+    pane = "output\n⏵⏵ some brand new mode  >"
+    assert detect_mode(pane) is None
+
+
+def test_detect_mode_picks_bottommost_banner() -> None:
+    """The active banner is the bottommost — an older one scrolled up loses."""
+    pane = "⏸ plan mode\n... lots of output ...\n⏵⏵ accept edits on"
+    assert detect_mode(pane) == "acceptEdits"

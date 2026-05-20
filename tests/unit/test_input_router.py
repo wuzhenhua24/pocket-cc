@@ -91,13 +91,19 @@ def _make_config(*, workspace: Path, whitelist: frozenset[str] = frozenset()) ->
 
 
 def _make_router(
-    *, tmux: FakeTmuxManager, lark: FakeLarkClient, registry: Registry, config: Config
+    *,
+    tmux: FakeTmuxManager,
+    lark: FakeLarkClient,
+    registry: Registry,
+    config: Config,
+    rerender_active: Any = None,
 ) -> InputRouter:
     return InputRouter(
         config=config,
         tmux=cast("Any", tmux),
         lark=lark,
         registry=registry,
+        rerender_active=rerender_active,
     )
 
 
@@ -376,6 +382,57 @@ def test_card_action_key_sends_named_key(tmp_path: Path) -> None:
 
     key_calls = [c for c in tmux.calls if c.method == "send_key"]
     assert key_calls and key_calls[-1].kwargs == {"window_id": "@1", "key": "Escape"}
+
+
+def test_card_action_mode_btab_reads_mode_back_and_rerenders(tmp_path: Path) -> None:
+    """⇧⭾ Mode sends BTab, then scrapes the pane mode-line and refreshes the
+    card. The transcript doesn't carry mid-turn mode changes, so this pane
+    readback is what makes the new mode echo in Lark."""
+    import pocket_cc.relay.input as input_module
+
+    cfg = _make_config(workspace=tmp_path)
+    # Pane shows the acceptEdits banner after the toggle.
+    tmux = FakeTmuxManager(capture_pane_text="working...\n⏵⏵ accept edits on (shift+tab to cycle)")
+    lark = FakeLarkClient()
+    registry = Registry()
+    rerendered: list[str] = []
+    router = _make_router(
+        tmux=tmux,
+        lark=lark,
+        registry=registry,
+        config=cfg,
+        rerender_active=lambda b: rerendered.append(b.chat_id),
+    )
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+
+    orig_delay = input_module._MODE_READBACK_DELAY_S
+    input_module._MODE_READBACK_DELAY_S = 0.0
+    try:
+        router.handle_card_action(
+            CardAction(
+                message_id=card_id,
+                chat_id="oc_chat1",
+                sender_open_id="ou_user1",
+                token="tok",
+                tag="button",
+                value={"action": "key", "key": "BTab"},
+            )
+        )
+    finally:
+        input_module._MODE_READBACK_DELAY_S = orig_delay
+
+    # BTab was sent to tmux
+    assert any(
+        c.method == "send_key" and c.kwargs["key"] == "BTab" for c in tmux.calls
+    )
+    # The pane was captured back, mode parsed, binding updated, card re-rendered.
+    binding = registry.get("oc_chat1")
+    assert binding is not None
+    assert binding.current_mode == "acceptEdits"
+    assert binding.current_turn is not None
+    assert binding.current_turn.accumulator.current_mode == "acceptEdits"
+    assert rerendered == ["oc_chat1"]
 
 
 def test_card_action_show_pane_dumps_capture_into_new_card(tmp_path: Path) -> None:

@@ -23,7 +23,7 @@ import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from pocket_cc.claude.pane_inspector import ParsedPrompt, inspect_pane
+from pocket_cc.claude.pane_inspector import ParsedPrompt, detect_mode, inspect_pane
 from pocket_cc.relay.waiting import TextResponse, WaitingFor, WaitingOption
 from pocket_cc.tmux import TmuxError
 
@@ -98,7 +98,13 @@ class PaneWatcher:
             return
 
         prompt = inspect_pane(pane)
-        current = turn.waiting_for
+        # Permission mode is read from the same capture. detect_mode returns
+        # None when no banner is shown — here (periodic poll) we *ignore*
+        # None rather than forcing "default", so a transient capture miss (or
+        # a mode banner that's hidden mid-run) can't flap the label. A switch
+        # back to default is reconciled by the immediate post-click readback
+        # in the input router, or by the next turn's transcript record.
+        detected_mode = detect_mode(pane)
         changed = False
 
         with binding.lock:
@@ -115,6 +121,13 @@ class PaneWatcher:
                 if current is None or current.fingerprint != new_waiting.fingerprint:
                     turn.waiting_for = new_waiting
                     changed = True
+
+            if detected_mode is not None and detected_mode != binding.current_mode:
+                # User toggled mode directly in tmux (or we missed the click
+                # readback) — sync so the card's Mode button reflects it.
+                binding.current_mode = detected_mode
+                turn.accumulator.current_mode = detected_mode
+                changed = True
 
         if changed:
             try:

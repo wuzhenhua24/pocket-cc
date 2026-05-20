@@ -309,3 +309,79 @@ def test_tick_callback_exception_does_not_crash_watcher() -> None:
     # Waiting state still got set
     assert binding.current_turn is not None
     assert binding.current_turn.waiting_for is not None
+
+
+# ===================================================== mode reconciliation
+
+_PANE_ACCEPT_EDITS = "doing work...\n⏵⏵ accept edits on (shift+tab to cycle)"
+_PANE_PLAN = "thinking...\n⏸ plan mode on (shift+tab to cycle)"
+
+
+def test_tick_syncs_mode_from_pane_and_fires_callback() -> None:
+    tmux = _FakeTmux(pane_text=_PANE_ACCEPT_EDITS)
+    registry = Registry()
+    binding = _make_binding_with_turn()
+    registry.set(binding)
+    log: list[str] = []
+    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
+
+    watcher._tick_binding(binding)
+
+    assert binding.current_mode == "acceptEdits"
+    assert binding.current_turn is not None
+    assert binding.current_turn.accumulator.current_mode == "acceptEdits"
+    assert log == ["oc_x"]
+
+
+def test_tick_same_mode_is_idempotent() -> None:
+    tmux = _FakeTmux(pane_text=_PANE_ACCEPT_EDITS)
+    registry = Registry()
+    binding = _make_binding_with_turn()
+    registry.set(binding)
+    log: list[str] = []
+    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
+
+    watcher._tick_binding(binding)
+    watcher._tick_binding(binding)
+
+    # Only the first transition fires a callback
+    assert log == ["oc_x"]
+    assert binding.current_mode == "acceptEdits"
+
+
+def test_tick_no_banner_does_not_force_default() -> None:
+    """A capture with no mode-line must NOT flip a known mode back to default
+    — it could be a transient miss or a banner hidden mid-run."""
+    tmux = _FakeTmux(pane_text=_PANE_ACCEPT_EDITS)
+    registry = Registry()
+    binding = _make_binding_with_turn()
+    registry.set(binding)
+    log: list[str] = []
+    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
+
+    watcher._tick_binding(binding)
+    assert binding.current_mode == "acceptEdits"
+
+    # Next tick: no banner in the pane.
+    tmux.pane_text = _NO_PROMPT
+    watcher._tick_binding(binding)
+    # Mode is unchanged; the absent banner did not force "default".
+    assert binding.current_mode == "acceptEdits"
+    assert log == ["oc_x"]  # no second callback from the (non-)mode change
+
+
+def test_tick_mode_change_updates_to_new_mode() -> None:
+    tmux = _FakeTmux(pane_text=_PANE_ACCEPT_EDITS)
+    registry = Registry()
+    binding = _make_binding_with_turn()
+    registry.set(binding)
+    log: list[str] = []
+    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
+
+    watcher._tick_binding(binding)
+    assert binding.current_mode == "acceptEdits"
+
+    tmux.pane_text = _PANE_PLAN
+    watcher._tick_binding(binding)
+    assert binding.current_mode == "plan"
+    assert log == ["oc_x", "oc_x"]

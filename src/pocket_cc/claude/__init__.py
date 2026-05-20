@@ -13,6 +13,7 @@ from pocket_cc.claude.pane_inspector import (
     ParsedOption,
     ParsedPrompt,
     PromptKind,
+    detect_mode,
     inspect_pane,
 )
 from pocket_cc.claude.session_index import (
@@ -47,6 +48,7 @@ __all__ = [
     "ToolUse",
     "TranscriptReader",
     "UserText",
+    "detect_mode",
     "encode_cwd_loose",
     "encode_cwd_strict",
     "find_active_transcript",

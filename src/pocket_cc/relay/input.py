@@ -24,6 +24,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 from pocket_cc.app.persistence import ChatBinding, TurnState
+from pocket_cc.claude.pane_inspector import detect_mode
 from pocket_cc.claude.session_index import snapshot_existing_transcripts
 from pocket_cc.lark.card import build_text_card
 from pocket_cc.lark.client import LarkApiError
@@ -33,6 +34,8 @@ from pocket_cc.relay.waiting import KeysResponse, TextResponse
 from pocket_cc.tmux import TmuxError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pocket_cc.app.config import Config
     from pocket_cc.app.persistence import Registry
     from pocket_cc.lark.card import CardState
@@ -65,6 +68,12 @@ _CANCEL_BETWEEN_ESCAPES_S = 0.1
 # tmux.send_text, we can interrupt it on cancel and drop the Enter before
 # it submits the prompt. Module-level so tests can monkeypatch it to 0.
 _DEFERRED_ENTER_DELAY_S = 0.5
+# After the ⇧⭾ Mode button sends Shift-Tab, wait this long before reading
+# the pane back — Claude's TUI redraws the mode-line near-instantly, so a
+# short pause is enough to capture the new mode. Mirrors ccgram's ~250ms +
+# a little headroom. Runs on the Lark WS callback thread (like _handle_cancel
+# at 0.3s, acceptable). Module-level so tests can monkeypatch it to 0.
+_MODE_READBACK_DELAY_S = 0.35
 
 
 class InputRouter:
@@ -77,11 +86,18 @@ class InputRouter:
         tmux: TmuxManager,
         lark: LarkClient,
         registry: Registry,
+        rerender_active: Callable[[ChatBinding], None] | None = None,
     ) -> None:
         self._config = config
         self._tmux = tmux
         self._lark = lark
         self._registry = registry
+        # Re-render the binding's active card via the bootstrap's
+        # rotation-aware path. Injected (not done inline) because the correct
+        # render needs from_committed / is_continuation / waiting handling
+        # that lives in bootstrap._publish_card. None in tests that don't
+        # exercise the mode readback.
+        self._rerender_active = rerender_active
         self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
 
     # =============================================================== messages
@@ -154,6 +170,11 @@ class InputRouter:
                 key = str(action.value.get("key", ""))
                 if key:
                     self._tmux.send_key(binding.window.window_id, key)
+                    if key == "BTab":
+                        # ⇧⭾ Mode just cycled the permission mode — read the
+                        # pane back and refresh the card so the user sees the
+                        # new mode without waiting for the next poll tick.
+                        self._readback_mode_after_toggle(binding)
             elif cmd == "key_sequence":
                 self._handle_key_sequence(binding, action.value)
             elif cmd == "show_pane":
@@ -450,6 +471,36 @@ class InputRouter:
         #    the dedicated ⎋ Esc button's two-Escape sequence.
         time.sleep(_CANCEL_BETWEEN_ESCAPES_S)
         self._tmux.send_key(window_id, "Escape")
+
+    def _readback_mode_after_toggle(self, binding: ChatBinding) -> None:
+        """Read the permission mode back from the pane after ⇧⭾ Mode.
+
+        The transcript only records `permission-mode` at turn boundaries,
+        so the running card never gets a mode signal from there. Instead we
+        scrape the TUI mode-line directly: Shift-Tab redraws it instantly,
+        so a brief pause then a capture reflects the new mode — including a
+        cycle back to *default*, which shows no banner (None → "default" is
+        safe here precisely because the footer just redrew).
+        """
+        window_id = binding.window.window_id
+        time.sleep(_MODE_READBACK_DELAY_S)
+        try:
+            pane = self._tmux.capture_pane(window_id, lines=40)
+        except TmuxError:
+            logger.debug(
+                "mode readback capture failed",
+                extra={"chat_id": binding.chat_id},
+            )
+            return
+        mode = detect_mode(pane) or "default"
+        turn = binding.current_turn
+        with binding.lock:
+            changed = binding.current_mode != mode
+            binding.current_mode = mode
+            if turn is not None:
+                turn.accumulator.current_mode = mode
+        if changed and turn is not None and self._rerender_active is not None:
+            self._rerender_active(binding)
 
     def _rerender_running(self, turn: TurnState) -> None:
         """Push an immediate running-state re-render of the current accumulator.

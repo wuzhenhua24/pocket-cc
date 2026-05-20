@@ -65,6 +65,7 @@ class Pocketcc:
             tmux=self._tmux,
             lark=self._lark,
             registry=self._registry,
+            rerender_active=self._rerender_active,
         )
         self._poller = TranscriptPoller(
             registry=self._registry,
@@ -308,6 +309,19 @@ class Pocketcc:
         )
 
     # ----------------------------------------------------- pane watcher (M2-C)
+
+    def _rerender_active(self, binding: ChatBinding) -> None:
+        """Re-render the binding's active card via the rotation-aware path.
+
+        Handed to :class:`InputRouter` so a card-action (e.g. the ⇧⭾ Mode
+        readback) can refresh the card immediately without duplicating the
+        from_committed / is_continuation / waiting logic that lives in
+        :meth:`_publish_card`. No-op when the turn has already ended.
+        """
+        turn = binding.current_turn
+        if turn is None:
+            return
+        self._publish_card(binding, turn)
 
     def _handle_pane_state_change(self, binding: ChatBinding) -> None:
         """PaneWatcher detected a waiting_for transition (set/changed/cleared).
