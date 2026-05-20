@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from pocket_cc.lark.card import CardState
     from pocket_cc.lark.client import LarkClient
     from pocket_cc.lark.event_loop import CardAction, IncomingMessage
+    from pocket_cc.relay.turn_controller import TurnController
     from pocket_cc.tmux import TmuxManager
 
 logger = logging.getLogger(__name__)
@@ -86,24 +87,23 @@ class InputRouter:
         tmux: TmuxManager,
         lark: LarkClient,
         registry: Registry,
-        rerender_active: Callable[[ChatBinding], None] | None = None,
+        controller_for: Callable[[ChatBinding], TurnController] | None = None,
         seal_active: Callable[[ChatBinding, CardState, str], None] | None = None,
     ) -> None:
         self._config = config
         self._tmux = tmux
         self._lark = lark
         self._registry = registry
-        # Re-render the binding's active card via the bootstrap's
-        # rotation-aware path. Injected (not done inline) because the correct
-        # render needs from_committed / is_continuation / waiting handling
-        # that lives in bootstrap._publish_card. None in tests that don't
-        # exercise the mode readback.
-        self._rerender_active = rerender_active
+        # Look up the binding's TurnController (bootstrap-owned, get-or-create).
+        # The router never constructs one — it only reaches a controller through
+        # this provider to drive rotation-aware state transitions (clear-waiting
+        # rerender, mode update). None in tests that don't exercise those paths.
+        self._controller_for = controller_for
         # Seal the active turn via the bootstrap's rotation-aware path so a
         # long final turn rolls across "(续)" cards instead of tail-truncating
-        # on the current card. Injected for the same reason as rerender_active
-        # (rotation machinery lives in bootstrap). None in tests → fall back
-        # to the simple single-card close in `_close_turn`.
+        # on the current card. Injected because the rotation machinery lives in
+        # the controller. None in tests → fall back to the simple single-card
+        # close in `_close_turn`.
         self._seal_active = seal_active
         self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
 
@@ -368,11 +368,11 @@ class InputRouter:
         turn = binding.current_turn
         if turn is None:  # defensive; caller checked
             return
-        with binding.lock:
-            turn.waiting_for = None
-        # Flip card back to running *now* — otherwise the user sees the
-        # waiting buttons stuck on screen until the next poll tick.
-        self._rerender_running(binding)
+        # Clear waiting + flip the card back to running *now* (rotation-aware),
+        # otherwise the user sees the waiting buttons stuck on screen until the
+        # next poll tick. Owned by the controller so an already-rotated turn
+        # isn't re-dumped onto the current card.
+        self._clear_waiting(binding, turn)
         try:
             self._tmux.send_text(binding.window.window_id, text)
         except TmuxError as e:
@@ -403,13 +403,11 @@ class InputRouter:
         option = options[index]
         # Clear waiting state before sending — the detector will re-set it
         # if needed. Holds the lock briefly.
-        with binding.lock:
-            turn.waiting_for = None
-        # Flip card back to running *now* (before the tmux send, even),
-        # so the user sees the buttons disappear immediately when they tap.
-        # Otherwise the card sits in waiting state until the next poll tick
-        # — a noticeable lag in real-world testing.
-        self._rerender_running(binding)
+        # Clear waiting + flip the card back to running *now* (before the tmux
+        # send, even), so the buttons disappear immediately when the user taps.
+        # Otherwise the card sits in waiting state until the next poll tick — a
+        # noticeable lag in real-world testing.
+        self._clear_waiting(binding, turn)
         try:
             response = option.response
             if isinstance(response, TextResponse):
@@ -510,44 +508,34 @@ class InputRouter:
             )
             return
         mode = detect_mode(pane) or "default"
+        if self._controller_for is not None:
+            # Controller owns the binding/turn mode write + rotation-aware
+            # rerender of the Mode button label.
+            self._controller_for(binding).update_mode(mode)
+            return
+        # Fallback for tests without a controller: update the fields directly.
+        binding.current_mode = mode
         turn = binding.current_turn
-        with binding.lock:
-            changed = binding.current_mode != mode
-            binding.current_mode = mode
-            if turn is not None:
-                turn.accumulator.current_mode = mode
-        if changed and turn is not None and self._rerender_active is not None:
-            self._rerender_active(binding)
+        if turn is not None:
+            turn.accumulator.current_mode = mode
 
-    def _rerender_running(self, binding: ChatBinding) -> None:
-        """Push an immediate running-state re-render of the active card.
+    def _clear_waiting(self, binding: ChatBinding, turn: TurnState) -> None:
+        """Clear the turn's waiting state and flip the card back to running.
 
-        Used right after a user responds to a waiting prompt (button or
-        free-form text) so the card flips out of waiting state without
-        waiting for the next transcript-poller / pane-watcher tick.
-        CardStream's throttle still applies (~1.5s max), but it's much
-        better than waiting for two-stage polling to converge.
+        Called right after a user responds to a waiting prompt (button or
+        free-form text) so the card leaves waiting state without waiting for
+        the next transcript-poller / pane-watcher tick. CardStream's throttle
+        still applies (~1.5s max), but it beats two-stage polling.
 
-        Goes through the bootstrap-owned rotation-aware path (``rerender_active``
-        → ``_publish_card``) when injected, so a turn that already rotated to a
-        "(续)" card doesn't re-dump full history onto the current card and
-        tail-truncate ("已截断早期内容"). The local render below is a fallback
-        for tests without that callback — it uses ``from_committed=True`` for
-        the same reason.
+        Goes through the binding's TurnController (rotation-aware) so a turn
+        that already rotated to a "(续)" card doesn't re-dump full history onto
+        the current card and tail-truncate ("已截断早期内容"). The local clear
+        below is a fallback for tests without a controller injected.
         """
-        if self._rerender_active is not None:
-            self._rerender_active(binding)
+        if self._controller_for is not None:
+            self._controller_for(binding).clear_waiting_and_rerender()
             return
-        turn = binding.current_turn
-        if turn is None:
-            return
-        try:
-            snapshot = turn.accumulator.snapshot(state="running", from_committed=True)
-            turn.card_stream.update(
-                render_card(snapshot, is_continuation=turn.is_continuation)
-            )
-        except Exception:
-            logger.warning("immediate card re-render failed", exc_info=True)
+        turn.waiting_for = None
 
     def _dump_pane(self, binding: ChatBinding) -> None:
         try:

@@ -15,6 +15,7 @@ from pocket_cc.app.persistence import ChatBinding, Registry
 from pocket_cc.lark.client import FakeLarkClient
 from pocket_cc.lark.event_loop import CardAction, IncomingMessage
 from pocket_cc.relay.input import InputRouter
+from pocket_cc.relay.turn_controller import TurnController
 from pocket_cc.relay.waiting import (
     KeysResponse,
     TextResponse,
@@ -96,15 +97,41 @@ def _make_router(
     lark: FakeLarkClient,
     registry: Registry,
     config: Config,
-    rerender_active: Any = None,
+    controller_for: Any = None,
 ) -> InputRouter:
     return InputRouter(
         config=config,
         tmux=cast("Any", tmux),
         lark=lark,
         registry=registry,
-        rerender_active=rerender_active,
+        controller_for=controller_for,
     )
+
+
+def _real_controller_for(lark: FakeLarkClient, config: Config) -> Any:
+    """Provider that hands the router a real TurnController per binding —
+    exercises the rotation-aware clear-waiting / mode-update paths."""
+    return lambda binding: TurnController(
+        binding=binding, lark=cast("Any", lark), config=config
+    )
+
+
+class _RecordingController:
+    """Spy controller that records which lifecycle method the router called."""
+
+    def __init__(self, binding: ChatBinding, calls: list[tuple[str, str]]) -> None:
+        self._binding = binding
+        self._calls = calls
+
+    def clear_waiting_and_rerender(self) -> None:
+        self._calls.append((self._binding.chat_id, "clear_waiting"))
+
+    def update_mode(self, mode: str) -> None:
+        self._calls.append((self._binding.chat_id, f"mode:{mode}"))
+
+
+def _recording_controller_for(calls: list[tuple[str, str]]) -> Any:
+    return lambda binding: _RecordingController(binding, calls)
 
 
 def _message(
@@ -395,13 +422,12 @@ def test_card_action_mode_btab_reads_mode_back_and_rerenders(tmp_path: Path) -> 
     tmux = FakeTmuxManager(capture_pane_text="working...\n⏵⏵ accept edits on (shift+tab to cycle)")
     lark = FakeLarkClient()
     registry = Registry()
-    rerendered: list[str] = []
     router = _make_router(
         tmux=tmux,
         lark=lark,
         registry=registry,
         config=cfg,
-        rerender_active=lambda b: rerendered.append(b.chat_id),
+        controller_for=_real_controller_for(lark, cfg),
     )
     router.handle_message(_message())
     card_id = lark.last_sent().message_id
@@ -432,7 +458,6 @@ def test_card_action_mode_btab_reads_mode_back_and_rerenders(tmp_path: Path) -> 
     assert binding.current_mode == "acceptEdits"
     assert binding.current_turn is not None
     assert binding.current_turn.accumulator.current_mode == "acceptEdits"
-    assert rerendered == ["oc_chat1"]
 
 
 def test_card_action_show_pane_dumps_capture_into_new_card(tmp_path: Path) -> None:
@@ -668,20 +693,20 @@ def test_waiting_reply_text_uses_rotation_aware_rerender(tmp_path: Path) -> None
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
     registry = Registry()
-    rerendered: list[str] = []
+    calls: list[tuple[str, str]] = []
     router = _make_router(
         tmux=tmux,
         lark=lark,
         registry=registry,
         config=cfg,
-        rerender_active=lambda b: rerendered.append(b.chat_id),
+        controller_for=_recording_controller_for(calls),
     )
     router.handle_message(_message(text="please run X"))
     _set_waiting_on_active_turn(registry, "oc_chat1")
 
     router.handle_message(_message(text="1", message_id="om_reply"))
 
-    assert rerendered == ["oc_chat1"]
+    assert calls == [("oc_chat1", "clear_waiting")]
 
 
 def test_waiting_response_button_uses_rotation_aware_rerender(tmp_path: Path) -> None:
@@ -689,13 +714,13 @@ def test_waiting_response_button_uses_rotation_aware_rerender(tmp_path: Path) ->
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
     registry = Registry()
-    rerendered: list[str] = []
+    calls: list[tuple[str, str]] = []
     router = _make_router(
         tmux=tmux,
         lark=lark,
         registry=registry,
         config=cfg,
-        rerender_active=lambda b: rerendered.append(b.chat_id),
+        controller_for=_recording_controller_for(calls),
     )
     router.handle_message(_message(text="please run X"))
     card_id = lark.last_sent().message_id
@@ -712,7 +737,7 @@ def test_waiting_response_button_uses_rotation_aware_rerender(tmp_path: Path) ->
         )
     )
 
-    assert rerendered == ["oc_chat1"]
+    assert calls == [("oc_chat1", "clear_waiting")]
 
 
 def test_message_after_continuation_opens_new_turn_again(tmp_path: Path) -> None:

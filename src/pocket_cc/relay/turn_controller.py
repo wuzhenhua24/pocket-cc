@@ -143,17 +143,35 @@ class TurnController:
             )
         binding.current_turn = None
 
-    def rerender(self) -> None:
-        """Re-render the binding's active card via the rotation-aware path.
+    def clear_waiting_and_rerender(self) -> None:
+        """Clear the active turn's waiting state and re-render it as running.
 
-        Used by card-actions (e.g. the ⇧⭾ Mode readback) and the waiting
-        clear/reply path to refresh the card immediately without duplicating
-        the from_committed / is_continuation / waiting logic in
-        :meth:`_publish_card`. No-op when the turn has already ended.
+        Called when the user replies to a waiting prompt (button or free-form
+        text). Clears ``waiting_for`` optimistically — the pane-watcher
+        re-sets it if Claude re-prompts. Goes through the rotation-aware
+        rerender so a turn that already rotated to a "(续)" card isn't
+        re-dumped onto the current card (which would tail-truncate).
         """
         turn = self._binding.current_turn
         if turn is None:
             return
+        turn.waiting_for = None
+        self._publish_card(turn)
+
+    def update_mode(self, mode: str) -> None:
+        """Record a permission-mode change and refresh the Mode button.
+
+        Always updates the binding-level (session) mode so the *next* turn
+        opens with the right mode even when no turn is active right now. When
+        a turn is active, also syncs the mode into its accumulator (drives the
+        Mode button label) and re-renders. A no-op mode write still re-renders,
+        but CardStream's hash de-dupe drops the redundant patch.
+        """
+        self._binding.current_mode = mode
+        turn = self._binding.current_turn
+        if turn is None:
+            return
+        turn.accumulator.current_mode = mode
         self._publish_card(turn)
 
     def on_pane_change(self) -> None:
