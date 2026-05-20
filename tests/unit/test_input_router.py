@@ -11,7 +11,7 @@ from pathlib import Path  # noqa: TC003 — used in test signatures
 from typing import Any, cast
 
 from pocket_cc.app.config import Config
-from pocket_cc.app.persistence import Registry
+from pocket_cc.app.persistence import ChatBinding, Registry
 from pocket_cc.lark.client import FakeLarkClient
 from pocket_cc.lark.event_loop import CardAction, IncomingMessage
 from pocket_cc.relay.input import InputRouter
@@ -506,6 +506,45 @@ def test_duplicate_card_action_token_is_dropped(tmp_path: Path) -> None:
 
     ctrl_c_calls = [c for c in tmux.calls if c.method == "send_key" and c.kwargs["key"] == "C-c"]
     assert len(ctrl_c_calls) == 1
+
+
+def test_close_turn_routes_through_injected_seal(tmp_path: Path) -> None:
+    """When a seal_active callback is injected (production), closing a turn
+    must delegate to it (rotation-aware seal) instead of the simple inline
+    close — so a long final turn rolls across "(续)" cards."""
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    sealed: list[tuple[str, str]] = []
+
+    def _seal(binding: ChatBinding, state: str, error: str) -> None:
+        sealed.append((state, error))
+        binding.current_turn = None  # mirror bootstrap._seal_active
+
+    router = InputRouter(
+        config=cfg,
+        tmux=cast("Any", tmux),
+        lark=lark,
+        registry=registry,
+        seal_active=_seal,
+    )
+
+    router.handle_message(_message(text="first"))
+    # Second message closes the prior turn → should go through the seal.
+    router.handle_message(
+        IncomingMessage(
+            message_id="om_msg2",
+            chat_id="oc_chat1",
+            chat_type="p2p",
+            sender_open_id="ou_user1",
+            message_type="text",
+            text="second",
+            raw_content='{"text":"second"}',
+        )
+    )
+
+    assert sealed == [("done", "")]
 
 
 def test_distinct_message_ids_both_processed(tmp_path: Path) -> None:

@@ -49,6 +49,13 @@ if TYPE_CHECKING:
 #                      this as `max_chars` for chunked rotation's fit window.
 _BODY_MAX_CHARS = 3000
 ROTATE_AT_CHARS = 2500
+# Max size of a single stored assistant_text part. A long assistant block
+# is split into chunks no bigger than this *at ingest* so that chunked
+# rotation (which splits at part boundaries) can always fit at least one
+# whole part in a card — otherwise a single oversized block would force
+# itself into one card and tail-truncate. Kept comfortably under
+# ROTATE_AT_CHARS to leave room for tool-call bullets + headers in the body.
+_TEXT_PART_MAX_CHARS = 2000
 _THINKING_MAX_CHARS = 2000
 _TITLE_MAX_CHARS = 60
 # Continuation marker appended to the body of a card we're about to close
@@ -160,7 +167,11 @@ class TurnAccumulator:
                 self.user_prompt = event.text
             return
         if isinstance(event, AssistantText):
-            self._assistant_text_parts.append(event.text)
+            # Split oversized blocks so each stored part fits one card —
+            # see `_split_text_part`. A single huge assistant message would
+            # otherwise be force-included whole by `find_fit_window` and then
+            # tail-truncated (the "已截断早期内容" bug).
+            self._assistant_text_parts.extend(_split_text_part(event.text))
             return
         if isinstance(event, ToolUse):
             self._tool_calls.append(format_tool_call(event.tool_name, event.tool_input))
@@ -538,3 +549,62 @@ def _shorten(s: str, limit: int) -> str:
     if len(s) <= limit:
         return s
     return s[: limit - 1] + "…"
+
+
+def _split_text_part(text: str, limit: int = _TEXT_PART_MAX_CHARS) -> list[str]:
+    """Split an assistant text block into chunks no longer than ``limit``.
+
+    Splits at paragraph (``\\n\\n``) boundaries where possible so the chunks
+    re-join seamlessly through the accumulator's ``"\\n\\n".join(...)`` — a
+    chunk holds one or more whole paragraphs. A single paragraph longer than
+    ``limit`` is hard-split on line/character boundaries (content preserved;
+    at most a cosmetic blank line where a hard cut lands). The point is to
+    keep every stored part small enough that chunked rotation can always fit
+    at least one whole part in a card, so no card ever tail-truncates.
+    """
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    buf = ""
+    for para in text.split("\n\n"):
+        if len(para) > limit:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            chunks.extend(_hard_split(para, limit))
+            continue
+        candidate = f"{buf}\n\n{para}" if buf else para
+        if len(candidate) > limit:
+            if buf:
+                chunks.append(buf)
+            buf = para
+        else:
+            buf = candidate
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def _hard_split(s: str, limit: int) -> list[str]:
+    """Last-resort split of an over-limit paragraph: prefer line boundaries,
+    fall back to a hard character cut for a single over-limit line."""
+    out: list[str] = []
+    buf = ""
+    for line in s.split("\n"):
+        if len(line) > limit:
+            if buf:
+                out.append(buf)
+                buf = ""
+            for i in range(0, len(line), limit):
+                out.append(line[i : i + limit])
+            continue
+        candidate = f"{buf}\n{line}" if buf else line
+        if len(candidate) > limit:
+            if buf:
+                out.append(buf)
+            buf = line
+        else:
+            buf = candidate
+    if buf:
+        out.append(buf)
+    return out

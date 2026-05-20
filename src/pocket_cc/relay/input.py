@@ -87,6 +87,7 @@ class InputRouter:
         lark: LarkClient,
         registry: Registry,
         rerender_active: Callable[[ChatBinding], None] | None = None,
+        seal_active: Callable[[ChatBinding, CardState, str], None] | None = None,
     ) -> None:
         self._config = config
         self._tmux = tmux
@@ -98,6 +99,12 @@ class InputRouter:
         # that lives in bootstrap._publish_card. None in tests that don't
         # exercise the mode readback.
         self._rerender_active = rerender_active
+        # Seal the active turn via the bootstrap's rotation-aware path so a
+        # long final turn rolls across "(续)" cards instead of tail-truncating
+        # on the current card. Injected for the same reason as rerender_active
+        # (rotation machinery lives in bootstrap). None in tests → fall back
+        # to the simple single-card close in `_close_turn`.
+        self._seal_active = seal_active
         self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
 
     # =============================================================== messages
@@ -334,6 +341,16 @@ class InputRouter:
         turn = binding.current_turn
         if turn is None:
             return
+        if self._seal_active is not None:
+            # Rotation-aware seal (bootstrap-owned): rolls any oversized
+            # uncommitted tail across "(续)" cards before closing, so the
+            # final card never tail-truncates the whole turn. Sets
+            # current_turn = None itself.
+            self._seal_active(binding, state, error)
+            return
+        # Fallback for tests without the seal injected: simple single-card
+        # close. Uses the full snapshot (fine for short turns; long turns
+        # only occur with the real bootstrap path injected).
         snapshot = turn.accumulator.snapshot(state=state, error=error)
         try:
             turn.card_stream.close(render_card(snapshot))

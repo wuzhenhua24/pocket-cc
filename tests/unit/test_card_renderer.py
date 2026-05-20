@@ -618,6 +618,109 @@ def test_chunked_rotation_no_truncation_message_when_split() -> None:
     assert "截断" not in final_body
 
 
+# ===================================== oversized single block + rotation-aware seal
+
+
+def test_split_text_part_short_passthrough() -> None:
+    from pocket_cc.relay.card_renderer import _split_text_part
+
+    assert _split_text_part("hello") == ["hello"]
+
+
+def test_split_text_part_packs_paragraphs_and_rejoins_exactly() -> None:
+    """Paragraph-boundary split must reconstruct the original verbatim when
+    rejoined with the accumulator's "\\n\\n" separator."""
+    from pocket_cc.relay.card_renderer import _split_text_part
+
+    original = "\n\n".join(f"paragraph {i} " + "x" * 400 for i in range(12))
+    chunks = _split_text_part(original, limit=1000)
+    assert len(chunks) >= 2
+    assert all(len(c) <= 1000 for c in chunks)
+    assert "\n\n".join(chunks) == original
+
+
+def test_split_text_part_hard_splits_single_giant_paragraph() -> None:
+    from pocket_cc.relay.card_renderer import _split_text_part
+
+    # One unbroken line, no paragraph/line boundaries to split on.
+    giant = "A" * 5000
+    chunks = _split_text_part(giant, limit=2000)
+    assert all(len(c) <= 2000 for c in chunks)
+    assert "".join(chunks) == giant  # content fully preserved
+
+
+def test_ingest_huge_assistant_text_is_stored_in_bounded_parts() -> None:
+    from pocket_cc.relay.card_renderer import _TEXT_PART_MAX_CHARS
+
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    huge = "\n\n".join(f"para {i}: " + "y" * 500 for i in range(20))  # ~10k chars
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text=huge))
+
+    # Full content is preserved (no loss at ingest)…
+    full = acc.snapshot(state="running", from_committed=False)
+    assert "para 0:" in full.assistant_text
+    assert "para 19:" in full.assistant_text
+    # …and no single part can force a card to tail-truncate.
+    text_end, _, _ = acc.find_fit_window(_TEXT_PART_MAX_CHARS + 200)
+    assert text_end >= 1  # at least one whole part fits the budget
+
+
+def test_single_huge_assistant_text_splits_across_cards_on_seal() -> None:
+    """The seal path (Stop hook / shutdown) must roll a huge final block
+    across multiple cards, not tail-truncate it onto the current one.
+
+    Simulates bootstrap._seal_active against the accumulator primitives:
+    rotate the from_committed tail until it fits, then render the final
+    card from the *from_committed* tail (NOT full history)."""
+    from pocket_cc.relay.card_renderer import ROTATE_AT_CHARS
+
+    acc = TurnAccumulator()
+    acc.user_prompt = "long answer"
+    huge = "\n\n".join(f"section {i}\n" + "z" * 600 for i in range(15))  # ~9k chars
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text=huge))
+
+    bodies: list[str] = []
+    for _ in range(32):
+        snap = acc.snapshot(state="running", from_committed=True)
+        if not should_rotate(snap):
+            break
+        te, toe, the = acc.find_fit_window(ROTATE_AT_CHARS)
+        seal_snap = acc.snapshot_window(text_end=te, tool_end=toe, thinking_end=the)
+        bodies.append(render_card(seal_snap, ends_with_continuation_marker=True)["elements"][0]["content"])
+        acc.commit_to(text_end=te, tool_end=toe, thinking_end=the)
+
+    # Final card: terminal state, rendered from the *uncommitted tail only*.
+    final_snap = acc.snapshot(state="done", from_committed=True)
+    final_card = render_card(final_snap, is_continuation=True)
+    final_body = final_card["elements"][0]["content"]
+
+    assert bodies, "a ~9k block must require at least one continuation card"
+    for b in [*bodies, final_body]:
+        assert "截断" not in b, f"no card should tail-truncate; got:\n{b}"
+        assert len(b) <= 3100  # within the per-card body cap (+ footer slack)
+
+
+def test_seal_uses_from_committed_tail_not_full_history() -> None:
+    """Regression for the core bug: after rotation has committed early
+    content, the final seal must render only the uncommitted tail — not the
+    full turn (which re-dumped onto the last card and tail-truncated)."""
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a1", timestamp="t", text="EARLY-" + "a" * 100))
+    acc.ingest(AssistantText(uuid="a2", timestamp="t", text="LATE-" + "b" * 100))
+
+    # Simulate a rotation that committed the first part.
+    acc.commit_to(text_end=1, tool_end=0, thinking_end=0)
+
+    final = acc.snapshot(state="done", from_committed=True)
+    assert "LATE-" in final.assistant_text
+    assert "EARLY-" not in final.assistant_text  # not re-dumped onto the final card
+    # Full history still has everything (used nowhere in the seal now).
+    full = acc.snapshot(state="done", from_committed=False)
+    assert "EARLY-" in full.assistant_text and "LATE-" in full.assistant_text
+
+
 # =============================================================== permission mode
 
 

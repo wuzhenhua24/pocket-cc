@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from pocket_cc.app.persistence import ChatBinding, TurnState
     from pocket_cc.claude.events import HookEvent
     from pocket_cc.claude.transcript import Event
+    from pocket_cc.lark.card import CardState
     from pocket_cc.relay.card_renderer import TurnSnapshot
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ class Pocketcc:
             lark=self._lark,
             registry=self._registry,
             rerender_active=self._rerender_active,
+            seal_active=self._seal_active,
         )
         self._poller = TranscriptPoller(
             registry=self._registry,
@@ -137,19 +139,18 @@ class Pocketcc:
         self._events_poller.stop()
         self._poller.stop()
         for binding in self._registry.all():
-            turn = binding.current_turn
-            if turn is None:
+            if binding.current_turn is None:
                 continue
             try:
-                snapshot = turn.accumulator.snapshot(state="done")
-                turn.card_stream.close(render_card(snapshot))
+                # Rotation-aware seal so a long final turn isn't truncated.
+                self._seal_active(binding, state="done")
             except Exception:
                 logger.warning(
                     "shutdown: closing turn failed",
                     extra={"chat_id": binding.chat_id},
                     exc_info=True,
                 )
-            binding.current_turn = None
+                binding.current_turn = None
 
     # -------------------------------------------------------------- internal
 
@@ -307,6 +308,53 @@ class Pocketcc:
                 "new_card_id": new_message_id,
             },
         )
+
+    def _seal_active(
+        self, binding: ChatBinding, state: CardState = "done", error: str = ""
+    ) -> None:
+        """Rotation-aware seal of the binding's active turn.
+
+        The seal counterpart of :meth:`_publish_card`. Naively closing the
+        card with a full-history snapshot re-dumps the whole turn onto the
+        *current* (possibly already-rotated) card, where it tail-truncates
+        ("已截断早期内容") — the bug we keep hitting. Instead we run the same
+        rotation loop on the **uncommitted tail**: any content beyond one
+        card's worth is rolled across "(续)" continuation cards first, then
+        the remaining tail (≤ one card) is closed with the terminal
+        done/failed state and the correct ``is_continuation`` flag.
+
+        Handed to :class:`InputRouter` as ``seal_active`` so every close
+        path (Stop / StopFailure hooks via ``close_active_turn``, the
+        new-message-closes-prior path, error paths) seals the same way.
+        Also used directly by :meth:`shutdown`.
+        """
+        turn = binding.current_turn
+        if turn is None:
+            return
+        # Roll the oversized uncommitted tail across continuation cards. We
+        # check the *running* snapshot (content only) so the loop stops once
+        # the remaining tail fits — that tail is then closed below with the
+        # terminal state. Same 32-iteration safety cap as _publish_card.
+        for _ in range(32):
+            if not should_rotate(
+                turn.accumulator.snapshot(state="running", from_committed=True)
+            ):
+                break
+            self._rotate_card(binding, turn)
+        final_snapshot = turn.accumulator.snapshot(
+            state=state, error=error, from_committed=True
+        )
+        try:
+            turn.card_stream.close(
+                render_card(final_snapshot, is_continuation=turn.is_continuation)
+            )
+        except Exception:
+            logger.warning(
+                "seal: closing final card failed",
+                extra={"chat_id": binding.chat_id},
+                exc_info=True,
+            )
+        binding.current_turn = None
 
     # ----------------------------------------------------- pane watcher (M2-C)
 
