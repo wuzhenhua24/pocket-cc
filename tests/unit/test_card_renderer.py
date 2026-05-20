@@ -125,11 +125,11 @@ def test_render_card_empty_running_shows_placeholder() -> None:
     assert "运行中" in body
 
 
-def test_render_card_thinking_renders_as_detail_section() -> None:
+def test_render_card_thinking_renders_as_detail_section_when_enabled() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
     acc.ingest(AssistantThinking(uuid="a", timestamp="t", text="secret thoughts"))
-    card = render_card(acc.snapshot(state="running"))
+    card = render_card(acc.snapshot(state="running"), show_thinking=True)
     tags = [e.get("tag") for e in card["elements"]]
     # body, hr, note, markdown (detail), hr, action — depending on state
     assert "note" in tags
@@ -139,6 +139,16 @@ def test_render_card_thinking_renders_as_detail_section() -> None:
     # the actual thinking content follows in the next markdown block
     assert card["elements"][note_idx + 1]["tag"] == "markdown"
     assert "secret thoughts" in card["elements"][note_idx + 1]["content"]
+
+
+def test_render_card_thinking_hidden_by_default() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantThinking(uuid="a", timestamp="t", text="secret thoughts"))
+    card = render_card(acc.snapshot(state="running"))
+    blob = str(card)
+    assert "思考链" not in blob
+    assert "secret thoughts" not in blob
 
 
 def test_render_card_body_truncated_when_huge() -> None:

@@ -369,6 +369,7 @@ def render_card(
     *,
     is_continuation: bool = False,
     ends_with_continuation_marker: bool = False,
+    show_thinking: bool = False,
 ) -> dict[str, Any]:
     """Render a TurnSnapshot to the Lark card dict.
 
@@ -385,14 +386,14 @@ def render_card(
         (used when sealing a card because the next card is starting).
     """
     if snapshot.waiting_for is not None:
-        return _render_waiting_card(snapshot, snapshot.waiting_for)
+        return _render_waiting_card(snapshot, snapshot.waiting_for, show_thinking=show_thinking)
 
     title_body = _shorten(snapshot.user_prompt, _TITLE_MAX_CHARS) or "Claude"
     title = f"{_CONTINUATION_TITLE_PREFIX}{title_body}" if is_continuation else title_body
     body = _render_body(snapshot)
     if ends_with_continuation_marker:
         body = body + _CONTINUATION_FOOTER
-    detail = _render_detail(snapshot)
+    detail = _render_detail(snapshot) if show_thinking else None
     actions: list[CardButton] | None = None
     if snapshot.state == "running":
         # Build a per-card action row so the Mode button can carry the
@@ -409,7 +410,9 @@ def render_card(
     )
 
 
-def _render_waiting_card(snapshot: TurnSnapshot, waiting: WaitingFor) -> dict[str, Any]:
+def _render_waiting_card(
+    snapshot: TurnSnapshot, waiting: WaitingFor, *, show_thinking: bool = False
+) -> dict[str, Any]:
     """Render a ❓ waiting card with question + option buttons.
 
     Options beyond `_WAITING_OPTION_BUTTONS_CAP` are still listed (numbered)
@@ -419,7 +422,7 @@ def _render_waiting_card(snapshot: TurnSnapshot, waiting: WaitingFor) -> dict[st
     """
     title = _shorten(snapshot.user_prompt, _TITLE_MAX_CHARS) or "Claude"
     body = _render_waiting_body(snapshot, waiting)
-    detail = _render_detail(snapshot)
+    detail = _render_detail(snapshot) if show_thinking else None
     actions = _render_waiting_actions(waiting)
 
     return build_status_card(

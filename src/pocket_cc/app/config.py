@@ -12,6 +12,7 @@ Layout (see DESIGN.md §5):
   - User whitelist (open_ids) → POCKET_CC_USER_WHITELIST (comma separated)
   - Card patch throttle (s)   → POCKET_CC_PATCH_INTERVAL_S (default 1.5)
   - Transcript poll (s)       → POCKET_CC_TRANSCRIPT_POLL_S (default 0.5)
+  - Show thinking chain       → POCKET_CC_SHOW_THINKING (default off)
 """
 
 from __future__ import annotations
@@ -67,6 +68,11 @@ class Config:
     transcript_poll_s: float
     events_poll_s: float
     pane_poll_s: float
+    # When False (default), the Lark card omits the "💭 思考链" detail section
+    # so the projection stays close to what the tmux terminal shows (which
+    # collapses thinking). The transcript still carries it — this is purely a
+    # render toggle, flip POCKET_CC_SHOW_THINKING=1 to surface it.
+    show_thinking: bool = False
     claude_projects_dir: Path = field(default_factory=lambda: Path.home() / ".claude" / "projects")
 
     @property
@@ -114,6 +120,7 @@ def load(env_path: str | os.PathLike[str] | None = ".env") -> Config:
             os.environ.get("POCKET_CC_EVENTS_POLL_S"), _DEFAULT_EVENTS_POLL_S
         ),
         pane_poll_s=_parse_float(os.environ.get("POCKET_CC_PANE_POLL_S"), _DEFAULT_PANE_POLL_S),
+        show_thinking=_parse_bool(os.environ.get("POCKET_CC_SHOW_THINKING"), default=False),
     )
 
 
@@ -130,6 +137,12 @@ def _parse_whitelist(raw: str | None) -> frozenset[str]:
     if not raw:
         return frozenset()
     return frozenset(s.strip() for s in raw.split(",") if s.strip())
+
+
+def _parse_bool(raw: str | None, *, default: bool) -> bool:
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _parse_float(raw: str | None, default: float) -> float:

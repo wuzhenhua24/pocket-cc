@@ -219,7 +219,11 @@ class Pocketcc:
             if not should_rotate(snapshot):
                 break
             self._rotate_card(binding, turn)
-        card = render_card(snapshot, is_continuation=turn.is_continuation)
+        card = render_card(
+            snapshot,
+            is_continuation=turn.is_continuation,
+            show_thinking=self._config.show_thinking,
+        )
         turn.card_stream.update(card)
 
     def _snapshot_active(self, turn: TurnState) -> TurnSnapshot:
@@ -259,6 +263,7 @@ class Pocketcc:
             sealing_snapshot,
             is_continuation=turn.is_continuation,
             ends_with_continuation_marker=True,
+            show_thinking=self._config.show_thinking,
         )
         try:
             turn.card_stream.close(sealing_card)
@@ -282,7 +287,9 @@ class Pocketcc:
         starter_snapshot = turn.accumulator.snapshot(
             state="running", from_committed=True
         )
-        new_card = render_card(starter_snapshot, is_continuation=True)
+        new_card = render_card(
+            starter_snapshot, is_continuation=True, show_thinking=self._config.show_thinking
+        )
         try:
             new_message_id = self._lark.send_card(binding.chat_id, new_card)
         except LarkApiError:
@@ -346,7 +353,11 @@ class Pocketcc:
         )
         try:
             turn.card_stream.close(
-                render_card(final_snapshot, is_continuation=turn.is_continuation)
+                render_card(
+                    final_snapshot,
+                    is_continuation=turn.is_continuation,
+                    show_thinking=self._config.show_thinking,
+                )
             )
         except Exception:
             logger.warning(
