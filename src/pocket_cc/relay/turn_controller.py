@@ -1,40 +1,56 @@
 """Per-binding owner of turn-lifecycle state.
 
-One :class:`TurnController` per :class:`ChatBinding`. It owns the render /
-rotate / seal / re-render side of a turn — the logic that used to live as
-loose methods on :class:`pocket_cc.app.bootstrap.Pocketcc`.
+One :class:`TurnController` per :class:`ChatBinding`. It is the **single
+owner** of a binding's turn state — ``current_turn``, the accumulator, the
+``CardStream``, ``waiting_for``, the permission mode and the transcript
+reader. Every mutation goes through a controller method; nothing else in the
+codebase writes that state directly.
 
-This is **step 1** of the controller extraction (see the migration plan): a
-*verbatim* move with no behavioral change. There is no lock and no turn
-generation yet — those land in later steps. The accumulator/`current_turn`
-mutations still happen exactly where and when they did before; the only
-difference is they now live behind a single object instead of being spread
-across the bootstrap callbacks.
+Threading: the controller is reached from several threads (transcript-poller,
+pane-watcher, events-poller, WS handlers, shutdown). A single reentrant lock
+(:attr:`_lock`) serializes every transition, so those threads can't interleave
+their mutations. Two fencing mechanisms ride on top of the lock:
 
-Threading note (unchanged from before this move): these methods are still
-invoked from several threads (transcript-poller, pane-watcher, events-poller,
-WS, shutdown) without coordination. Making that safe is the point of the
-later steps; for now we preserve the status quo so the diff is reviewable.
+  - **generation** (``_active_gen``) — each opened turn gets a fresh id;
+    deferred/async work re-checks it before acting so it can't touch a turn
+    that was superseded or sealed in the meantime.
+  - **pending-stop FIFO** (``_pending_stops``) — attributes each Stop hook to
+    the turn that actually awaits it, since the hook carries no turn token.
+
+Lock discipline: ``send_card`` and ``CardStream.close`` (rare, bounded) may
+run inside the lock; tmux I/O and sleeps never do (they live in InputRouter /
+PaneWatcher). The high-frequency ``CardStream.update`` is flushed *outside*
+the lock — methods compute the card under the lock, release, then update.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from pocket_cc.claude.transcript import ModeChange
+from pocket_cc.app.persistence import TurnState
+from pocket_cc.claude.transcript import ModeChange, TranscriptReader
 from pocket_cc.lark.client import LarkApiError
-from pocket_cc.relay.card_renderer import ROTATE_AT_CHARS, render_card, should_rotate
+from pocket_cc.relay.card_renderer import (
+    ROTATE_AT_CHARS,
+    TurnAccumulator,
+    render_card,
+    should_rotate,
+)
 from pocket_cc.relay.card_stream import CardStream
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from pocket_cc.app.config import Config
-    from pocket_cc.app.persistence import ChatBinding, TurnState
+    from pocket_cc.app.persistence import ChatBinding
     from pocket_cc.claude.transcript import Event
     from pocket_cc.lark.card import CardState
     from pocket_cc.lark.client import LarkClient
     from pocket_cc.relay.card_renderer import TurnSnapshot
+    from pocket_cc.relay.waiting import WaitingFor
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +62,32 @@ class TurnController:
         self._binding = binding
         self._lark = lark
         self._config = config
+        # The single per-binding lock. Every turn-state transition (open / seal
+        # / ingest / pane-apply / mode / transcript swap) runs under it, so the
+        # transcript-poller, pane-watcher, events-poller, WS and shutdown
+        # threads can't interleave their mutations. Reentrant because some
+        # methods compose (e.g. seal_on_stop → seal, open_turn → begin_turn).
+        #
+        # Lock discipline (see DESIGN): allowed inside the lock are state
+        # decisions, accumulator ops, `send_card` and `CardStream.close`
+        # (rare, bounded). Forbidden inside: tmux I/O and sleeps (those live in
+        # InputRouter / PaneWatcher, never here). The high-frequency
+        # `CardStream.update` is flushed *outside* the lock — methods compute
+        # the card under the lock, release, then update.
+        self._lock = threading.RLock()
         # Turn generation — a fencing token. Each opened turn gets a fresh,
         # monotonically increasing id; `_active_gen` is the id of the turn
-        # that's current right now (None once it's sealed). Deferred/async
-        # work (the deferred Enter today; Stop-hook attribution in a later
-        # step) captures the gen at schedule time and re-checks
-        # `is_current_gen` before acting, so it can't operate on a turn that
-        # has since been superseded or sealed. No lock yet — that lands in a
-        # later step alongside the rest of the lifecycle serialization.
+        # that's current right now (None once it's sealed). Deferred/async work
+        # (the deferred Enter; Stop-hook attribution) captures the gen at
+        # schedule time and re-checks before acting, so it can't operate on a
+        # turn that has since been superseded or sealed.
         self._next_gen = 0
         self._active_gen: int | None = None
+        # Generations whose pending submission the user cancelled during the
+        # deferred-Enter grace window — the worker checks this (via
+        # `should_submit_deferred_enter`) and drops the Enter. Replaces the old
+        # per-turn cancel_event.
+        self._submit_cancelled: set[int] = set()
         # FIFO of generations whose prompt was actually submitted to Claude and
         # are therefore awaiting a Stop/StopFailure hook. The hook can't carry a
         # Lark-turn token, and one Claude session serves many turns (same
@@ -73,13 +105,32 @@ class TurnController:
 
     def begin_turn(self) -> int:
         """Mark a freshly opened turn as current and return its generation."""
-        self._next_gen += 1
-        self._active_gen = self._next_gen
-        return self._active_gen
+        with self._lock:
+            self._next_gen += 1
+            self._active_gen = self._next_gen
+            return self._active_gen
 
     def is_current_gen(self, gen: int) -> bool:
         """True iff ``gen`` is still the active turn (not superseded/sealed)."""
-        return self._active_gen == gen
+        with self._lock:
+            return self._active_gen == gen
+
+    def mark_submit_cancelled(self) -> None:
+        """Cancel the active turn's pending submission (⏹ during the grace
+        window). The deferred-Enter worker will drop the Enter. No-op if no
+        turn is active. Replaces the old per-turn cancel_event."""
+        with self._lock:
+            if self._active_gen is not None:
+                self._submit_cancelled.add(self._active_gen)
+
+    def should_submit_deferred_enter(self, gen: int) -> bool:
+        """Whether the deferred-Enter worker for ``gen`` should still submit.
+
+        False if the turn was superseded/sealed (gen no longer active) or its
+        submission was cancelled during the grace window.
+        """
+        with self._lock:
+            return self._active_gen == gen and gen not in self._submit_cancelled
 
     def expect_stop(self, gen: int) -> None:
         """Record that ``gen``'s prompt was submitted and now awaits a Stop.
@@ -87,7 +138,8 @@ class TurnController:
         Called once the deferred Enter actually reaches Claude (a cancelled /
         never-submitted turn produces no Stop, so it must not enqueue).
         """
-        self._pending_stops.append(gen)
+        with self._lock:
+            self._pending_stops.append(gen)
 
     def seal_on_stop(self, state: CardState = "done", error: str = "") -> None:
         """Seal the turn a Stop/StopFailure hook belongs to, via the FIFO.
@@ -101,26 +153,156 @@ class TurnController:
         An empty FIFO means no submitted turn is awaiting a Stop (duplicate or
         stray hook) — no-op, never seal a turn that might still be running.
         """
-        if not self._pending_stops:
-            logger.info(
-                "stop hook with no pending turn — ignored",
-                extra={"chat_id": self._binding.chat_id},
-            )
-            return
-        expected = self._pending_stops.popleft()
-        if expected == self._active_gen:
-            self.seal(state=state, error=error)
-        else:
-            logger.info(
-                "stop hook for superseded/sealed turn discarded",
-                extra={
-                    "chat_id": self._binding.chat_id,
-                    "expected_gen": expected,
-                    "active_gen": self._active_gen,
-                },
-            )
+        with self._lock:
+            if not self._pending_stops:
+                logger.info(
+                    "stop hook with no pending turn — ignored",
+                    extra={"chat_id": self._binding.chat_id},
+                )
+                return
+            expected = self._pending_stops.popleft()
+            if expected == self._active_gen:
+                self.seal(state=state, error=error)
+            else:
+                logger.info(
+                    "stop hook for superseded/sealed turn discarded",
+                    extra={
+                        "chat_id": self._binding.chat_id,
+                        "expected_gen": expected,
+                        "active_gen": self._active_gen,
+                    },
+                )
 
     # --------------------------------------------------------------- public API
+
+    def open_turn(self, user_text: str) -> int | None:
+        """Open a fresh turn: send its initial card, install it as current,
+        and return the new generation. Returns None if the initial card send
+        fails (no turn is installed in that case).
+
+        The caller (InputRouter) still owns the tmux side-effects — injecting
+        the prompt text and the deferred Enter — because those are terminal
+        I/O that must stay out of the controller's critical section.
+        """
+        with self._lock:
+            accumulator = TurnAccumulator()
+            accumulator.user_prompt = user_text  # show immediately; transcript confirms
+            # Carry over the session-level permission mode so the Mode button on
+            # the very first card render doesn't flash "默认" before the next
+            # transcript `permission-mode` record lands.
+            accumulator.current_mode = self._binding.current_mode
+
+            try:
+                message_id = self._lark.send_card(
+                    self._binding.chat_id,
+                    render_card(
+                        accumulator.snapshot(state="running"),
+                        show_thinking=self._config.show_thinking,
+                    ),
+                )
+            except LarkApiError:
+                logger.exception("send initial card failed")
+                return None
+
+            stream = CardStream(
+                self._lark, message_id, interval_s=self._config.patch_interval_s
+            )
+            stream.start()
+            turn = TurnState(
+                card_message_id=message_id,
+                card_stream=stream,
+                accumulator=accumulator,
+            )
+            self._binding.current_turn = turn
+            return self.begin_turn()
+
+    def poll_transcript(self, found: Path | None) -> None:
+        """Adopt/swap the active transcript and ingest any new events.
+
+        ``found`` is the result of the transcript poller's filesystem scan
+        (None if no active transcript yet). The scan stays in the poller (slow
+        I/O); the swap + read + ingest happen here so that *all* transcript
+        reader access — this poll and the Stop-hook drain — is serialized by a
+        single owner instead of racing on the reader's byte offset.
+        """
+        pending = None
+        with self._lock:
+            if found is not None and self._binding.transcript_path != found:
+                self._binding.transcript_path = found
+                self._binding.transcript_reader = TranscriptReader(path=found)
+                logger.info(
+                    "transcript switched",
+                    extra={"chat_id": self._binding.chat_id, "path": str(found)},
+                )
+            reader = self._binding.transcript_reader
+            if reader is not None:
+                pending = self._ingest_locked(reader.read_new())
+        if pending is not None:
+            pending[0].update(pending[1])
+
+    def lock_transcript(self, path: Path) -> bool:
+        """Lock the binding's transcript path (idempotent). Returns True if it
+        was just locked (so the caller can log), False if already set.
+
+        Called from the SessionStart hook to pin the transcript early, before
+        the poller's mtime heuristic would otherwise pick it up.
+        """
+        with self._lock:
+            if self._binding.transcript_path is not None:
+                return False
+            self._binding.transcript_path = path
+            self._binding.transcript_reader = TranscriptReader(path=path)
+            return True
+
+    def drain_and_ingest(self) -> int:
+        """Pull any pending transcript events into the accumulator (no render).
+
+        Used right before a Stop/StopFailure seal: Claude writes its final
+        assistant message moments before the hook fires, too fast for the
+        0.5s poll tick, so we drain synchronously so the final snapshot
+        reflects it. Returns the number of events ingested.
+        """
+        with self._lock:
+            reader = self._binding.transcript_reader
+            turn = self._binding.current_turn
+            if reader is None or turn is None:
+                return 0
+            events = reader.read_new()
+            for ev in events:
+                turn.accumulator.ingest(ev)
+            return len(events)
+
+    def apply_pane_state(
+        self, new_waiting: WaitingFor | None, detected_mode: str | None
+    ) -> None:
+        """Apply a pane-watcher observation to the active turn.
+
+        ``new_waiting`` is the prompt parsed from the pane (None = no prompt
+        visible). ``detected_mode`` is the permission mode read off the same
+        capture (None = no banner, which must NOT force "default"). Re-renders
+        only when something actually changed.
+        """
+        pending = None
+        with self._lock:
+            turn = self._binding.current_turn
+            if turn is not None:
+                changed = False
+                current = turn.waiting_for
+                if new_waiting is None:
+                    if current is not None:
+                        turn.waiting_for = None
+                        changed = True
+                elif current is None or current.fingerprint != new_waiting.fingerprint:
+                    turn.waiting_for = new_waiting
+                    changed = True
+                if detected_mode is not None and detected_mode != self._binding.current_mode:
+                    self._binding.current_mode = detected_mode
+                    turn.accumulator.current_mode = detected_mode
+                    changed = True
+                if changed:
+                    pending = self._render_locked(turn)
+        if pending is not None:
+            pending[0].update(pending[1])
 
     def ingest_events(self, events: list[Event]) -> None:
         """Poller → accumulator → maybe rotate → re-render → throttled patch.
@@ -136,33 +318,10 @@ class TurnController:
         rendering. Rotation is **disabled while waiting** to avoid the
         weird UX of rotating mid-prompt.
         """
-        binding = self._binding
-        # Permission-mode records can arrive between turns (e.g. user
-        # pressed Shift-Tab in the tmux pane while no Lark turn was open)
-        # — keep the binding's mode current regardless, so the next turn
-        # that opens initializes its accumulator with the right mode.
-        for ev in events:
-            if isinstance(ev, ModeChange):
-                binding.current_mode = ev.mode
-
-        turn = binding.current_turn
-        if turn is None:
-            logger.debug(
-                "ingest_events skipped — no active turn",
-                extra={"chat_id": binding.chat_id, "event_count": len(events)},
-            )
-            return
-        logger.debug(
-            "ingest_events ingesting",
-            extra={
-                "chat_id": binding.chat_id,
-                "event_count": len(events),
-                "kinds": [type(e).__name__ for e in events],
-            },
-        )
-        for ev in events:
-            turn.accumulator.ingest(ev)
-        self._publish_card(turn)
+        with self._lock:
+            pending = self._ingest_locked(events)
+        if pending is not None:
+            pending[0].update(pending[1])
 
     def seal(self, state: CardState = "done", error: str = "") -> None:
         """Rotation-aware seal of the binding's active turn.
@@ -180,42 +339,45 @@ class TurnController:
         ``InputRouter._close_turn``), from shutdown, and — through
         :meth:`seal_on_stop` — from the Stop / StopFailure hooks.
         """
-        binding = self._binding
-        turn = binding.current_turn
-        if turn is None:
-            return
-        # Roll the oversized uncommitted tail across continuation cards. We
-        # check the *running* snapshot (content only) so the loop stops once
-        # the remaining tail fits — that tail is then closed below with the
-        # terminal state. Same 32-iteration safety cap as _publish_card.
-        for _ in range(32):
-            if not should_rotate(
-                turn.accumulator.snapshot(state="running", from_committed=True)
-            ):
-                break
-            self._rotate_card(turn)
-        final_snapshot = turn.accumulator.snapshot(
-            state=state, error=error, from_committed=True
-        )
-        try:
-            turn.card_stream.close(
-                render_card(
-                    final_snapshot,
-                    is_continuation=turn.is_continuation,
-                    show_thinking=self._config.show_thinking,
+        with self._lock:
+            binding = self._binding
+            turn = binding.current_turn
+            if turn is None:
+                return
+            # Roll the oversized uncommitted tail across continuation cards. We
+            # check the *running* snapshot (content only) so the loop stops once
+            # the remaining tail fits — that tail is then closed below with the
+            # terminal state. Same 32-iteration safety cap as _render_locked.
+            for _ in range(32):
+                if not should_rotate(
+                    turn.accumulator.snapshot(state="running", from_committed=True)
+                ):
+                    break
+                self._rotate_card(turn)
+            final_snapshot = turn.accumulator.snapshot(
+                state=state, error=error, from_committed=True
+            )
+            try:
+                # CardStream.close may block briefly (joins the patch thread);
+                # rare and bounded, so it's allowed inside the lock.
+                turn.card_stream.close(
+                    render_card(
+                        final_snapshot,
+                        is_continuation=turn.is_continuation,
+                        show_thinking=self._config.show_thinking,
+                    )
                 )
-            )
-        except Exception:
-            logger.warning(
-                "seal: closing final card failed",
-                extra={"chat_id": binding.chat_id},
-                exc_info=True,
-            )
-        binding.current_turn = None
-        # Retire the generation so any in-flight deferred work (e.g. a
-        # deferred Enter that was scheduled for this turn) sees a stale gen
-        # and aborts instead of acting on a closed/next turn.
-        self._active_gen = None
+            except Exception:
+                logger.warning(
+                    "seal: closing final card failed",
+                    extra={"chat_id": binding.chat_id},
+                    exc_info=True,
+                )
+            binding.current_turn = None
+            # Retire the generation so any in-flight deferred work (e.g. a
+            # deferred Enter scheduled for this turn) sees a stale gen and
+            # aborts instead of acting on a closed/next turn.
+            self._active_gen = None
 
     def clear_waiting_and_rerender(self) -> None:
         """Clear the active turn's waiting state and re-render it as running.
@@ -226,11 +388,14 @@ class TurnController:
         rerender so a turn that already rotated to a "(续)" card isn't
         re-dumped onto the current card (which would tail-truncate).
         """
-        turn = self._binding.current_turn
-        if turn is None:
-            return
-        turn.waiting_for = None
-        self._publish_card(turn)
+        pending = None
+        with self._lock:
+            turn = self._binding.current_turn
+            if turn is not None:
+                turn.waiting_for = None
+                pending = self._render_locked(turn)
+        if pending is not None:
+            pending[0].update(pending[1])
 
     def update_mode(self, mode: str) -> None:
         """Record a permission-mode change and refresh the Mode button.
@@ -241,47 +406,49 @@ class TurnController:
         Mode button label) and re-renders. A no-op mode write still re-renders,
         but CardStream's hash de-dupe drops the redundant patch.
         """
-        self._binding.current_mode = mode
-        turn = self._binding.current_turn
-        if turn is None:
-            return
-        turn.accumulator.current_mode = mode
-        self._publish_card(turn)
-
-    def on_pane_change(self) -> None:
-        """PaneWatcher detected a waiting_for transition (set/changed/cleared).
-
-        Re-render the card to reflect the new state. CardStream's throttle
-        + hash dedupe handles the case where the rendered content didn't
-        actually change. Goes through the same rotation-aware path as
-        transcript updates.
-        """
-        turn = self._binding.current_turn
-        if turn is None:
-            return
-        self._publish_card(turn)
+        pending = None
+        with self._lock:
+            self._binding.current_mode = mode
+            turn = self._binding.current_turn
+            if turn is not None:
+                turn.accumulator.current_mode = mode
+                pending = self._render_locked(turn)
+        if pending is not None:
+            pending[0].update(pending[1])
 
     # ----------------------------------------------------------------- internal
 
-    def _publish_card(self, turn: TurnState) -> None:
-        """Render the current accumulator state to a card and patch it.
+    def _ingest_locked(self, events: list[Event]) -> tuple[CardStream, dict[str, Any]] | None:
+        """Fold events into the accumulator and render. **Lock must be held.**
 
-        Single re-render path used by both the transcript-poller callback
-        and the pane-watcher callback. Owns the rotation decision so both
-        paths get the same long-content handling.
+        Returns the ``(stream, card)`` to flush (outside the lock), or None
+        when there's no active turn. Permission-mode records are applied to the
+        binding mode even between turns so the next turn opens with it.
+        """
+        binding = self._binding
+        for ev in events:
+            if isinstance(ev, ModeChange):
+                binding.current_mode = ev.mode
+        turn = binding.current_turn
+        if turn is None:
+            return None
+        for ev in events:
+            turn.accumulator.ingest(ev)
+        return self._render_locked(turn)
+
+    def _render_locked(self, turn: TurnState) -> tuple[CardStream, dict[str, Any]]:
+        """Run the rotation loop and render the current card. **Lock must be
+        held.** Returns ``(stream, card)``; the caller flushes via
+        ``stream.update(card)`` *after* releasing the lock (the only
+        high-frequency op kept off the lock).
 
         Loops the rotation step: when one transcript batch ingests enough
         content to fill *several* cards (e.g. one long assistant response
-        plus a flurry of tool calls), each iteration seals the largest
-        prefix that fits without tail-truncation, then re-checks. Without
-        the loop, a single oversized batch produces one truncated sealed
-        card + one fresh card holding the leftover — losing the early
-        content the user expected to see across multiple "(续)" cards.
+        plus a flurry of tool calls), each iteration seals the largest prefix
+        that fits without tail-truncation, then re-checks — so a long batch
+        becomes N "(续)" cards instead of one truncated card.
         """
-        # Safety cap so a logic bug in find_fit_window can't busy-loop
-        # forever. Number of cards a single batch could *plausibly* need
-        # is bounded by (max batch size) / ROTATE_AT_CHARS; 32 is far
-        # past any realistic value and below the Lark per-chat send rate.
+        # Safety cap so a logic bug in find_fit_window can't busy-loop forever.
         for _ in range(32):
             snapshot = self._snapshot_active(turn)
             if not should_rotate(snapshot):
@@ -292,7 +459,7 @@ class TurnController:
             is_continuation=turn.is_continuation,
             show_thinking=self._config.show_thinking,
         )
-        turn.card_stream.update(card)
+        return turn.card_stream, card
 
     def _snapshot_active(self, turn: TurnState) -> TurnSnapshot:
         """Snapshot helper that respects waiting_for + from_committed."""

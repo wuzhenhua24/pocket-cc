@@ -13,10 +13,10 @@ Concepts:
   - Registry      — thread-safe dict of ChatBindings.
 
 Locking model: the Registry has a coarse lock around the mapping itself.
-Per-binding state mutations are not lock-protected here — callers (input
-router, output poller) must coordinate their accesses. In M1 there are only
-two writers (the WS thread for input, the poller thread for output) and
-they touch different fields, so this is fine without finer locks.
+:class:`TurnState` and :class:`ChatBinding` are plain data — they carry no
+lock. All concurrent access to a binding's turn state is serialized by its
+:class:`pocket_cc.relay.turn_controller.TurnController`, which is the single
+owner of those mutations (see that module for the threading model).
 """
 
 from __future__ import annotations
@@ -66,14 +66,6 @@ class TurnState:
     accumulator: TurnAccumulator
     waiting_for: WaitingFor | None = None
     is_continuation: bool = False
-    # Set when the user clicks ⏹ 中断 *before* `_open_turn`'s deferred Enter
-    # has fired. The Enter worker (in `relay.input._open_turn`) checks this
-    # flag right before sending Enter — if set, the prompt is dropped so it
-    # never reaches Claude. Without this, an early cancel races with the
-    # send_text Enter and the prompt gets submitted anyway (visible as
-    # "leftover text in input" after C-c + Escape ran but couldn't clean
-    # what hadn't yet been submitted).
-    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
@@ -100,9 +92,6 @@ class ChatBinding:
     # create a brand-new jsonl with a fresh uuid, which won't be in this set.
     # See M1-D-15.
     excluded_transcripts: frozenset[Path] = field(default_factory=frozenset)
-    # We expose a per-binding sentinel so future hooks can serialize updates
-    # without forcing all callers through the registry lock.
-    lock: threading.Lock = field(default_factory=threading.Lock)
     # Latest permission mode seen on this binding's transcript (session-
     # scoped). The bootstrap updates this on every `permission-mode`
     # record (including ones that arrive between turns, when no

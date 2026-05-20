@@ -16,7 +16,14 @@ from pocket_cc.lark.client import FakeLarkClient
 from pocket_cc.relay.card_renderer import TurnAccumulator
 from pocket_cc.relay.card_stream import CardStream
 from pocket_cc.relay.turn_controller import TurnController
+from pocket_cc.relay.waiting import WaitingFor
 from pocket_cc.tmux import WindowInfo
+
+
+def _waiting(fingerprint: str) -> WaitingFor:
+    return WaitingFor(
+        source="permission", question="Proceed?", options=(), fingerprint=fingerprint
+    )
 
 
 def _config(tmp_path: Path) -> Config:
@@ -81,6 +88,27 @@ def test_seal_retires_active_generation(tmp_path: Path) -> None:
     # captured `gen` will now see is_current_gen False and abort.
     assert binding.current_turn is None
     assert not controller.is_current_gen(gen)
+
+
+def test_mark_submit_cancelled_blocks_deferred_enter(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    controller = TurnController(
+        binding=binding, lark=FakeLarkClient(), config=_config(tmp_path)
+    )
+    gen = controller.begin_turn()
+    assert controller.should_submit_deferred_enter(gen) is True
+    controller.mark_submit_cancelled()
+    assert controller.should_submit_deferred_enter(gen) is False
+
+
+def test_should_submit_deferred_enter_false_for_superseded_gen(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    controller = TurnController(
+        binding=binding, lark=FakeLarkClient(), config=_config(tmp_path)
+    )
+    gen_a = controller.begin_turn()
+    controller.begin_turn()  # supersede → gen_a no longer active
+    assert controller.should_submit_deferred_enter(gen_a) is False
 
 
 def test_superseding_turn_invalidates_prior_generation(tmp_path: Path) -> None:
@@ -148,4 +176,67 @@ def test_stale_stop_does_not_seal_the_superseding_turn(tmp_path: Path) -> None:
 
     # Stop(B) lands → pops gen_b == active → seals B.
     controller.seal_on_stop(state="done")
+    assert binding.current_turn is None
+
+
+# ===================================================== apply_pane_state
+
+
+def _controller_with_turn(tmp_path: Path) -> tuple[TurnController, ChatBinding]:
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    _attach_turn(binding, lark)
+    return controller, binding
+
+
+def test_apply_pane_state_sets_waiting_when_prompt_appears(tmp_path: Path) -> None:
+    controller, binding = _controller_with_turn(tmp_path)
+    controller.apply_pane_state(_waiting("fp1"), None)
+    assert binding.current_turn is not None
+    assert binding.current_turn.waiting_for is not None
+    assert binding.current_turn.waiting_for.fingerprint == "fp1"
+
+
+def test_apply_pane_state_same_fingerprint_is_idempotent(tmp_path: Path) -> None:
+    controller, binding = _controller_with_turn(tmp_path)
+    controller.apply_pane_state(_waiting("fp1"), None)
+    assert binding.current_turn is not None
+    first = binding.current_turn.waiting_for
+    controller.apply_pane_state(_waiting("fp1"), None)
+    # Same fingerprint → not reassigned.
+    assert binding.current_turn.waiting_for is first
+
+
+def test_apply_pane_state_clears_waiting_when_prompt_gone(tmp_path: Path) -> None:
+    controller, binding = _controller_with_turn(tmp_path)
+    controller.apply_pane_state(_waiting("fp1"), None)
+    controller.apply_pane_state(None, None)
+    assert binding.current_turn is not None
+    assert binding.current_turn.waiting_for is None
+
+
+def test_apply_pane_state_syncs_detected_mode(tmp_path: Path) -> None:
+    controller, binding = _controller_with_turn(tmp_path)
+    controller.apply_pane_state(None, "acceptEdits")
+    assert binding.current_mode == "acceptEdits"
+    assert binding.current_turn is not None
+    assert binding.current_turn.accumulator.current_mode == "acceptEdits"
+
+
+def test_apply_pane_state_ignores_none_mode(tmp_path: Path) -> None:
+    controller, binding = _controller_with_turn(tmp_path)
+    binding.current_mode = "acceptEdits"
+    controller.apply_pane_state(None, None)
+    # A None banner must not force "default".
+    assert binding.current_mode == "acceptEdits"
+
+
+def test_apply_pane_state_noop_without_turn(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    controller = TurnController(
+        binding=binding, lark=FakeLarkClient(), config=_config(tmp_path)
+    )
+    # No current turn → must not raise.
+    controller.apply_pane_state(_waiting("fp1"), "plan")
     assert binding.current_turn is None

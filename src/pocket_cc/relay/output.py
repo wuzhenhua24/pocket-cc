@@ -21,14 +21,13 @@ import threading
 from typing import TYPE_CHECKING
 
 from pocket_cc.claude.session_index import find_active_transcript
-from pocket_cc.claude.transcript import TranscriptReader
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
     from pocket_cc.app.persistence import ChatBinding, Registry
-    from pocket_cc.claude.transcript import Event
+    from pocket_cc.relay.turn_controller import TurnController
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +40,13 @@ class TranscriptPoller:
     def __init__(
         self,
         registry: Registry,
-        on_events: Callable[[ChatBinding, list[Event]], None],
+        controller_for: Callable[[ChatBinding], TurnController],
         *,
         projects_dir: Path,
         interval_s: float = _DEFAULT_INTERVAL_S,
     ) -> None:
         self._registry = registry
-        self._on_events = on_events
+        self._controller_for = controller_for
         self._projects_dir = projects_dir
         self._interval_s = interval_s
         self._stop = threading.Event()
@@ -78,61 +77,19 @@ class TranscriptPoller:
             self._stop.wait(self._interval_s)
 
     def _poll(self, binding: ChatBinding) -> None:
-        with binding.lock:
-            # Two-layer defense against picking up the wrong transcript:
-            #   1. `exclude` — files that existed at binding creation. These
-            #      were written by other Claude instances (desktop, prior
-            #      pocket-cc runs) and never count, even if they keep
-            #      mtime-bumping from concurrent use. (M1-D-15)
-            #   2. `after_ts` — secondary filter for files modified long
-            #      before the binding started. (M1-D-14, kept as belt+braces)
-            current = find_active_transcript(
-                binding.cwd,
-                self._projects_dir,
-                after_ts=binding.created_at,
-                exclude=binding.excluded_transcripts,
-            )
-            if current is None:
-                logger.debug(
-                    "no active transcript found",
-                    extra={
-                        "chat_id": binding.chat_id,
-                        "cwd": str(binding.cwd),
-                        "after_ts": binding.created_at,
-                        "excluded_count": len(binding.excluded_transcripts),
-                        "has_hook_path": binding.transcript_path is not None,
-                    },
-                )
-                return
-            if binding.transcript_path != current:
-                # First time, or Claude rotated session (e.g. `/clear`).
-                binding.transcript_path = current
-                binding.transcript_reader = TranscriptReader(path=current)
-                logger.info(
-                    "transcript switched",
-                    extra={"chat_id": binding.chat_id, "path": str(current)},
-                )
-
-            reader = binding.transcript_reader
-            if reader is None:
-                return
-            events = reader.read_new()
-            logger.debug(
-                "transcript poll tick",
-                extra={
-                    "chat_id": binding.chat_id,
-                    "path": str(binding.transcript_path),
-                    "offset": reader.byte_offset,
-                    "new_events": len(events),
-                },
-            )
-
-        if events:
-            try:
-                self._on_events(binding, events)
-            except Exception:
-                logger.warning(
-                    "on_events callback raised",
-                    extra={"chat_id": binding.chat_id},
-                    exc_info=True,
-                )
+        # The filesystem scan (slow I/O) stays here; the swap + reader read +
+        # ingest happen inside the controller so all transcript-reader access
+        # is serialized by one owner.
+        #   1. `exclude` — files that existed at binding creation. These were
+        #      written by other Claude instances (desktop, prior pocket-cc
+        #      runs) and never count, even if they keep mtime-bumping from
+        #      concurrent use. (M1-D-15)
+        #   2. `after_ts` — secondary filter for files modified long before
+        #      the binding started. (M1-D-14, kept as belt+braces)
+        current = find_active_transcript(
+            binding.cwd,
+            self._projects_dir,
+            after_ts=binding.created_at,
+            exclude=binding.excluded_transcripts,
+        )
+        self._controller_for(binding).poll_transcript(current)

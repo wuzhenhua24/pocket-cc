@@ -15,8 +15,10 @@ Lifecycle:
        ├─ TranscriptPoller.stop()
        └─ close every live TurnState (one final card PATCH with state=done)
 
-The transcript→card update path goes through :meth:`_handle_events`, which
-is registered as the poller's `on_events` callback.
+Per-binding turn state lives behind one :class:`TurnController` (see
+:meth:`_controller_for`); the poller, pane-watcher, input router and hook
+callbacks all drive transitions through it rather than mutating binding
+state directly.
 """
 
 from __future__ import annotations
@@ -30,7 +32,6 @@ from pocket_cc.app.config import events_jsonl_path
 from pocket_cc.app.persistence import Registry
 from pocket_cc.claude.events import EventsReader
 from pocket_cc.claude.hooks import all_installed as hooks_all_installed
-from pocket_cc.claude.transcript import TranscriptReader
 from pocket_cc.lark.client import LarkOapiClient
 from pocket_cc.lark.event_loop import LarkEventLoop
 from pocket_cc.relay.events_router import EventsPoller, HookEventsDispatcher
@@ -44,8 +45,6 @@ if TYPE_CHECKING:
     from pocket_cc.app.config import Config
     from pocket_cc.app.persistence import ChatBinding
     from pocket_cc.claude.events import HookEvent
-    from pocket_cc.claude.transcript import Event
-    from pocket_cc.lark.card import CardState
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +71,10 @@ class Pocketcc:
             lark=self._lark,
             registry=self._registry,
             controller_for=self._controller_for,
-            seal_active=self._seal_active,
         )
         self._poller = TranscriptPoller(
             registry=self._registry,
-            on_events=self._handle_events,
+            controller_for=self._controller_for,
             projects_dir=config.claude_projects_dir,
             interval_s=config.transcript_poll_s,
         )
@@ -103,7 +101,7 @@ class Pocketcc:
         self._pane_watcher = PaneWatcher(
             registry=self._registry,
             tmux=self._tmux,
-            on_change=self._handle_pane_state_change,
+            controller_for=self._controller_for,
             interval_s=config.pane_poll_s,
         )
 
@@ -148,7 +146,7 @@ class Pocketcc:
                 continue
             try:
                 # Rotation-aware seal so a long final turn isn't truncated.
-                self._seal_active(binding, state="done")
+                self._controller_for(binding).seal(state="done")
             except Exception:
                 logger.warning(
                     "shutdown: closing turn failed",
@@ -174,28 +172,6 @@ class Pocketcc:
                 self._controllers[binding.chat_id] = controller
             return controller
 
-    def _handle_events(self, binding: ChatBinding, events: list[Event]) -> None:
-        """Poller callback → binding's TurnController."""
-        self._controller_for(binding).ingest_events(events)
-
-    def _seal_active(
-        self, binding: ChatBinding, state: CardState = "done", error: str = ""
-    ) -> None:
-        """Rotation-aware seal — delegates to the binding's TurnController.
-
-        Handed to :class:`InputRouter` as ``seal_active`` so every close
-        path (Stop / StopFailure hooks via ``close_active_turn``, the
-        new-message-closes-prior path, error paths) seals the same way.
-        Also used directly by :meth:`shutdown`.
-        """
-        self._controller_for(binding).seal(state=state, error=error)
-
-    # ----------------------------------------------------- pane watcher (M2-C)
-
-    def _handle_pane_state_change(self, binding: ChatBinding) -> None:
-        """PaneWatcher detected a waiting_for transition — delegates to TurnController."""
-        self._controller_for(binding).on_pane_change()
-
     # ---------------------------------------------------- hook event callbacks
 
     def _handle_session_start(self, binding: ChatBinding, event: HookEvent) -> None:
@@ -204,14 +180,11 @@ class Pocketcc:
         if not event.transcript_path:
             return
         path = Path(event.transcript_path)
-        with binding.lock:
-            if binding.transcript_path is None:
-                binding.transcript_path = path
-                binding.transcript_reader = TranscriptReader(path=path)
-                logger.info(
-                    "transcript locked via SessionStart hook",
-                    extra={"chat_id": binding.chat_id, "path": str(path)},
-                )
+        if self._controller_for(binding).lock_transcript(path):
+            logger.info(
+                "transcript locked via SessionStart hook",
+                extra={"chat_id": binding.chat_id, "path": str(path)},
+            )
 
     def _handle_stop(self, binding: ChatBinding, event: HookEvent) -> None:
         """Stop hook for our Claude — seal the active card as ✅ done."""
@@ -242,12 +215,8 @@ class Pocketcc:
         Drain here ensures the final snapshot reflects whatever Claude
         actually said. (M2-fix-seal-drain)
         """
-        reader = binding.transcript_reader
-        turn = binding.current_turn
-        if reader is None or turn is None:
-            return
         try:
-            events = reader.read_new()
+            count = self._controller_for(binding).drain_and_ingest()
         except Exception:
             logger.warning(
                 "final transcript drain failed",
@@ -255,11 +224,8 @@ class Pocketcc:
                 exc_info=True,
             )
             return
-        if not events:
-            return
-        logger.info(
-            "drained transcript events on stop",
-            extra={"chat_id": binding.chat_id, "count": len(events)},
-        )
-        for ev in events:
-            turn.accumulator.ingest(ev)
+        if count:
+            logger.info(
+                "drained transcript events on stop",
+                extra={"chat_id": binding.chat_id, "count": count},
+            )

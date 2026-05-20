@@ -29,6 +29,7 @@ from pocket_cc.tmux import TmuxError
 
 if TYPE_CHECKING:
     from pocket_cc.app.persistence import ChatBinding, Registry
+    from pocket_cc.relay.turn_controller import TurnController
     from pocket_cc.tmux import TmuxManager
 
 logger = logging.getLogger(__name__)
@@ -39,23 +40,28 @@ _DEFAULT_INTERVAL_S = 1.0
 # keeping capture cheap.
 _CAPTURE_LINES = 60
 
-PaneStateChangeCb = Callable[["ChatBinding"], None]
+ControllerProvider = Callable[["ChatBinding"], "TurnController"]
 
 
 class PaneWatcher:
-    """One thread, all bindings — ticks pane → updates waiting_for → fires callback."""
+    """One thread, all bindings — ticks pane → hands prompt/mode to the controller.
+
+    The watcher only does the *observation* (capture + parse). Applying the
+    result to turn state (waiting_for / mode) and re-rendering is the
+    controller's job, so all turn-state mutation stays serialized there.
+    """
 
     def __init__(
         self,
         registry: Registry,
         tmux: TmuxManager,
         *,
-        on_change: PaneStateChangeCb,
+        controller_for: ControllerProvider,
         interval_s: float = _DEFAULT_INTERVAL_S,
     ) -> None:
         self._registry = registry
         self._tmux = tmux
-        self._on_change = on_change
+        self._controller_for = controller_for
         self._interval_s = interval_s
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="pane-watcher", daemon=True)
@@ -84,8 +90,7 @@ class PaneWatcher:
             self._stop.wait(self._interval_s)
 
     def _tick_binding(self, binding: ChatBinding) -> None:
-        turn = binding.current_turn
-        if turn is None:
+        if binding.current_turn is None:
             return
 
         try:
@@ -98,46 +103,21 @@ class PaneWatcher:
             return
 
         prompt = inspect_pane(pane)
+        new_waiting = _build_waiting_for(prompt) if prompt is not None else None
         # Permission mode is read from the same capture. detect_mode returns
-        # None when no banner is shown — here (periodic poll) we *ignore*
-        # None rather than forcing "default", so a transient capture miss (or
-        # a mode banner that's hidden mid-run) can't flap the label. A switch
-        # back to default is reconciled by the immediate post-click readback
-        # in the input router, or by the next turn's transcript record.
+        # None when no banner is shown — the controller *ignores* None rather
+        # than forcing "default", so a transient capture miss (or a mode banner
+        # hidden mid-run) can't flap the label. A switch back to default is
+        # reconciled by the post-click readback or the next transcript record.
         detected_mode = detect_mode(pane)
-        changed = False
-
-        with binding.lock:
-            # Re-read under lock — the input router may have just cleared it.
-            current = turn.waiting_for
-            if prompt is None:
-                if current is not None:
-                    # Prompt is gone — user answered in tmux directly, or
-                    # Claude moved on for some other reason.
-                    turn.waiting_for = None
-                    changed = True
-            else:
-                new_waiting = _build_waiting_for(prompt)
-                if current is None or current.fingerprint != new_waiting.fingerprint:
-                    turn.waiting_for = new_waiting
-                    changed = True
-
-            if detected_mode is not None and detected_mode != binding.current_mode:
-                # User toggled mode directly in tmux (or we missed the click
-                # readback) — sync so the card's Mode button reflects it.
-                binding.current_mode = detected_mode
-                turn.accumulator.current_mode = detected_mode
-                changed = True
-
-        if changed:
-            try:
-                self._on_change(binding)
-            except Exception:
-                logger.warning(
-                    "pane watcher on_change callback raised",
-                    extra={"chat_id": binding.chat_id},
-                    exc_info=True,
-                )
+        try:
+            self._controller_for(binding).apply_pane_state(new_waiting, detected_mode)
+        except Exception:
+            logger.warning(
+                "pane watcher apply_pane_state raised",
+                extra={"chat_id": binding.chat_id},
+                exc_info=True,
+            )
 
 
 def _build_waiting_for(prompt: ParsedPrompt) -> WaitingFor:

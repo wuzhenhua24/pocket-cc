@@ -1,4 +1,11 @@
-"""Unit tests for relay/pane_watcher.py — tick → waiting_for transitions."""
+"""Unit tests for relay/pane_watcher.py.
+
+The watcher's job is now narrow: capture the pane, parse it, and hand the
+parsed (waiting, mode) to the binding's controller. Applying that to turn
+state lives in :class:`TurnController.apply_pane_state` (tested in
+test_turn_controller.py), so here we cover the parse helpers and that the
+watcher delegates with the right arguments.
+"""
 
 from __future__ import annotations
 
@@ -25,20 +32,8 @@ _PROMPT_YES_NO = textwrap.dedent(
     """
 )
 
-_PROMPT_DIFFERENT = textwrap.dedent(
-    """\
-    Bash command
-      cmd-B
-
-    Do you want to proceed?
-    ❯ 1. Yes
-      2. No
-
-    Esc to cancel
-    """
-)
-
 _NO_PROMPT = "$ all done\n$ "
+_PANE_ACCEPT_EDITS = "doing work...\n⏵⏵ accept edits on (shift+tab to cycle)"
 
 
 # ----------------------------------------------------------------- fakes
@@ -74,6 +69,25 @@ class _StubWindow:
     pane_id: str = "%0"
 
 
+@dataclass
+class _RecordingController:
+    """Captures apply_pane_state(new_waiting, detected_mode) calls."""
+
+    applied: list[tuple[WaitingFor | None, str | None]] = field(default_factory=list)
+
+    def apply_pane_state(
+        self, new_waiting: WaitingFor | None, detected_mode: str | None
+    ) -> None:
+        self.applied.append((new_waiting, detected_mode))
+
+
+class _FakeAny:
+    """Stand-in for typed dependencies the watcher doesn't actually touch."""
+
+    def __getattr__(self, name: str) -> Any:
+        return self
+
+
 def _make_binding_with_turn(chat_id: str = "oc_x") -> ChatBinding:
     binding = ChatBinding(
         chat_id=chat_id,
@@ -88,18 +102,13 @@ def _make_binding_with_turn(chat_id: str = "oc_x") -> ChatBinding:
     return binding
 
 
-class _FakeAny:
-    """Stand-in for typed dependencies the watcher doesn't actually touch."""
-
-    def __getattr__(self, name: str) -> Any:
-        return self
-
-
-def _make_watcher(*, tmux: _FakeTmux, registry: Registry, on_change_log: list[str]) -> PaneWatcher:
+def _make_watcher(
+    *, tmux: _FakeTmux, registry: Registry, controller: _RecordingController
+) -> PaneWatcher:
     return PaneWatcher(
         registry=registry,
         tmux=cast("Any", tmux),
-        on_change=lambda b: on_change_log.append(b.chat_id),
+        controller_for=lambda _b: cast("Any", controller),
         interval_s=10.0,  # huge — we drive ticks manually
     )
 
@@ -163,10 +172,9 @@ def test_build_waiting_for_maps_numbered_options_to_text_response() -> None:
 # ============================================================ watcher ticks
 
 
-def test_tick_no_active_turn_is_noop() -> None:
+def test_tick_no_active_turn_skips_capture_and_controller() -> None:
     tmux = _FakeTmux(pane_text=_PROMPT_YES_NO)
     registry = Registry()
-    # Binding without an active turn
     registry.set(
         ChatBinding(
             chat_id="x",
@@ -174,214 +182,91 @@ def test_tick_no_active_turn_is_noop() -> None:
             cwd=Path("/tmp"),
         )
     )
-    log: list[str] = []
-    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
+    controller = _RecordingController()
+    watcher = _make_watcher(tmux=tmux, registry=registry, controller=controller)
     binding = registry.get("x")
     assert binding is not None
+
     watcher._tick_binding(binding)
-    assert log == []
-    # capture_pane shouldn't have been called either
-    assert tmux.calls == []
+
+    assert controller.applied == []
+    assert tmux.calls == []  # no active turn → capture skipped
 
 
-def test_tick_sets_waiting_when_prompt_appears() -> None:
+def test_tick_delegates_waiting_for_when_prompt_present() -> None:
     tmux = _FakeTmux(pane_text=_PROMPT_YES_NO)
     registry = Registry()
     binding = _make_binding_with_turn()
     registry.set(binding)
-    log: list[str] = []
-    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
+    controller = _RecordingController()
+    watcher = _make_watcher(tmux=tmux, registry=registry, controller=controller)
 
     watcher._tick_binding(binding)
 
-    assert binding.current_turn is not None
-    assert binding.current_turn.waiting_for is not None
-    assert binding.current_turn.waiting_for.source == "permission"
-    assert len(binding.current_turn.waiting_for.options) == 2
-    assert log == ["oc_x"]
+    assert len(controller.applied) == 1
+    new_waiting, detected_mode = controller.applied[0]
+    assert isinstance(new_waiting, WaitingFor)
+    assert new_waiting.source == "permission"
+    assert len(new_waiting.options) == 2
+    assert detected_mode is None  # no banner in this pane
 
 
-def test_tick_same_prompt_is_idempotent_no_callback() -> None:
-    tmux = _FakeTmux(pane_text=_PROMPT_YES_NO)
-    registry = Registry()
-    binding = _make_binding_with_turn()
-    registry.set(binding)
-    log: list[str] = []
-    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
-
-    watcher._tick_binding(binding)
-    watcher._tick_binding(binding)
-    watcher._tick_binding(binding)
-
-    # Only the first transition fires the callback
-    assert log == ["oc_x"]
-    assert binding.current_turn is not None
-    assert binding.current_turn.waiting_for is not None
-
-
-def test_tick_different_prompt_updates_waiting() -> None:
-    tmux = _FakeTmux(pane_text=_PROMPT_YES_NO)
-    registry = Registry()
-    binding = _make_binding_with_turn()
-    registry.set(binding)
-    log: list[str] = []
-    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
-
-    watcher._tick_binding(binding)
-    first_fp = (
-        binding.current_turn.waiting_for.fingerprint
-        if binding.current_turn and binding.current_turn.waiting_for
-        else None
-    )
-
-    tmux.pane_text = _PROMPT_DIFFERENT
-    watcher._tick_binding(binding)
-
-    assert binding.current_turn is not None
-    assert binding.current_turn.waiting_for is not None
-    second_fp = binding.current_turn.waiting_for.fingerprint
-    assert first_fp != second_fp
-    assert log == ["oc_x", "oc_x"]
-
-
-def test_tick_clears_waiting_when_prompt_disappears() -> None:
-    tmux = _FakeTmux(pane_text=_PROMPT_YES_NO)
-    registry = Registry()
-    binding = _make_binding_with_turn()
-    registry.set(binding)
-    log: list[str] = []
-    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
-
-    watcher._tick_binding(binding)
-    assert binding.current_turn is not None
-    assert binding.current_turn.waiting_for is not None
-
-    tmux.pane_text = _NO_PROMPT
-    watcher._tick_binding(binding)
-    assert binding.current_turn.waiting_for is None
-    assert log == ["oc_x", "oc_x"]
-
-
-def test_tick_no_prompt_when_already_none_is_noop() -> None:
+def test_tick_delegates_none_when_no_prompt() -> None:
     tmux = _FakeTmux(pane_text=_NO_PROMPT)
     registry = Registry()
     binding = _make_binding_with_turn()
     registry.set(binding)
-    log: list[str] = []
-    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
+    controller = _RecordingController()
+    watcher = _make_watcher(tmux=tmux, registry=registry, controller=controller)
 
     watcher._tick_binding(binding)
+
+    assert controller.applied == [(None, None)]
+
+
+def test_tick_delegates_detected_mode() -> None:
+    tmux = _FakeTmux(pane_text=_PANE_ACCEPT_EDITS)
+    registry = Registry()
+    binding = _make_binding_with_turn()
+    registry.set(binding)
+    controller = _RecordingController()
+    watcher = _make_watcher(tmux=tmux, registry=registry, controller=controller)
+
     watcher._tick_binding(binding)
-    assert log == []
-    assert binding.current_turn is not None
-    assert binding.current_turn.waiting_for is None
+
+    assert len(controller.applied) == 1
+    _new_waiting, detected_mode = controller.applied[0]
+    assert detected_mode == "acceptEdits"
 
 
-def test_tick_tmux_error_does_not_crash_or_call_callback() -> None:
+def test_tick_tmux_error_does_not_delegate() -> None:
     tmux = _FakeTmux(raise_on_capture=TmuxError("window gone"))
     registry = Registry()
     binding = _make_binding_with_turn()
     registry.set(binding)
-    log: list[str] = []
-    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
+    controller = _RecordingController()
+    watcher = _make_watcher(tmux=tmux, registry=registry, controller=controller)
 
     watcher._tick_binding(binding)
-    assert log == []
+
+    assert controller.applied == []
 
 
-def test_tick_callback_exception_does_not_crash_watcher() -> None:
+def test_tick_controller_exception_does_not_crash_watcher() -> None:
     tmux = _FakeTmux(pane_text=_PROMPT_YES_NO)
     registry = Registry()
     binding = _make_binding_with_turn()
     registry.set(binding)
 
-    def _bad(_b: ChatBinding) -> None:
-        raise RuntimeError("simulated")
+    class _Bad:
+        def apply_pane_state(self, *_a: Any, **_k: Any) -> None:
+            raise RuntimeError("simulated")
 
     watcher = PaneWatcher(
         registry=registry,
         tmux=cast("Any", tmux),
-        on_change=_bad,
+        controller_for=lambda _b: cast("Any", _Bad()),
         interval_s=10.0,
     )
-    # Must not raise
+    # Must not raise.
     watcher._tick_binding(binding)
-    # Waiting state still got set
-    assert binding.current_turn is not None
-    assert binding.current_turn.waiting_for is not None
-
-
-# ===================================================== mode reconciliation
-
-_PANE_ACCEPT_EDITS = "doing work...\n⏵⏵ accept edits on (shift+tab to cycle)"
-_PANE_PLAN = "thinking...\n⏸ plan mode on (shift+tab to cycle)"
-
-
-def test_tick_syncs_mode_from_pane_and_fires_callback() -> None:
-    tmux = _FakeTmux(pane_text=_PANE_ACCEPT_EDITS)
-    registry = Registry()
-    binding = _make_binding_with_turn()
-    registry.set(binding)
-    log: list[str] = []
-    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
-
-    watcher._tick_binding(binding)
-
-    assert binding.current_mode == "acceptEdits"
-    assert binding.current_turn is not None
-    assert binding.current_turn.accumulator.current_mode == "acceptEdits"
-    assert log == ["oc_x"]
-
-
-def test_tick_same_mode_is_idempotent() -> None:
-    tmux = _FakeTmux(pane_text=_PANE_ACCEPT_EDITS)
-    registry = Registry()
-    binding = _make_binding_with_turn()
-    registry.set(binding)
-    log: list[str] = []
-    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
-
-    watcher._tick_binding(binding)
-    watcher._tick_binding(binding)
-
-    # Only the first transition fires a callback
-    assert log == ["oc_x"]
-    assert binding.current_mode == "acceptEdits"
-
-
-def test_tick_no_banner_does_not_force_default() -> None:
-    """A capture with no mode-line must NOT flip a known mode back to default
-    — it could be a transient miss or a banner hidden mid-run."""
-    tmux = _FakeTmux(pane_text=_PANE_ACCEPT_EDITS)
-    registry = Registry()
-    binding = _make_binding_with_turn()
-    registry.set(binding)
-    log: list[str] = []
-    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
-
-    watcher._tick_binding(binding)
-    assert binding.current_mode == "acceptEdits"
-
-    # Next tick: no banner in the pane.
-    tmux.pane_text = _NO_PROMPT
-    watcher._tick_binding(binding)
-    # Mode is unchanged; the absent banner did not force "default".
-    assert binding.current_mode == "acceptEdits"
-    assert log == ["oc_x"]  # no second callback from the (non-)mode change
-
-
-def test_tick_mode_change_updates_to_new_mode() -> None:
-    tmux = _FakeTmux(pane_text=_PANE_ACCEPT_EDITS)
-    registry = Registry()
-    binding = _make_binding_with_turn()
-    registry.set(binding)
-    log: list[str] = []
-    watcher = _make_watcher(tmux=tmux, registry=registry, on_change_log=log)
-
-    watcher._tick_binding(binding)
-    assert binding.current_mode == "acceptEdits"
-
-    tmux.pane_text = _PANE_PLAN
-    watcher._tick_binding(binding)
-    assert binding.current_mode == "plan"
-    assert log == ["oc_x", "oc_x"]

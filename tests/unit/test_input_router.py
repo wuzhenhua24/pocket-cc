@@ -99,6 +99,10 @@ def _make_router(
     config: Config,
     controller_for: Any = None,
 ) -> InputRouter:
+    # The controller is mandatory now; default to a real (caching) provider so
+    # tests exercise the genuine turn-lifecycle paths unless they pass a spy.
+    if controller_for is None:
+        controller_for = _real_controller_for(lark, config)
     return InputRouter(
         config=config,
         tmux=cast("Any", tmux),
@@ -129,31 +133,49 @@ def _real_controller_for(lark: FakeLarkClient, config: Config) -> Any:
 
 
 class _RecordingController:
-    """Spy controller that records which lifecycle method the router called."""
+    """Spy that wraps a real TurnController, recording the lifecycle methods
+    the router calls while delegating everything to the real one (so turn
+    creation / generation / sealing actually happen)."""
 
-    def __init__(self, binding: ChatBinding, calls: list[tuple[str, str]]) -> None:
-        self._binding = binding
+    def __init__(self, real: TurnController, calls: list[tuple[str, str]]) -> None:
+        self._real = real
         self._calls = calls
 
-    def begin_turn(self) -> int:
-        self._calls.append((self._binding.chat_id, "begin_turn"))
-        return 1
+    def __getattr__(self, name: str) -> Any:  # delegate anything not overridden
+        return getattr(self._real, name)
 
-    def is_current_gen(self, gen: int) -> bool:
-        return True
-
-    def expect_stop(self, gen: int) -> None:
-        self._calls.append((self._binding.chat_id, f"expect_stop:{gen}"))
+    def open_turn(self, user_text: str) -> int | None:
+        self._calls.append((self._real.binding.chat_id, "open_turn"))
+        return self._real.open_turn(user_text)
 
     def clear_waiting_and_rerender(self) -> None:
-        self._calls.append((self._binding.chat_id, "clear_waiting"))
+        self._calls.append((self._real.binding.chat_id, "clear_waiting"))
+        self._real.clear_waiting_and_rerender()
 
     def update_mode(self, mode: str) -> None:
-        self._calls.append((self._binding.chat_id, f"mode:{mode}"))
+        self._calls.append((self._real.binding.chat_id, f"mode:{mode}"))
+        self._real.update_mode(mode)
+
+    def seal(self, state: str = "done", error: str = "") -> None:
+        self._calls.append((self._real.binding.chat_id, f"seal:{state}"))
+        self._real.seal(state=cast("Any", state), error=error)
 
 
-def _recording_controller_for(calls: list[tuple[str, str]]) -> Any:
-    return lambda binding: _RecordingController(binding, calls)
+def _recording_controller_for(
+    calls: list[tuple[str, str]], lark: FakeLarkClient, config: Config
+) -> Any:
+    """Caching provider of recording spies wrapping real controllers."""
+    cache: dict[str, _RecordingController] = {}
+
+    def provider(binding: ChatBinding) -> _RecordingController:
+        spy = cache.get(binding.chat_id)
+        if spy is None or spy.binding is not binding:
+            real = TurnController(binding=binding, lark=cast("Any", lark), config=config)
+            spy = _RecordingController(real, calls)
+            cache[binding.chat_id] = spy
+        return spy
+
+    return provider
 
 
 def _message(
@@ -350,17 +372,15 @@ def test_card_action_cancel_sends_ctrl_c_then_double_escape(tmp_path: Path) -> N
     assert all(k.kwargs["window_id"] == "@1" for k in cancel_keys)
 
 
-def test_cancel_skips_deferred_enter_so_prompt_is_not_submitted(
+def test_cancel_marks_submission_cancelled_so_deferred_enter_is_dropped(
     tmp_path: Path,
 ) -> None:
     """Early ⏹ 中断 must abort the deferred Enter before it submits the prompt.
 
-    Regression: send_text (text-only) injects the user's text into the
-    pane, then a worker thread sleeps `_DEFERRED_ENTER_DELAY_S` and fires
-    Enter. If cancel runs during that grace window, the cancel handler
-    sets `turn.cancel_event` — the worker wakes early on the event and
-    skips Enter, so Claude never receives the prompt. Without this, the
-    Enter fires after C-c/Escape ran, leaving Claude actually running.
+    The cancel handler tells the controller to cancel the active turn's
+    submission; the deferred-Enter worker checks
+    ``should_submit_deferred_enter`` and drops the Enter. Asserted
+    deterministically via the controller (no thread-timing race).
     """
     import pocket_cc.relay.input as input_module
 
@@ -368,16 +388,22 @@ def test_cancel_skips_deferred_enter_so_prompt_is_not_submitted(
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
     registry = Registry()
-    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    provider = _real_controller_for(lark, cfg)
+    router = _make_router(
+        tmux=tmux, lark=lark, registry=registry, config=cfg, controller_for=provider
+    )
 
-    # Stretch the grace window so the test can race cancel against it
-    # without flakiness; the production value (0.5s) is way too long for
-    # a unit test, but we need it non-zero to exercise the wait path.
+    # Stretch the grace window so the auto-spawned worker can't fire during
+    # the test (we assert the cancel fence directly, not via the worker).
     orig_delay = input_module._DEFERRED_ENTER_DELAY_S
-    input_module._DEFERRED_ENTER_DELAY_S = 2.0
+    input_module._DEFERRED_ENTER_DELAY_S = 60.0
     try:
         router.handle_message(_message())
         card_id = lark.last_sent().message_id
+        binding = registry.get("oc_chat1")
+        assert binding is not None
+        controller = provider(binding)
+        assert controller.should_submit_deferred_enter(1) is True  # gen 1, not yet cancelled
 
         router.handle_card_action(
             CardAction(
@@ -389,24 +415,11 @@ def test_cancel_skips_deferred_enter_so_prompt_is_not_submitted(
                 value={"action": "cancel"},
             )
         )
+
+        # Cancel marked the active generation → the worker must drop the Enter.
+        assert controller.should_submit_deferred_enter(1) is False
     finally:
         input_module._DEFERRED_ENTER_DELAY_S = orig_delay
-
-    # Wait briefly for the deferred-Enter worker to observe cancel_event
-    # and exit. Without sleeping, the assertion could race the worker
-    # thread; the cancel_event.set() in _handle_cancel wakes it almost
-    # immediately, so 100ms is plenty.
-    import time
-
-    time.sleep(0.1)
-
-    enter_keys = [
-        c for c in tmux.calls if c.method == "send_key" and c.kwargs["key"] == "Enter"
-    ]
-    assert enter_keys == [], (
-        "deferred Enter must NOT fire after cancel — would re-submit the user's "
-        "prompt to Claude after the cancel handler already cleared the pane"
-    )
 
 
 def test_card_action_key_sends_named_key(tmp_path: Path) -> None:
@@ -555,43 +568,28 @@ def test_duplicate_card_action_token_is_dropped(tmp_path: Path) -> None:
     assert len(ctrl_c_calls) == 1
 
 
-def test_close_turn_routes_through_injected_seal(tmp_path: Path) -> None:
-    """When a seal_active callback is injected (production), closing a turn
-    must delegate to it (rotation-aware seal) instead of the simple inline
-    close — so a long final turn rolls across "(续)" cards."""
+def test_close_turn_routes_through_controller_seal(tmp_path: Path) -> None:
+    """Superseding a turn (new message while one is open) must close the prior
+    turn via the controller's rotation-aware seal — so a long final turn rolls
+    across "(续)" cards instead of tail-truncating."""
     cfg = _make_config(workspace=tmp_path)
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
     registry = Registry()
-    sealed: list[tuple[str, str]] = []
-
-    def _seal(binding: ChatBinding, state: str, error: str) -> None:
-        sealed.append((state, error))
-        binding.current_turn = None  # mirror bootstrap._seal_active
-
-    router = InputRouter(
-        config=cfg,
-        tmux=cast("Any", tmux),
+    calls: list[tuple[str, str]] = []
+    router = _make_router(
+        tmux=tmux,
         lark=lark,
         registry=registry,
-        seal_active=_seal,
+        config=cfg,
+        controller_for=_recording_controller_for(calls, lark, cfg),
     )
 
     router.handle_message(_message(text="first"))
-    # Second message closes the prior turn → should go through the seal.
-    router.handle_message(
-        IncomingMessage(
-            message_id="om_msg2",
-            chat_id="oc_chat1",
-            chat_type="p2p",
-            sender_open_id="ou_user1",
-            message_type="text",
-            text="second",
-            raw_content='{"text":"second"}',
-        )
-    )
+    # Second message closes the prior turn → should go through controller.seal.
+    router.handle_message(_message(text="second", message_id="om_msg2"))
 
-    assert sealed == [("done", "")]
+    assert ("oc_chat1", "seal:done") in calls
 
 
 def test_distinct_message_ids_both_processed(tmp_path: Path) -> None:
@@ -721,14 +719,14 @@ def test_waiting_reply_text_uses_rotation_aware_rerender(tmp_path: Path) -> None
         lark=lark,
         registry=registry,
         config=cfg,
-        controller_for=_recording_controller_for(calls),
+        controller_for=_recording_controller_for(calls, lark, cfg),
     )
     router.handle_message(_message(text="please run X"))
     _set_waiting_on_active_turn(registry, "oc_chat1")
 
     router.handle_message(_message(text="1", message_id="om_reply"))
 
-    assert calls == [("oc_chat1", "begin_turn"), ("oc_chat1", "clear_waiting")]
+    assert calls == [("oc_chat1", "open_turn"), ("oc_chat1", "clear_waiting")]
 
 
 def test_waiting_response_button_uses_rotation_aware_rerender(tmp_path: Path) -> None:
@@ -742,7 +740,7 @@ def test_waiting_response_button_uses_rotation_aware_rerender(tmp_path: Path) ->
         lark=lark,
         registry=registry,
         config=cfg,
-        controller_for=_recording_controller_for(calls),
+        controller_for=_recording_controller_for(calls, lark, cfg),
     )
     router.handle_message(_message(text="please run X"))
     card_id = lark.last_sent().message_id
@@ -759,7 +757,7 @@ def test_waiting_response_button_uses_rotation_aware_rerender(tmp_path: Path) ->
         )
     )
 
-    assert calls == [("oc_chat1", "begin_turn"), ("oc_chat1", "clear_waiting")]
+    assert calls == [("oc_chat1", "open_turn"), ("oc_chat1", "clear_waiting")]
 
 
 def test_message_after_continuation_opens_new_turn_again(tmp_path: Path) -> None:

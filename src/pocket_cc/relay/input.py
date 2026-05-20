@@ -23,13 +23,11 @@ import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
-from pocket_cc.app.persistence import ChatBinding, TurnState
+from pocket_cc.app.persistence import ChatBinding
 from pocket_cc.claude.pane_inspector import detect_mode
 from pocket_cc.claude.session_index import snapshot_existing_transcripts
 from pocket_cc.lark.card import build_text_card
 from pocket_cc.lark.client import LarkApiError
-from pocket_cc.relay.card_renderer import TurnAccumulator, render_card
-from pocket_cc.relay.card_stream import CardStream
 from pocket_cc.relay.waiting import KeysResponse, TextResponse
 from pocket_cc.tmux import TmuxError
 
@@ -87,24 +85,17 @@ class InputRouter:
         tmux: TmuxManager,
         lark: LarkClient,
         registry: Registry,
-        controller_for: Callable[[ChatBinding], TurnController] | None = None,
-        seal_active: Callable[[ChatBinding, CardState, str], None] | None = None,
+        controller_for: Callable[[ChatBinding], TurnController],
     ) -> None:
         self._config = config
         self._tmux = tmux
         self._lark = lark
         self._registry = registry
         # Look up the binding's TurnController (bootstrap-owned, get-or-create).
-        # The router never constructs one — it only reaches a controller through
-        # this provider to drive rotation-aware state transitions (clear-waiting
-        # rerender, mode update). None in tests that don't exercise those paths.
+        # The router never constructs one and never mutates turn state directly
+        # — every state transition (open / seal / clear-waiting / mode) goes
+        # through a controller method so it stays serialized per binding.
         self._controller_for = controller_for
-        # Seal the active turn via the bootstrap's rotation-aware path so a
-        # long final turn rolls across "(续)" cards instead of tail-truncating
-        # on the current card. Injected because the rotation machinery lives in
-        # the controller. None in tests → fall back to the simple single-card
-        # close in `_close_turn`.
-        self._seal_active = seal_active
         self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
 
     # =============================================================== messages
@@ -253,42 +244,18 @@ class InputRouter:
         return binding
 
     def _open_turn(self, binding: ChatBinding, user_text: str) -> None:
-        accumulator = TurnAccumulator()
-        accumulator.user_prompt = user_text  # show immediately, transcript will confirm
-        # Carry over the session-level permission mode so the Mode button
-        # on the very first card render doesn't flash "默认" before the
-        # next transcript `permission-mode` record lands.
-        accumulator.current_mode = binding.current_mode
-
-        try:
-            message_id = self._lark.send_card(
-                binding.chat_id,
-                render_card(accumulator.snapshot(state="running")),
-            )
-        except LarkApiError:
-            logger.exception("send initial card failed")
+        # The controller owns turn creation (initial card + CardStream +
+        # current_turn + generation). It returns the new generation, or None
+        # if the initial card send failed (no turn installed).
+        gen = self._controller_for(binding).open_turn(user_text)
+        if gen is None:
             return
-
-        stream = CardStream(self._lark, message_id, interval_s=self._config.patch_interval_s)
-        stream.start()
-        turn = TurnState(
-            card_message_id=message_id,
-            card_stream=stream,
-            accumulator=accumulator,
-        )
-        binding.current_turn = turn
-        # Register the new turn with its controller and capture the generation
-        # so the deferred-Enter worker can tell if this turn is still current
-        # when it fires. None when no controller is injected (tests) → the
-        # worker falls back to an object-identity check.
-        gen = self._controller_for(binding).begin_turn() if self._controller_for else None
-
         try:
-            # Inject the text only — Enter is sent on a separate worker
-            # after a brief grace period during which `_handle_cancel` can
-            # set `turn.cancel_event` to abort the submission. Without this
-            # split, an early ⏹ 中断 races send_text's internal Enter delay
-            # and the prompt still gets submitted to Claude.
+            # Inject the text only — Enter is sent on a separate worker after a
+            # brief grace period during which ⏹ 中断 can cancel the submission
+            # (the controller marks the gen cancelled). Without this split, an
+            # early cancel races send_text's internal Enter delay and the prompt
+            # still gets submitted to Claude.
             self._tmux.send_text(binding.window.window_id, user_text, with_enter=False)
         except TmuxError as e:
             logger.exception("tmux send_text failed")
@@ -297,36 +264,22 @@ class InputRouter:
 
         threading.Thread(
             target=self._deferred_enter,
-            args=(binding, turn, gen),
+            args=(binding, gen),
             name=f"deferred-enter-{binding.window.window_id}",
             daemon=True,
         ).start()
 
-    def _deferred_enter(
-        self, binding: ChatBinding, turn: TurnState, gen: int | None
-    ) -> None:
-        """Send Enter after the grace period, unless cancel fired first.
-
-        `wait(timeout=…)` returns True iff the event was set before timeout,
-        i.e. the user clicked ⏹ 中断 during the grace window. In that case
-        we skip Enter entirely — Claude never sees the prompt, so the cancel
-        sequence only has to clear the input box (no "Interrupted · redirect"
-        to escape out of).
-        """
-        if turn.cancel_event.wait(timeout=_DEFERRED_ENTER_DELAY_S):
+    def _deferred_enter(self, binding: ChatBinding, gen: int) -> None:
+        """Send Enter after the grace period, unless the submission should be
+        dropped — cancelled during the grace window, or the turn was
+        superseded/sealed. Both are answered by the controller's generation
+        fence (``should_submit_deferred_enter``)."""
+        time.sleep(_DEFERRED_ENTER_DELAY_S)
+        if not self._controller_for(binding).should_submit_deferred_enter(gen):
             logger.info(
-                "deferred Enter skipped — cancel signaled before grace period elapsed",
+                "deferred Enter dropped (cancelled or superseded)",
                 extra={"chat_id": binding.chat_id, "window_id": binding.window.window_id},
             )
-            return
-        # Turn was sealed or superseded between scheduling and firing — drop
-        # the Enter to avoid submitting a stale prompt against whatever state
-        # Claude is in now. Generation fence when a controller is present;
-        # object-identity fallback otherwise.
-        if self._controller_for is not None and gen is not None:
-            if not self._controller_for(binding).is_current_gen(gen):
-                return
-        elif binding.current_turn is not turn:
             return
         try:
             self._tmux.send_key(binding.window.window_id, "Enter")
@@ -338,33 +291,16 @@ class InputRouter:
             return
         # The prompt is now in front of Claude → exactly one Stop/StopFailure
         # will eventually fire for it. Record the generation so the Stop hook
-        # can attribute its seal to *this* turn (and not a turn the user opened
-        # afterwards). Only when a controller is wired (gen present).
-        if self._controller_for is not None and gen is not None:
-            self._controller_for(binding).expect_stop(gen)
+        # can attribute its seal to *this* turn (not a turn opened afterwards).
+        self._controller_for(binding).expect_stop(gen)
 
     def _close_turn(
         self, binding: ChatBinding, *, state: CardState = "done", error: str = ""
     ) -> None:
-        turn = binding.current_turn
-        if turn is None:
-            return
-        if self._seal_active is not None:
-            # Rotation-aware seal (bootstrap-owned): rolls any oversized
-            # uncommitted tail across "(续)" cards before closing, so the
-            # final card never tail-truncates the whole turn. Sets
-            # current_turn = None itself.
-            self._seal_active(binding, state, error)
-            return
-        # Fallback for tests without the seal injected: simple single-card
-        # close. Uses the full snapshot (fine for short turns; long turns
-        # only occur with the real bootstrap path injected).
-        snapshot = turn.accumulator.snapshot(state=state, error=error)
-        try:
-            turn.card_stream.close(render_card(snapshot))
-        except Exception:
-            logger.warning("closing card stream failed", exc_info=True)
-        binding.current_turn = None
+        # Rotation-aware seal owned by the controller: rolls any oversized
+        # uncommitted tail across "(续)" cards before closing, so the final
+        # card never tail-truncates the whole turn. No-op if no active turn.
+        self._controller_for(binding).seal(state=state, error=error)
 
     def _continue_waiting_turn(self, binding: ChatBinding, text: str) -> None:
         """User's text is a reply to Claude's waiting prompt.
@@ -380,7 +316,7 @@ class InputRouter:
         # otherwise the user sees the waiting buttons stuck on screen until the
         # next poll tick. Owned by the controller so an already-rotated turn
         # isn't re-dumped onto the current card.
-        self._clear_waiting(binding, turn)
+        self._controller_for(binding).clear_waiting_and_rerender()
         try:
             self._tmux.send_text(binding.window.window_id, text)
         except TmuxError as e:
@@ -409,13 +345,11 @@ class InputRouter:
             )
             return
         option = options[index]
-        # Clear waiting state before sending — the detector will re-set it
-        # if needed. Holds the lock briefly.
         # Clear waiting + flip the card back to running *now* (before the tmux
         # send, even), so the buttons disappear immediately when the user taps.
         # Otherwise the card sits in waiting state until the next poll tick — a
         # noticeable lag in real-world testing.
-        self._clear_waiting(binding, turn)
+        self._controller_for(binding).clear_waiting_and_rerender()
         try:
             response = option.response
             if isinstance(response, TextResponse):
@@ -460,29 +394,28 @@ class InputRouter:
            input box; Escape then exits redirect and clears the input.
 
         2. **Just-submitted-but-deferred-Enter-not-yet-fired** — the user
-           hit cancel during `_open_turn`'s grace period. Setting
-           `cancel_event` makes the deferred-Enter worker drop the Enter
-           before it ever reaches Claude, so the prompt never gets
-           submitted. The C-c + Escapes still run to clear any text the
-           `send-keys -l` already injected into the input box.
+           hit cancel during `_open_turn`'s grace period.
+           `controller.mark_submit_cancelled()` makes the deferred-Enter
+           worker drop the Enter before it ever reaches Claude, so the prompt
+           never gets submitted. The C-c + Escapes still run to clear any text
+           the `send-keys -l` already injected into the input box.
 
         3. **Idle with leftover input** — defense-in-depth for cases where
            something slipped through (e.g. a previous turn left text on
            the pane). Double-Escape clears the input regardless of state.
 
-        Without (2)'s cancel_event signal, an early cancel races send_text's
-        500ms internal Enter delay: C-c+Escape clears the visible input,
-        but the queued Enter fires afterwards and submits the prompt
-        anyway, leaving Claude actually running with no way to interrupt
-        from the user's perspective.
+        Without (2)'s cancel signal, an early cancel races send_text's 500ms
+        internal Enter delay: C-c+Escape clears the visible input, but the
+        queued Enter fires afterwards and submits the prompt anyway, leaving
+        Claude actually running with no way to interrupt from the user's
+        perspective.
         """
         window_id = binding.window.window_id
-        turn = binding.current_turn
-        if turn is not None:
-            # Tell the deferred-Enter worker (if any) to abort. This is
-            # *the* fix for the early-cancel race — the C-c/Escape keys
-            # below can't catch an Enter that fires after they ran.
-            turn.cancel_event.set()
+        # Tell the deferred-Enter worker (if any) to abort. This is *the* fix
+        # for the early-cancel race — the C-c/Escape keys below can't catch an
+        # Enter that fires after they ran. The controller marks the active
+        # generation cancelled; the worker checks it before submitting.
+        self._controller_for(binding).mark_submit_cancelled()
         # 1. Interrupt any running Claude task / clear pending text.
         self._tmux.send_key(window_id, "C-c")
         # 2. Let Claude TUI render its "Interrupted · redirect" state.
@@ -516,34 +449,9 @@ class InputRouter:
             )
             return
         mode = detect_mode(pane) or "default"
-        if self._controller_for is not None:
-            # Controller owns the binding/turn mode write + rotation-aware
-            # rerender of the Mode button label.
-            self._controller_for(binding).update_mode(mode)
-            return
-        # Fallback for tests without a controller: update the fields directly.
-        binding.current_mode = mode
-        turn = binding.current_turn
-        if turn is not None:
-            turn.accumulator.current_mode = mode
-
-    def _clear_waiting(self, binding: ChatBinding, turn: TurnState) -> None:
-        """Clear the turn's waiting state and flip the card back to running.
-
-        Called right after a user responds to a waiting prompt (button or
-        free-form text) so the card leaves waiting state without waiting for
-        the next transcript-poller / pane-watcher tick. CardStream's throttle
-        still applies (~1.5s max), but it beats two-stage polling.
-
-        Goes through the binding's TurnController (rotation-aware) so a turn
-        that already rotated to a "(续)" card doesn't re-dump full history onto
-        the current card and tail-truncate ("已截断早期内容"). The local clear
-        below is a fallback for tests without a controller injected.
-        """
-        if self._controller_for is not None:
-            self._controller_for(binding).clear_waiting_and_rerender()
-            return
-        turn.waiting_for = None
+        # Controller owns the binding/turn mode write + rotation-aware rerender
+        # of the Mode button label.
+        self._controller_for(binding).update_mode(mode)
 
     def _dump_pane(self, binding: ChatBinding) -> None:
         try:
