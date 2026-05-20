@@ -395,7 +395,10 @@ def render_card(
         body = body + _CONTINUATION_FOOTER
     detail = _render_detail(snapshot) if show_thinking else None
     actions: list[CardButton] | None = None
-    if snapshot.state == "running":
+    # Sealed continuation cards (ends_with_continuation_marker) are historical —
+    # the action row belongs only on the live (last) card, so a turn that spans
+    # N cards doesn't litter every sealed card with 中断/Esc/Mode/内容 buttons.
+    if snapshot.state == "running" and not ends_with_continuation_marker:
         # Build a per-card action row so the Mode button can carry the
         # current permission mode as a suffix. The body of the action row
         # is otherwise static — only the Mode button label is dynamic.

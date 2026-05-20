@@ -478,6 +478,8 @@ def test_render_card_with_continuation_marker_appends_footer() -> None:
     body = card["elements"][0]["content"]
     assert "续下条" in body
     assert "⏬" in body
+    # Sealed continuation cards are historical → no action row.
+    assert "action" not in [e.get("tag") for e in card["elements"]]
 
 
 def test_render_card_no_continuation_marker_by_default() -> None:
