@@ -220,7 +220,7 @@ class Pocketcc:
             extra={"chat_id": binding.chat_id, "session_id": event.session_id},
         )
         self._drain_transcript_for_seal(binding)
-        self._router.close_active_turn(binding, state="done")
+        self._controller_for(binding).seal_on_stop(state="done")
 
     def _handle_stop_failure(self, binding: ChatBinding, event: HookEvent) -> None:
         """StopFailure hook — seal as ❌ failed with whatever error info Claude gave us."""
@@ -230,7 +230,7 @@ class Pocketcc:
             extra={"chat_id": binding.chat_id, "session_id": event.session_id},
         )
         self._drain_transcript_for_seal(binding)
-        self._router.close_active_turn(binding, state="failed", error=error_msg)
+        self._controller_for(binding).seal_on_stop(state="failed", error=error_msg)
 
     def _drain_transcript_for_seal(self, binding: ChatBinding) -> None:
         """Pull any pending transcript events into the accumulator before sealing.

@@ -142,6 +142,9 @@ class _RecordingController:
     def is_current_gen(self, gen: int) -> bool:
         return True
 
+    def expect_stop(self, gen: int) -> None:
+        self._calls.append((self._binding.chat_id, f"expect_stop:{gen}"))
+
     def clear_waiting_and_rerender(self) -> None:
         self._calls.append((self._binding.chat_id, "clear_waiting"))
 

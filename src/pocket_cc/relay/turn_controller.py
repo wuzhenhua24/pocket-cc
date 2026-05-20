@@ -20,6 +20,7 @@ later steps; for now we preserve the status quo so the diff is reviewable.
 from __future__ import annotations
 
 import logging
+from collections import deque
 from typing import TYPE_CHECKING
 
 from pocket_cc.claude.transcript import ModeChange
@@ -55,6 +56,14 @@ class TurnController:
         # later step alongside the rest of the lifecycle serialization.
         self._next_gen = 0
         self._active_gen: int | None = None
+        # FIFO of generations whose prompt was actually submitted to Claude and
+        # are therefore awaiting a Stop/StopFailure hook. The hook can't carry a
+        # Lark-turn token, and one Claude session serves many turns (same
+        # session_id/transcript_path), so we attribute each Stop to the oldest
+        # outstanding turn here. See :meth:`seal_on_stop`. Assumes exactly one
+        # main Stop (or StopFailure) per submitted turn — subagent stops fire a
+        # different hook, so that holds.
+        self._pending_stops: deque[int] = deque()
 
     @property
     def binding(self) -> ChatBinding:
@@ -71,6 +80,45 @@ class TurnController:
     def is_current_gen(self, gen: int) -> bool:
         """True iff ``gen`` is still the active turn (not superseded/sealed)."""
         return self._active_gen == gen
+
+    def expect_stop(self, gen: int) -> None:
+        """Record that ``gen``'s prompt was submitted and now awaits a Stop.
+
+        Called once the deferred Enter actually reaches Claude (a cancelled /
+        never-submitted turn produces no Stop, so it must not enqueue).
+        """
+        self._pending_stops.append(gen)
+
+    def seal_on_stop(self, state: CardState = "done", error: str = "") -> None:
+        """Seal the turn a Stop/StopFailure hook belongs to, via the FIFO.
+
+        Pops the oldest outstanding generation and seals it **only if it's
+        still the active turn**. If it was already superseded (the user fired a
+        new turn) or sealed by another path, the Stop is discarded — crucially
+        without sealing whatever turn happens to be current now, which is the
+        "old Stop closes new turn" race this whole mechanism exists to prevent.
+
+        An empty FIFO means no submitted turn is awaiting a Stop (duplicate or
+        stray hook) — no-op, never seal a turn that might still be running.
+        """
+        if not self._pending_stops:
+            logger.info(
+                "stop hook with no pending turn — ignored",
+                extra={"chat_id": self._binding.chat_id},
+            )
+            return
+        expected = self._pending_stops.popleft()
+        if expected == self._active_gen:
+            self.seal(state=state, error=error)
+        else:
+            logger.info(
+                "stop hook for superseded/sealed turn discarded",
+                extra={
+                    "chat_id": self._binding.chat_id,
+                    "expected_gen": expected,
+                    "active_gen": self._active_gen,
+                },
+            )
 
     # --------------------------------------------------------------- public API
 
@@ -128,9 +176,9 @@ class TurnController:
         the remaining tail (≤ one card) is closed with the terminal
         done/failed state and the correct ``is_continuation`` flag.
 
-        Reached from every close path (Stop / StopFailure hooks via
-        ``InputRouter.close_active_turn``, the new-message-closes-prior path,
-        error paths) and directly from shutdown.
+        Reached from the new-message-closes-prior path and error paths (via
+        ``InputRouter._close_turn``), from shutdown, and — through
+        :meth:`seal_on_stop` — from the Stop / StopFailure hooks.
         """
         binding = self._binding
         turn = binding.current_turn

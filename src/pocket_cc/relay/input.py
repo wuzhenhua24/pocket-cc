@@ -335,16 +335,13 @@ class InputRouter:
                 "deferred Enter send failed",
                 extra={"chat_id": binding.chat_id},
             )
-
-    def close_active_turn(
-        self, binding: ChatBinding, *, state: CardState = "done", error: str = ""
-    ) -> None:
-        """Seal whichever turn is currently active on this binding (no-op if none).
-
-        Public so the hooks/events router can call it on Stop / StopFailure
-        without going through the message handler.
-        """
-        self._close_turn(binding, state=state, error=error)
+            return
+        # The prompt is now in front of Claude → exactly one Stop/StopFailure
+        # will eventually fire for it. Record the generation so the Stop hook
+        # can attribute its seal to *this* turn (and not a turn the user opened
+        # afterwards). Only when a controller is wired (gen present).
+        if self._controller_for is not None and gen is not None:
+            self._controller_for(binding).expect_stop(gen)
 
     def _close_turn(
         self, binding: ChatBinding, *, state: CardState = "done", error: str = ""

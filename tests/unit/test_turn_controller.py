@@ -94,3 +94,58 @@ def test_superseding_turn_invalidates_prior_generation(tmp_path: Path) -> None:
 
     assert controller.is_current_gen(gen_b)
     assert not controller.is_current_gen(gen_a)
+
+
+def test_seal_on_stop_seals_the_awaiting_turn(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    gen = controller.begin_turn()
+    _attach_turn(binding, lark)
+    controller.expect_stop(gen)
+
+    controller.seal_on_stop(state="done")
+
+    assert binding.current_turn is None
+    assert not controller.is_current_gen(gen)
+
+
+def test_seal_on_stop_with_empty_fifo_is_noop(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    controller.begin_turn()
+    _attach_turn(binding, lark)
+    # No expect_stop was recorded → a stray/duplicate Stop must not seal a
+    # turn that may still be running.
+    controller.seal_on_stop(state="done")
+
+    assert binding.current_turn is not None
+
+
+def test_stale_stop_does_not_seal_the_superseding_turn(tmp_path: Path) -> None:
+    """The core race: Stop(A) arrives after the user already opened B. It must
+    consume A's FIFO entry and discard — never seal B."""
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+
+    # Turn A: opened, submitted (awaiting stop).
+    gen_a = controller.begin_turn()
+    _attach_turn(binding, lark)
+    controller.expect_stop(gen_a)
+
+    # User supersedes with B: WS path seals A directly, then B opens + submits.
+    controller.seal(state="done")  # seals A
+    gen_b = controller.begin_turn()
+    _attach_turn(binding, lark)
+    controller.expect_stop(gen_b)
+
+    # Stop(A) lands first → pops gen_a, which is no longer active → discard.
+    controller.seal_on_stop(state="done")
+    assert binding.current_turn is not None  # B untouched
+    assert controller.is_current_gen(gen_b)
+
+    # Stop(B) lands → pops gen_b == active → seals B.
+    controller.seal_on_stop(state="done")
+    assert binding.current_turn is None
