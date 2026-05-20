@@ -524,7 +524,12 @@ def _render_body(snapshot: TurnSnapshot) -> str:
     elif snapshot.assistant_text:
         sections.append(snapshot.assistant_text)
 
-    if snapshot.tool_calls:
+    # Terminal cards (done/failed) drop the tool-call list — once the answer
+    # is in, it's just process noise (the user saw it scroll by while running,
+    # and the full trace lives in tmux). Fallback: if there's no other content
+    # to show, keep it so the card body isn't just a "(运行中…)" placeholder.
+    is_terminal = snapshot.state in ("done", "failed")
+    if snapshot.tool_calls and (not is_terminal or not sections):
         bullets = "\n".join(f"- {t}" for t in snapshot.tool_calls)
         sections.append(f"**🔧 工具调用** ({len(snapshot.tool_calls)})\n{bullets}")
 

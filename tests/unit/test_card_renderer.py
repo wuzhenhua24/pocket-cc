@@ -108,6 +108,46 @@ def test_render_card_done_state_no_actions() -> None:
     assert "action" not in [e.get("tag") for e in card["elements"]]
 
 
+def test_render_card_running_keeps_tool_calls() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="working on it"))
+    acc.ingest(ToolUse(uuid="b", timestamp="t", tool_use_id="t1", tool_name="Read", tool_input={"file_path": "foo.py"}))
+    body = render_card(acc.snapshot(state="running"))["elements"][0]["content"]
+    assert "工具调用" in body
+    assert "foo.py" in body
+
+
+def test_render_card_done_drops_tool_calls_when_text_present() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="here is the answer"))
+    acc.ingest(ToolUse(uuid="b", timestamp="t", tool_use_id="t1", tool_name="Read", tool_input={"file_path": "foo.py"}))
+    body = render_card(acc.snapshot(state="done"))["elements"][0]["content"]
+    assert "here is the answer" in body
+    assert "工具调用" not in body
+    assert "foo.py" not in body
+
+
+def test_render_card_done_keeps_tool_calls_as_fallback_when_no_text() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(ToolUse(uuid="b", timestamp="t", tool_use_id="t1", tool_name="Bash", tool_input={"command": "pytest"}))
+    body = render_card(acc.snapshot(state="done"))["elements"][0]["content"]
+    # No assistant text → keep tool calls so the body isn't just a placeholder.
+    assert "工具调用" in body
+    assert "pytest" in body
+
+
+def test_render_card_failed_drops_tool_calls() -> None:
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(ToolUse(uuid="b", timestamp="t", tool_use_id="t1", tool_name="Read", tool_input={"file_path": "foo.py"}))
+    body = render_card(acc.snapshot(state="failed", error="boom"))["elements"][0]["content"]
+    assert "boom" in body
+    assert "工具调用" not in body
+
+
 def test_render_card_failed_includes_error_in_body() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
