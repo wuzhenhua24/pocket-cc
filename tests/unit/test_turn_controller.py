@@ -230,6 +230,50 @@ def test_rotation_send_failure_is_recoverable(tmp_path: Path) -> None:
     assert old_stream._closed.is_set()
 
 
+# ===================================================== final-close failure
+
+
+def test_seal_final_patch_failure_sends_fallback_notice(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """If the terminal card patch fails every retry, the turn is still sealed
+    internally (current_turn cleared) but the user gets a fallback text notice
+    instead of being silently stranded on a 'running' card."""
+    import pocket_cc.relay.turn_controller as tc
+
+    monkeypatch.setattr(tc, "_FINAL_CLOSE_BACKOFF_S", 0.0)  # don't sleep in the test
+
+    class _PatchFailLark(FakeLarkClient):
+        def patch_card(self, message_id: str, card: dict[str, Any]) -> None:
+            raise LarkApiError(500, "patch boom")
+
+    binding = _binding(tmp_path)
+    lark = _PatchFailLark()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    controller.open_turn("hi")
+
+    controller.seal(state="done")
+
+    # Turn is logically sealed regardless of the patch failure.
+    assert binding.current_turn is None
+    assert controller.phase() is TurnPhase.IDLE
+    # A fallback text notice was sent (kind="text"), so the user isn't stranded.
+    assert sum(1 for s in lark.sent if s.kind == "text") == 1
+
+
+def test_seal_success_sends_no_fallback_notice(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    controller.open_turn("hi")
+
+    controller.seal(state="done")
+
+    assert binding.current_turn is None
+    # Only the initial card; no fallback text on the happy path.
+    assert sum(1 for s in lark.sent if s.kind == "text") == 0
+
+
 # ===================================================== cancel_active_turn
 
 

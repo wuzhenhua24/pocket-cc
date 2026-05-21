@@ -30,6 +30,7 @@ import enum
 import logging
 import threading
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from pocket_cc.app.persistence import TurnState
@@ -55,6 +56,26 @@ if TYPE_CHECKING:
     from pocket_cc.relay.waiting import WaitingFor
 
 logger = logging.getLogger(__name__)
+
+# Retry policy for the terminal card patch (the done/failed/cancelled state).
+# Runs *outside* the controller lock, so the backoff sleeps are safe. The
+# terminal patch is the only signal the turn ended, so unlike the best-effort
+# background tick it gets a few retries before we fall back to a text notice.
+_FINAL_CLOSE_RETRIES = 3
+_FINAL_CLOSE_BACKOFF_S = 0.5
+
+
+@dataclass(frozen=True)
+class _FinalCloseJob:
+    """Work handed from seal's locked section to its unlocked finish.
+
+    The locked section detaches the stream + computes the terminal card; the
+    unlocked section flushes it with retries (which must not hold the lock).
+    """
+
+    stream: CardStream
+    final_card: dict[str, Any]
+    chat_id: str
 
 
 class TurnPhase(enum.Enum):
@@ -201,6 +222,7 @@ class TurnController:
         An empty FIFO means no submitted turn is awaiting a Stop (duplicate or
         stray hook) — no-op, never seal a turn that might still be running.
         """
+        job: _FinalCloseJob | None = None
         with self._lock:
             if not self._pending_stops:
                 logger.info(
@@ -210,7 +232,7 @@ class TurnController:
                 return
             expected = self._pending_stops.popleft()
             if expected == self._active_gen:
-                self.seal(state=state, error=error)
+                job = self._seal_locked(state=state, error=error)
             else:
                 logger.info(
                     "stop hook for superseded/sealed turn discarded",
@@ -220,6 +242,8 @@ class TurnController:
                         "active_gen": self._active_gen,
                     },
                 )
+        if job is not None:
+            self._close_final_stream(job)
 
     def cancel_active_turn(self) -> bool:
         """Cancel + seal the active turn (the ⏹ 中断 button). Returns True if a
@@ -242,6 +266,7 @@ class TurnController:
         The tmux C-c / Escape side-effects stay in :class:`InputRouter`
         (terminal I/O must not run under the lock).
         """
+        job: _FinalCloseJob | None = None
         with self._lock:
             if self._binding.current_turn is None:
                 return False
@@ -255,8 +280,10 @@ class TurnController:
                 # OPENED phase was never enqueued → remove() is a no-op there.
                 with contextlib.suppress(ValueError):
                     self._pending_stops.remove(gen)
-            self.seal(state="cancelled")
-            return True
+            job = self._seal_locked(state="cancelled", error="")
+        if job is not None:
+            self._close_final_stream(job)
+        return True
 
     # --------------------------------------------------------------- public API
 
@@ -423,46 +450,88 @@ class TurnController:
         Reached from the new-message-closes-prior path and error paths (via
         ``InputRouter._close_turn``), from shutdown, and — through
         :meth:`seal_on_stop` — from the Stop / StopFailure hooks.
+
+        Two-phase so the terminal patch's retries don't run under the lock:
+        the locked :meth:`_seal_locked` rotates + computes the final card +
+        detaches the stream + clears active state and returns a close job; the
+        unlocked :meth:`_close_final_stream` flushes it (with retries).
         """
         with self._lock:
-            binding = self._binding
-            turn = binding.current_turn
-            if turn is None:
-                return
-            # Roll the oversized uncommitted tail across continuation cards. We
-            # check the *running* snapshot (content only) so the loop stops once
-            # the remaining tail fits — that tail is then closed below with the
-            # terminal state. Same 32-iteration safety cap as _render_locked.
-            for _ in range(32):
-                if not should_rotate(
-                    turn.accumulator.snapshot(state="running", from_committed=True)
-                ):
-                    break
-                self._rotate_card(turn)
-            final_snapshot = turn.accumulator.snapshot(
-                state=state, error=error, from_committed=True
+            job = self._seal_locked(state=state, error=error)
+        if job is not None:
+            self._close_final_stream(job)
+
+    def _seal_locked(self, *, state: CardState, error: str) -> _FinalCloseJob | None:
+        """Locked half of :meth:`seal`. **Lock must be held.**
+
+        Rolls the oversized uncommitted tail across continuation cards, renders
+        the terminal card, then detaches the stream and clears the active turn
+        + generation so no later work touches it. Returns the close job to run
+        outside the lock, or None when there is no active turn.
+        """
+        binding = self._binding
+        turn = binding.current_turn
+        if turn is None:
+            return None
+        # Roll the oversized uncommitted tail across continuation cards. We
+        # check the *running* snapshot (content only) so the loop stops once the
+        # remaining tail fits — that tail is closed by the caller with the
+        # terminal state. Same 32-iteration safety cap as _render_locked.
+        for _ in range(32):
+            if not should_rotate(turn.accumulator.snapshot(state="running", from_committed=True)):
+                break
+            self._rotate_card(turn)
+        final_card = render_card(
+            turn.accumulator.snapshot(state=state, error=error, from_committed=True),
+            is_continuation=turn.is_continuation,
+            show_thinking=self._config.show_thinking,
+        )
+        stream = turn.card_stream
+        binding.current_turn = None
+        # Retire the generation so any in-flight deferred work (e.g. a deferred
+        # Enter scheduled for this turn) sees a stale gen and aborts instead of
+        # acting on a closed/next turn.
+        self._active_gen = None
+        return _FinalCloseJob(stream=stream, final_card=final_card, chat_id=binding.chat_id)
+
+    def _close_final_stream(self, job: _FinalCloseJob) -> None:
+        """Unlocked half of :meth:`seal`: flush the terminal card with retries.
+
+        Unlike rotation's best-effort intermediate closes, the terminal patch
+        is the only signal the turn ended — so if every retry fails we surface
+        a fallback text notice rather than silently leaving the user staring at
+        a "running" card while the turn is internally done.
+        """
+        try:
+            delivered = job.stream.close(
+                job.final_card,
+                retries=_FINAL_CLOSE_RETRIES,
+                backoff_s=_FINAL_CLOSE_BACKOFF_S,
             )
-            try:
-                # CardStream.close may block briefly (joins the patch thread);
-                # rare and bounded, so it's allowed inside the lock.
-                turn.card_stream.close(
-                    render_card(
-                        final_snapshot,
-                        is_continuation=turn.is_continuation,
-                        show_thinking=self._config.show_thinking,
-                    )
-                )
-            except Exception:
-                logger.warning(
-                    "seal: closing final card failed",
-                    extra={"chat_id": binding.chat_id},
-                    exc_info=True,
-                )
-            binding.current_turn = None
-            # Retire the generation so any in-flight deferred work (e.g. a
-            # deferred Enter scheduled for this turn) sees a stale gen and
-            # aborts instead of acting on a closed/next turn.
-            self._active_gen = None
+        except Exception:
+            logger.warning(
+                "seal: closing final card raised",
+                extra={"chat_id": job.chat_id},
+                exc_info=True,
+            )
+            delivered = False
+        if delivered:
+            return
+        logger.error(
+            "seal: final card patch failed after retries — sending fallback notice",
+            extra={"chat_id": job.chat_id},
+        )
+        try:
+            self._lark.send_text(
+                job.chat_id,
+                "✅ 上一轮已处理完成，但最终卡片更新失败——内容以实际会话为准，可刷新查看。",
+            )
+        except LarkApiError:
+            logger.warning(
+                "seal: fallback notice send also failed",
+                extra={"chat_id": job.chat_id},
+                exc_info=True,
+            )
 
     def clear_waiting_and_rerender(self) -> None:
         """Clear the active turn's waiting state and re-render it as running.

@@ -10,9 +10,12 @@ callbacks fire on a worker thread, and our handlers are plain functions).
 We don't want to drag an event loop into this just for one feature.
 
 Closing semantics:
-  - `close(final_card, *, flush=True)` swaps in `final_card` (if given) and
-    forces one last patch immediately. Used to render the "done" / "failed"
-    state when a turn ends.
+  - `close(final_card, *, flush=True, retries=, backoff_s=)` swaps in
+    `final_card` (if given) and forces one last patch. Unlike the best-effort
+    background tick, this final flush **retries** on failure and **returns a
+    bool** (True = delivered) so the caller can react — the terminal patch is
+    the only signal to the user that the turn ended, so it can't be silently
+    dropped. Used to render the "done" / "failed" / "cancelled" state.
   - After `close()`, further `update()` calls are silent no-ops.
 """
 
@@ -22,6 +25,7 @@ import hashlib
 import json
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -73,8 +77,24 @@ class CardStream:
             self._pending = card
         self._wakeup.set()
 
-    def close(self, final_card: dict[str, Any] | None = None, *, flush: bool = True) -> None:
-        """Stop the worker. If ``flush`` is True, send one final PATCH first."""
+    def close(
+        self,
+        final_card: dict[str, Any] | None = None,
+        *,
+        flush: bool = True,
+        retries: int = 0,
+        backoff_s: float = 0.0,
+    ) -> bool:
+        """Stop the worker, then (if ``flush``) send the final PATCH.
+
+        Returns True if the final card was delivered (or there was nothing to
+        flush / ``flush`` is False), False if every attempt failed. The final
+        flush retries up to ``retries`` extra times with ``backoff_s`` between
+        attempts — it carries the turn's terminal state, so a transient failure
+        must not silently leave the user on a "running" card. ``retries=0``
+        (the default) preserves the old best-effort single attempt, used for
+        rotation's intermediate sealing cards.
+        """
         if final_card is not None:
             with self._lock:
                 self._pending = final_card
@@ -82,8 +102,9 @@ class CardStream:
         self._wakeup.set()
         if self._started:
             self._thread.join(timeout=5)
-        if flush:
-            self._flush_once()
+        if not flush:
+            return True
+        return self._flush_final(retries=retries, backoff_s=backoff_s)
 
     # -------------------------------------------------------------- internal
 
@@ -114,6 +135,36 @@ class CardStream:
             logger.warning(
                 "card patch failed", extra={"message_id": self._message_id}, exc_info=True
             )
+
+    def _flush_final(self, *, retries: int, backoff_s: float) -> bool:
+        """Send the terminal card, retrying on failure. Returns delivery success.
+
+        Runs after the worker thread has stopped (no tick will retry for us),
+        so this is the turn's last chance to show its done/failed state. The
+        hash de-dupe still applies: if the worker already flushed an identical
+        card, there's nothing left to send and we report success.
+        """
+        with self._lock:
+            if self._pending is None:
+                return True
+            card = self._pending
+        h = _card_hash(card)
+        if h == self._last_hash:
+            return True
+        for attempt in range(retries + 1):
+            try:
+                self._client.patch_card(self._message_id, card)
+                self._last_hash = h
+                return True
+            except Exception:
+                logger.warning(
+                    "final card patch attempt failed",
+                    extra={"message_id": self._message_id, "attempt": attempt + 1},
+                    exc_info=True,
+                )
+                if attempt < retries and backoff_s > 0:
+                    time.sleep(backoff_s)
+        return False
 
 
 def _card_hash(card: dict[str, Any]) -> str:

@@ -83,6 +83,53 @@ def test_update_after_close_is_noop() -> None:
     assert fake.patches == []
 
 
+def test_close_final_flush_returns_true_on_success() -> None:
+    fake = FakeLarkClient()
+    stream = CardStream(fake, "om_abc", interval_s=10.0)
+    stream.start()
+    assert stream.close({"final": True}) is True
+    assert len(fake.patches) == 1
+
+
+def test_close_flush_false_returns_true() -> None:
+    fake = FakeLarkClient()
+    stream = CardStream(fake, "om_abc", interval_s=10.0)
+    stream.start()
+    stream.update({"x": 1})
+    assert stream.close(flush=False) is True
+    assert fake.patches == []
+
+
+def test_close_final_flush_retries_then_succeeds() -> None:
+    class FlakyClient(FakeLarkClient):
+        fails_left: int = 2
+
+        def patch_card(self, message_id: str, card: dict[str, object]) -> None:
+            if self.fails_left > 0:
+                self.fails_left -= 1
+                raise RuntimeError("transient blip")
+            super().patch_card(message_id, card)
+
+    fake = FlakyClient()
+    stream = CardStream(fake, "om_abc", interval_s=10.0)
+    stream.start()
+    # 2 failures then success, within retries=3 → delivered.
+    assert stream.close({"final": True}, retries=3, backoff_s=0.0) is True
+    assert len(fake.patches) == 1
+
+
+def test_close_final_flush_returns_false_when_all_attempts_fail() -> None:
+    class BombClient(FakeLarkClient):
+        def patch_card(self, message_id: str, card: dict[str, object]) -> None:
+            raise RuntimeError("always down")
+
+    fake = BombClient()
+    stream = CardStream(fake, "om_abc", interval_s=10.0)
+    stream.start()
+    # retries=2 → 3 attempts, all fail → reports failure (caller sends fallback).
+    assert stream.close({"final": True}, retries=2, backoff_s=0.0) is False
+
+
 def test_patch_failure_does_not_stop_the_stream() -> None:
     class BombClient(FakeLarkClient):
         def patch_card(self, message_id: str, card: dict[str, object]) -> None:
