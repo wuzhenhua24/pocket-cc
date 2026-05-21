@@ -15,7 +15,7 @@ from pocket_cc.app.persistence import ChatBinding, TurnState
 from pocket_cc.lark.client import FakeLarkClient
 from pocket_cc.relay.card_renderer import TurnAccumulator
 from pocket_cc.relay.card_stream import CardStream
-from pocket_cc.relay.turn_controller import TurnController
+from pocket_cc.relay.turn_controller import TurnController, TurnPhase
 from pocket_cc.relay.waiting import WaitingFor
 from pocket_cc.tmux import WindowInfo
 
@@ -177,6 +177,145 @@ def test_stale_stop_does_not_seal_the_superseding_turn(tmp_path: Path) -> None:
     # Stop(B) lands → pops gen_b == active → seals B.
     controller.seal_on_stop(state="done")
     assert binding.current_turn is None
+
+
+# ===================================================== cancel_active_turn
+
+
+def test_cancel_active_turn_idle_returns_false(tmp_path: Path) -> None:
+    controller = TurnController(
+        binding=_binding(tmp_path), lark=FakeLarkClient(), config=_config(tmp_path)
+    )
+    # Nothing open → no-op, must not raise (the ⏹ defense-in-depth case).
+    assert controller.cancel_active_turn() is False
+
+
+def test_cancel_active_turn_opened_seals_and_drops_deferred_enter(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    gen = controller.begin_turn()
+    _attach_turn(binding, lark)
+    # OPENED: deferred Enter not yet fired (no expect_stop).
+    assert controller.should_submit_deferred_enter(gen) is True
+
+    assert controller.cancel_active_turn() is True
+
+    assert binding.current_turn is None
+    assert controller.phase() is TurnPhase.IDLE
+    # The deferred-Enter worker must now drop its Enter.
+    assert controller.should_submit_deferred_enter(gen) is False
+
+
+def test_cancel_active_turn_running_removes_pending_stop(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    gen = controller.begin_turn()
+    _attach_turn(binding, lark)
+    controller.expect_stop(gen)  # submitted → RUNNING, gen in FIFO
+
+    assert controller.cancel_active_turn() is True
+
+    assert binding.current_turn is None
+    # A stray/late Stop after the interrupt must find an empty FIFO → no-op,
+    # never seal a future turn.
+    controller.seal_on_stop(state="done")  # must not raise / must be harmless
+    assert binding.current_turn is None
+
+
+def test_cancel_does_not_poison_next_turns_stop(tmp_path: Path) -> None:
+    """The core reason cancel must drain the FIFO: an interrupt fires no Stop,
+    so a left-behind FIFO entry for the cancelled turn would be mis-popped
+    against the *next* turn's Stop, leaving that turn stuck running forever."""
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+
+    # Turn A: submitted (awaiting a Stop that will never come — user interrupts).
+    gen_a = controller.begin_turn()
+    _attach_turn(binding, lark)
+    controller.expect_stop(gen_a)
+    controller.cancel_active_turn()  # removes gen_a from the FIFO
+
+    # Turn B: opened + submitted.
+    gen_b = controller.begin_turn()
+    _attach_turn(binding, lark)
+    controller.expect_stop(gen_b)
+
+    # B completes → its Stop must pop gen_b (not a stale gen_a) and seal B.
+    controller.seal_on_stop(state="done")
+    assert binding.current_turn is None
+    assert not controller.is_current_gen(gen_b)
+
+
+# ===================================================== phase()
+
+
+def test_phase_idle_without_turn(tmp_path: Path) -> None:
+    controller = TurnController(
+        binding=_binding(tmp_path), lark=FakeLarkClient(), config=_config(tmp_path)
+    )
+    assert controller.phase() is TurnPhase.IDLE
+
+
+def test_phase_opened_after_open_before_submit(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    # Card created + generation active, but the deferred Enter hasn't fired
+    # (no expect_stop yet) → still in the cancellable grace window.
+    controller.begin_turn()
+    _attach_turn(binding, lark)
+    assert controller.phase() is TurnPhase.OPENED
+
+
+def test_phase_running_after_expect_stop(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    gen = controller.begin_turn()
+    _attach_turn(binding, lark)
+    controller.expect_stop(gen)
+    assert controller.phase() is TurnPhase.RUNNING
+
+
+def test_phase_waiting_takes_precedence_over_running(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    gen = controller.begin_turn()
+    _attach_turn(binding, lark)
+    controller.expect_stop(gen)  # submitted → would be RUNNING…
+    controller.apply_pane_state(_waiting("fp1"), None)  # …but Claude prompted
+    assert controller.phase() is TurnPhase.WAITING
+
+
+def test_phase_idle_after_seal(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    controller.begin_turn()
+    _attach_turn(binding, lark)
+    controller.seal(state="done")
+    assert controller.phase() is TurnPhase.IDLE
+
+
+def test_phase_opened_for_new_turn_with_stale_fifo_entry(tmp_path: Path) -> None:
+    """A superseded turn's generation can linger in the FIFO until its late
+    Stop drains it. The freshly-opened turn must read as OPENED (not RUNNING)
+    because *its* generation hasn't been submitted yet — phase keys off the
+    active gen's membership, not a non-empty FIFO."""
+    binding = _binding(tmp_path)
+    lark = FakeLarkClient()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    gen_a = controller.begin_turn()
+    _attach_turn(binding, lark)
+    controller.expect_stop(gen_a)  # A submitted
+    controller.seal(state="done")  # A sealed; gen_a still in _pending_stops
+    controller.begin_turn()  # B opens
+    _attach_turn(binding, lark)
+    assert controller.phase() is TurnPhase.OPENED
 
 
 # ===================================================== apply_pane_state

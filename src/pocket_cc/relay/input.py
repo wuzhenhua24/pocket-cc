@@ -28,6 +28,7 @@ from pocket_cc.claude.pane_inspector import detect_mode
 from pocket_cc.claude.session_index import snapshot_existing_transcripts
 from pocket_cc.lark.card import build_text_card
 from pocket_cc.lark.client import LarkApiError
+from pocket_cc.relay.turn_controller import TurnPhase
 from pocket_cc.relay.waiting import KeysResponse, TextResponse
 from pocket_cc.tmux import TmuxError
 
@@ -73,6 +74,12 @@ _DEFERRED_ENTER_DELAY_S = 0.5
 # a little headroom. Runs on the Lark WS callback thread (like _handle_cancel
 # at 0.3s, acceptable). Module-level so tests can monkeypatch it to 0.
 _MODE_READBACK_DELAY_S = 0.35
+# When a message arrives while Claude is still busy (OPENED/RUNNING), we reject
+# it with one lightweight notice instead of opening a turn that would steal the
+# running task's transcript output. If the user fires several messages in quick
+# succession we don't want a notice per message — only re-notify after this many
+# seconds of quiet. Wall-clock-independent (uses time.monotonic).
+_REJECT_NOTICE_THROTTLE_S = 5.0
 
 
 class InputRouter:
@@ -97,6 +104,10 @@ class InputRouter:
         # through a controller method so it stays serialized per binding.
         self._controller_for = controller_for
         self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
+        # chat_id → monotonic timestamp of the last "Claude is busy" notice,
+        # so a burst of messages while busy yields at most one notice per
+        # `_REJECT_NOTICE_THROTTLE_S` window. See `_reject_busy`.
+        self._last_reject_notice: dict[str, float] = {}
 
     # =============================================================== messages
 
@@ -127,22 +138,29 @@ class InputRouter:
             if binding is None:
                 return
 
-        # **Continuation path** (M2-0): when the current turn is waiting on a
-        # user response (Permission / AskUserQuestion prompt detected by
-        # M2-A or M2-C), text from Lark is a *reply to that prompt*, not a
-        # new request. Don't open a new turn — keep the current card and
-        # send the text through. The waiting_for is cleared optimistically;
-        # the detector will re-set it if Claude actually re-prompts.
-        if binding.current_turn is not None and binding.current_turn.waiting_for is not None:
+        # Route on the controller's turn phase (the single source of truth for
+        # "is Claude still busy"), never by guessing from `current_turn`:
+        #
+        #   WAITING        — Claude is blocked on a prompt (Permission /
+        #                    AskUserQuestion / Plan). The text is a *reply* to
+        #                    that prompt, not a new request: keep the current
+        #                    card and send it through (continuation). M2-A/C
+        #                    re-set waiting_for if Claude re-prompts.
+        #   OPENED/RUNNING — a turn is still in flight. We must NOT open a new
+        #                    turn: the prior task is still writing the shared
+        #                    transcript, and a new turn's accumulator would
+        #                    ingest that output (misattribution). We also must
+        #                    not seal it prematurely (an interrupt fires no
+        #                    Stop, completion does — let the real signal seal
+        #                    it). So we reject with a throttled notice.
+        #   IDLE           — nothing running: open a fresh turn.
+        phase = self._controller_for(binding).phase()
+        if phase is TurnPhase.WAITING:
             self._continue_waiting_turn(binding, msg.text)
             return
-
-        # Closing the previous turn is purely a UX seal — the *card* is
-        # marked done, but Claude in the tmux pane is still running if it
-        # hasn't finished. M1-E wires the Stop hook to drive this transition
-        # from the real session-end signal instead.
-        if binding.current_turn is not None:
-            self._close_turn(binding, state="done")
+        if phase in (TurnPhase.OPENED, TurnPhase.RUNNING):
+            self._reject_busy(binding)
+            return
 
         self._open_turn(binding, msg.text)
 
@@ -302,6 +320,28 @@ class InputRouter:
         # card never tail-truncates the whole turn. No-op if no active turn.
         self._controller_for(binding).seal(state=state, error=error)
 
+    def _reject_busy(self, binding: ChatBinding) -> None:
+        """Tell the user Claude is still busy, at most once per throttle window.
+
+        The incoming message is intentionally dropped (not queued): opening a
+        turn now would mis-ingest the running task's transcript output, and
+        sealing the running turn early would lie about completion. The user
+        can wait for it to finish or tap ⏹ 中断. Queueing is a separate, later
+        enhancement — this is the minimal correct seal of the semantics.
+        """
+        now = time.monotonic()
+        last = self._last_reject_notice.get(binding.chat_id, 0.0)
+        if now - last < _REJECT_NOTICE_THROTTLE_S:
+            return  # within the quiet window — swallow to avoid notice spam
+        self._last_reject_notice[binding.chat_id] = now
+        try:
+            self._lark.send_text(
+                binding.chat_id,
+                "⏳ Claude 还在处理上一条消息——请等它完成，或点卡片上的 ⏹ 中断后再发。",
+            )
+        except LarkApiError:
+            logger.warning("failed to send busy notice", exc_info=True)
+
     def _continue_waiting_turn(self, binding: ChatBinding, text: str) -> None:
         """User's text is a reply to Claude's waiting prompt.
 
@@ -411,11 +451,14 @@ class InputRouter:
         perspective.
         """
         window_id = binding.window.window_id
-        # Tell the deferred-Enter worker (if any) to abort. This is *the* fix
-        # for the early-cancel race — the C-c/Escape keys below can't catch an
-        # Enter that fires after they ran. The controller marks the active
-        # generation cancelled; the worker checks it before submitting.
-        self._controller_for(binding).mark_submit_cancelled()
+        # Cancel + seal the active turn (if any) now. An interrupt fires no
+        # Stop hook, so the controller seals here rather than waiting for
+        # seal_on_stop; this also drops the not-yet-sent deferred Enter (the
+        # early-cancel-race fix — the C-c/Escape keys below can't catch an
+        # Enter that fires after they ran) and removes a submitted turn's
+        # stale pending-stop FIFO entry. No-op when idle, so the C-c/Escape
+        # defense-in-depth below still runs to clear any leftover input.
+        self._controller_for(binding).cancel_active_turn()
         # 1. Interrupt any running Claude task / clear pending text.
         self._tmux.send_key(window_id, "C-c")
         # 2. Let Claude TUI render its "Interrupted · redirect" state.

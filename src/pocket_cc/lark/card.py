@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 
-CardState = Literal["running", "done", "failed", "waiting"]
+CardState = Literal["running", "done", "failed", "waiting", "cancelled"]
 
 # state → (header template color, emoji prefix)
 _STATE_STYLE: dict[CardState, tuple[str, str]] = {
@@ -27,6 +27,7 @@ _STATE_STYLE: dict[CardState, tuple[str, str]] = {
     "done": ("green", "✅"),
     "failed": ("red", "❌"),
     "waiting": ("orange", "❓"),
+    "cancelled": ("grey", "⏹"),
 }
 
 ButtonStyle = Literal["default", "primary", "danger"]

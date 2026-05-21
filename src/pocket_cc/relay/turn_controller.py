@@ -25,6 +25,8 @@ the lock — methods compute the card under the lock, release, then update.
 
 from __future__ import annotations
 
+import contextlib
+import enum
 import logging
 import threading
 from collections import deque
@@ -53,6 +55,34 @@ if TYPE_CHECKING:
     from pocket_cc.relay.waiting import WaitingFor
 
 logger = logging.getLogger(__name__)
+
+
+class TurnPhase(enum.Enum):
+    """Lifecycle phase of a binding's turn — a read-only projection of the
+    controller's existing state (``current_turn`` + ``waiting_for`` +
+    ``_pending_stops`` + ``_active_gen``), not a separately-stored field.
+
+    Computed by :meth:`TurnController.phase`. There is no stored phase to keep
+    in sync, so WAITING can't drift out of step with ``waiting_for`` and
+    RUNNING can't drift from the pending-stop FIFO.
+
+      - ``IDLE``    — no active turn; an incoming message opens a new one.
+      - ``OPENED``  — card created and prompt text injected, but the deferred
+        Enter hasn't fired yet (the cancellable grace window). No Stop is
+        owed for it, so cancel only has to drop the deferred Enter.
+      - ``RUNNING`` — the Enter was submitted and the turn awaits a
+        Stop/StopFailure (its generation is in ``_pending_stops``). Cancel
+        here means interrupting a live Claude task.
+      - ``WAITING`` — Claude paused on a prompt (Permission / AskUserQuestion
+        / Plan); ``waiting_for`` is set. An incoming message is a *reply*
+        (continuation), not a new turn. Takes precedence over RUNNING because
+        the prompt is what the user is responding to.
+    """
+
+    IDLE = "idle"
+    OPENED = "opened"
+    RUNNING = "running"
+    WAITING = "waiting"
 
 
 class TurnController:
@@ -115,6 +145,24 @@ class TurnController:
         with self._lock:
             return self._active_gen == gen
 
+    def phase(self) -> TurnPhase:
+        """Current lifecycle phase, derived from existing state under the lock.
+
+        See :class:`TurnPhase` for the meaning of each value. Pure projection:
+        nothing here mutates state, and the precedence (WAITING before RUNNING)
+        is what the routing layer relies on so a waiting turn is answered as a
+        continuation rather than treated as a busy one.
+        """
+        with self._lock:
+            turn = self._binding.current_turn
+            if turn is None:
+                return TurnPhase.IDLE
+            if turn.waiting_for is not None:
+                return TurnPhase.WAITING
+            if self._active_gen in self._pending_stops:
+                return TurnPhase.RUNNING
+            return TurnPhase.OPENED
+
     def mark_submit_cancelled(self) -> None:
         """Cancel the active turn's pending submission (⏹ during the grace
         window). The deferred-Enter worker will drop the Enter. No-op if no
@@ -172,6 +220,43 @@ class TurnController:
                         "active_gen": self._active_gen,
                     },
                 )
+
+    def cancel_active_turn(self) -> bool:
+        """Cancel + seal the active turn (the ⏹ 中断 button). Returns True if a
+        turn was cancelled, False if nothing was active (IDLE).
+
+        Interrupting a running Claude (C-c / Esc) fires **no** Stop hook
+        (verified empirically), so we cannot wait for ``seal_on_stop`` to
+        archive the turn — it would stay stuck "running" forever, and its
+        generation would linger in ``_pending_stops`` where a *future* turn's
+        Stop would later mis-pop it (sealing the wrong turn, or no turn). So we
+        seal here and drop the FIFO entry. Both phases are covered:
+
+          - OPENED — the deferred Enter hasn't fired; ``mark_submit_cancelled``
+            makes the worker drop it (the prompt was never submitted, so no
+            Stop is owed and nothing was enqueued).
+          - RUNNING — the prompt was submitted and its generation sits in
+            ``_pending_stops``; since the interrupt yields no Stop, we remove
+            that entry so it can't shift attribution of a later turn's Stop.
+
+        The tmux C-c / Escape side-effects stay in :class:`InputRouter`
+        (terminal I/O must not run under the lock).
+        """
+        with self._lock:
+            if self._binding.current_turn is None:
+                return False
+            gen = self._active_gen
+            # OPENED: drop the not-yet-sent deferred Enter. Harmless if RUNNING
+            # (its Enter already fired; the worker won't re-check).
+            self.mark_submit_cancelled()
+            if gen is not None:
+                # RUNNING: the submitted gen is awaiting a Stop that will never
+                # come. Remove it so the FIFO stays aligned with reality.
+                # OPENED phase was never enqueued → remove() is a no-op there.
+                with contextlib.suppress(ValueError):
+                    self._pending_stops.remove(gen)
+            self.seal(state="cancelled")
+            return True
 
     # --------------------------------------------------------------- public API
 

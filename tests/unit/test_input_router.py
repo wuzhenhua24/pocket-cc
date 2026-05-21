@@ -287,7 +287,11 @@ def test_tmux_new_window_failure_surfaces_to_user(tmp_path: Path) -> None:
 # ------------------------------------------------------------ turn transitions
 
 
-def test_second_message_closes_prior_turn_and_opens_new_one(tmp_path: Path) -> None:
+def test_second_message_while_busy_is_rejected(tmp_path: Path) -> None:
+    """A new message arriving while the prior turn is still in flight
+    (OPENED/RUNNING) must NOT open a new turn or seal the old one — it would
+    mis-ingest the running task's output and lie about completion. Instead the
+    router rejects with a busy notice and leaves the current turn intact."""
     cfg = _make_config(workspace=tmp_path)
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
@@ -301,12 +305,33 @@ def test_second_message_closes_prior_turn_and_opens_new_one(tmp_path: Path) -> N
 
     binding = registry.get("oc_chat1")
     assert binding is not None
+    # Same turn still current — not superseded, not sealed.
     assert binding.current_turn is not None
-    second_turn_id = binding.current_turn.card_message_id
-    assert second_turn_id != first_turn_id
-
-    # Second call should NOT have created a second tmux window — same binding.
+    assert binding.current_turn.card_message_id == first_turn_id
+    # No second card was opened; exactly one busy notice (text) was sent.
+    assert sum(1 for s in lark.sent if s.kind == "card") == 1
+    assert sum(1 for s in lark.sent if s.kind == "text") == 1
+    # The second prompt was never injected into tmux.
+    assert [c.kwargs["text"] for c in tmux.calls if c.method == "send_text"] == ["first"]
     assert sum(1 for c in tmux.calls if c.method == "new_window") == 1
+
+
+def test_busy_notices_are_throttled(tmp_path: Path) -> None:
+    """A burst of messages while Claude is busy yields at most one notice per
+    throttle window, so the user isn't spammed."""
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    router.handle_message(_message(text="first"))  # opens the turn (busy)
+    router.handle_message(_message(text="busy-1"))
+    router.handle_message(_message(text="busy-2"))
+    router.handle_message(_message(text="busy-3"))
+
+    # Three rejected messages within the window → exactly one busy notice.
+    assert sum(1 for s in lark.sent if s.kind == "text") == 1
 
 
 def test_non_text_message_is_ignored(tmp_path: Path) -> None:
@@ -568,10 +593,10 @@ def test_duplicate_card_action_token_is_dropped(tmp_path: Path) -> None:
     assert len(ctrl_c_calls) == 1
 
 
-def test_close_turn_routes_through_controller_seal(tmp_path: Path) -> None:
-    """Superseding a turn (new message while one is open) must close the prior
-    turn via the controller's rotation-aware seal — so a long final turn rolls
-    across "(续)" cards instead of tail-truncating."""
+def test_busy_message_does_not_seal_prior_turn(tmp_path: Path) -> None:
+    """A new message while a turn is in flight must NOT seal it (the old
+    premature-"done" behavior). An interrupt fires no Stop and completion does,
+    so only the real signal — or an explicit ⏹ — may seal the turn."""
     cfg = _make_config(workspace=tmp_path)
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
@@ -586,13 +611,16 @@ def test_close_turn_routes_through_controller_seal(tmp_path: Path) -> None:
     )
 
     router.handle_message(_message(text="first"))
-    # Second message closes the prior turn → should go through controller.seal.
+    # Second message arrives while the first turn is busy → rejected, not sealed.
     router.handle_message(_message(text="second", message_id="om_msg2"))
 
-    assert ("oc_chat1", "seal:done") in calls
+    assert not any(c[1].startswith("seal:") for c in calls)
 
 
-def test_distinct_message_ids_both_processed(tmp_path: Path) -> None:
+def test_distinct_message_ids_both_processed_not_deduped(tmp_path: Path) -> None:
+    """Two distinct message_ids must both pass the dedupe filter (only repeated
+    *ids* are dropped). The first opens a turn; the second, arriving while busy,
+    is processed into a busy notice — proving it wasn't silently deduped."""
     cfg = _make_config(workspace=tmp_path)
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
@@ -612,8 +640,9 @@ def test_distinct_message_ids_both_processed(tmp_path: Path) -> None:
     router.handle_message(m1)
     router.handle_message(m2)
 
-    send_texts = [c for c in tmux.calls if c.method == "send_text"]
-    assert {c.kwargs["text"] for c in send_texts} == {"first", "second"}
+    # First prompt injected; second rejected with a busy notice (not deduped).
+    assert [c.kwargs["text"] for c in tmux.calls if c.method == "send_text"] == ["first"]
+    assert sum(1 for s in lark.sent if s.kind == "text") == 1
 
 
 def test_card_action_unknown_card_id_is_no_op(tmp_path: Path) -> None:
@@ -760,21 +789,33 @@ def test_waiting_response_button_uses_rotation_aware_rerender(tmp_path: Path) ->
     assert calls == [("oc_chat1", "open_turn"), ("oc_chat1", "clear_waiting")]
 
 
-def test_message_after_continuation_opens_new_turn_again(tmp_path: Path) -> None:
-    """Once continuation clears waiting_for, the next reply opens a new turn."""
+def test_message_after_continuation_is_rejected_until_turn_completes(tmp_path: Path) -> None:
+    """Answering a waiting prompt (continuation) puts Claude back to work — it
+    does NOT make the turn idle. A new request while it's running is rejected;
+    only once the turn actually completes (seal → IDLE) does the next message
+    open a fresh turn."""
     cfg = _make_config(workspace=tmp_path)
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
     registry = Registry()
-    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    provider = _real_controller_for(lark, cfg)
+    router = _make_router(
+        tmux=tmux, lark=lark, registry=registry, config=cfg, controller_for=provider
+    )
     router.handle_message(_message(text="please run X"))
     _set_waiting_on_active_turn(registry, "oc_chat1")
-    router.handle_message(_message(text="1", message_id="om_reply"))
-    # Continuation done → waiting cleared. A *new* message now should open
-    # a new turn (= new card).
+    router.handle_message(_message(text="1", message_id="om_reply"))  # continuation
+
+    # Turn is running again → a new request is rejected (no new card).
     router.handle_message(_message(text="next request", message_id="om_next"))
-    cards = [s for s in lark.sent if s.kind == "card"]
-    assert len(cards) == 2  # original + new turn
+    assert sum(1 for s in lark.sent if s.kind == "card") == 1
+
+    # Now the turn completes → IDLE. The next message opens a new turn.
+    binding = registry.get("oc_chat1")
+    assert binding is not None
+    provider(binding).seal(state="done")
+    router.handle_message(_message(text="after done", message_id="om_after"))
+    assert sum(1 for s in lark.sent if s.kind == "card") == 2
 
 
 def test_card_action_waiting_response_text_dispatches_send_text(tmp_path: Path) -> None:
