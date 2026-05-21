@@ -137,6 +137,97 @@ def test_stop_event_with_empty_transcript_path_is_ignored(tmp_path: Path) -> Non
     assert captured == []
 
 
+# --------------------------------------------------- Stop lazy-lock fallback
+
+
+def test_stop_lazily_locks_and_fires_when_transcript_not_yet_locked(tmp_path: Path) -> None:
+    """The fix: a Stop arriving before the transcript was locked (SessionStart
+    missed/ambiguous, poller hadn't ticked) must still attribute — via the
+    path the Stop event itself carries — instead of being dropped."""
+    binding = _binding(cwd=tmp_path)  # transcript_path is None — never locked
+    registry = Registry()
+    registry.set(binding)
+
+    fresh = str(tmp_path / "ours-new.jsonl")
+    locked: list[str] = []
+    stopped: list[ChatBinding] = []
+    dispatcher = HookEventsDispatcher(
+        registry,
+        on_session_start=lambda _b, e: locked.append(e.transcript_path),
+        on_stop=lambda b, _e: stopped.append(b),
+    )
+    dispatcher.dispatch(_event("Stop", transcript_path=fresh, cwd=str(tmp_path)))
+
+    # Lazily locked via the Stop's own transcript_path, then sealed.
+    assert locked == [fresh]
+    assert stopped == [binding]
+
+
+def test_stop_fallback_matches_cwd_across_symlink(tmp_path: Path) -> None:
+    """cwd compare must be symlink-tolerant: binding holds the configured path,
+    the hook reports the realpath (the /tmp vs /private/tmp case on macOS)."""
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    binding = _binding(cwd=link)  # configured path (symlink), unlocked
+    registry = Registry()
+    registry.set(binding)
+
+    stopped: list[ChatBinding] = []
+    dispatcher = HookEventsDispatcher(
+        registry,
+        on_session_start=lambda _b, _e: None,
+        on_stop=lambda b, _e: stopped.append(b),
+    )
+    # Event reports the resolved (real) cwd.
+    dispatcher.dispatch(
+        _event("Stop", transcript_path=str(real / "ours.jsonl"), cwd=str(real))
+    )
+
+    assert stopped == [binding]
+
+
+def test_stop_fallback_skips_when_multiple_bindings_match(tmp_path: Path) -> None:
+    """Two unlocked bindings in the same cwd → can't tell which the Stop is
+    for; never guess (would seal the wrong turn)."""
+    a = _binding(chat_id="a", cwd=tmp_path)
+    b = _binding(chat_id="b", cwd=tmp_path)
+    registry = Registry()
+    registry.set(a)
+    registry.set(b)
+
+    stopped: list[ChatBinding] = []
+    dispatcher = HookEventsDispatcher(registry, on_stop=lambda bind, _e: stopped.append(bind))
+    dispatcher.dispatch(
+        _event("Stop", transcript_path=str(tmp_path / "f.jsonl"), cwd=str(tmp_path))
+    )
+
+    assert stopped == []
+
+
+def test_stop_fallback_ignores_excluded_transcript(tmp_path: Path) -> None:
+    """A Stop for a pre-existing (excluded) transcript is a concurrent Claude's,
+    even in our cwd — must not lazy-lock onto it."""
+    desktop = tmp_path / "desktop.jsonl"
+    binding = _binding(cwd=tmp_path, excluded=frozenset({desktop}))  # unlocked
+    registry = Registry()
+    registry.set(binding)
+
+    stopped: list[ChatBinding] = []
+    locked: list[str] = []
+    dispatcher = HookEventsDispatcher(
+        registry,
+        on_session_start=lambda _b, e: locked.append(e.transcript_path),
+        on_stop=lambda b, _e: stopped.append(b),
+    )
+    dispatcher.dispatch(_event("Stop", transcript_path=str(desktop), cwd=str(tmp_path)))
+
+    assert locked == []
+    assert stopped == []
+
+
 # --------------------------------------------------------------- SessionStart
 
 

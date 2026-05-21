@@ -34,6 +34,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _same_dir(binding_cwd: Path, event_cwd: str) -> bool:
+    """Symlink-tolerant cwd comparison.
+
+    Claude reports the OS-realpath cwd in hook payloads (e.g. ``/private/tmp``
+    on macOS) while the binding holds the path as configured (``/tmp``); a plain
+    string compare would miss that match and the event would never attribute.
+    ``resolve()`` collapses symlinks on both sides; if resolution fails (e.g.
+    the dir no longer exists), fall back to a literal compare.
+    """
+    if not event_cwd:
+        return False
+    try:
+        return binding_cwd.resolve() == Path(event_cwd).resolve()
+    except OSError:
+        return str(binding_cwd) == event_cwd
+
+
 # Callback signatures the bootstrap wires up.
 SessionStartCb = Callable[["ChatBinding", "HookEvent"], None]
 StopCb = Callable[["ChatBinding", "HookEvent"], None]
@@ -84,50 +102,71 @@ class HookEventsDispatcher:
     # --------------------------------------------------------- session_start
 
     def _handle_session_start(self, event: HookEvent) -> None:
-        """Try to attribute the event's transcript_path to a waiting binding.
+        """Attribute the event's transcript_path to a waiting binding and lock
+        it early (before the poller's mtime heuristic would catch it)."""
+        binding = self._match_waiting_binding(event)
+        if binding is not None and self._on_session_start is not None:
+            self._on_session_start(binding, event)
 
-        Only matches a binding when *all* of these hold:
-          - the binding has no transcript_path locked yet (poller hasn't
-            picked one up either)
-          - the event's cwd matches the binding's cwd
+    def _match_waiting_binding(self, event: HookEvent) -> ChatBinding | None:
+        """Find the unique waiting binding an event's transcript belongs to.
+
+        Shared by SessionStart (early lock) and the Stop fallback (lazy lock).
+        Matches a binding only when *all* hold:
+          - it has no transcript_path locked yet (the poller hasn't picked one
+            up either)
+          - the event's cwd matches the binding's cwd (symlink-tolerant)
           - the event's transcript_path is *not* in
-            ``binding.excluded_transcripts`` (it's a freshly created file —
-            our Claude's)
-        Ambiguity (multiple matching bindings) is logged and skipped to
-        avoid binding to the wrong session.
+            ``binding.excluded_transcripts`` (so a concurrent desktop/other
+            Claude in the same cwd can't be mistaken for ours)
+        Ambiguity (multiple matching bindings) → None, to avoid binding to the
+        wrong session.
         """
+        if not event.transcript_path:
+            return None
         candidates = [
             b
             for b in self._registry.all()
             if b.transcript_path is None
-            and str(b.cwd) == event.cwd
+            and _same_dir(b.cwd, event.cwd)
             and Path(event.transcript_path) not in b.excluded_transcripts
         ]
         if not candidates:
-            return
+            return None
         if len(candidates) > 1:
             logger.info(
-                "SessionStart matched multiple bindings — skipping early lock",
-                extra={"cwd": event.cwd, "count": len(candidates)},
+                "hook event matched multiple waiting bindings — skipping",
+                extra={"event": event.event, "cwd": event.cwd, "count": len(candidates)},
             )
-            return
-        binding = candidates[0]
-        if self._on_session_start is not None:
-            self._on_session_start(binding, event)
+            return None
+        return candidates[0]
 
     # -------------------------------------------------------------- stop / fail
 
     def _handle_stop(self, event: HookEvent, *, failed: bool) -> None:
-        """Find the binding owning this transcript and fire the callback."""
+        """Find the binding owning this transcript and fire the callback.
+
+        Primary path: the transcript was already locked (by SessionStart or the
+        poller), so a direct transcript_path match works. Fallback: if no
+        binding has locked it yet, attribute via the same waiting-binding match
+        SessionStart uses and **lazily lock** using the path the Stop event
+        itself carries. Without this fallback a Stop that races ahead of the
+        lock (SessionStart missed/ambiguous, or poller hadn't ticked) is
+        dropped — and since a turn only leaves RUNNING via its Stop, the drop
+        now wedges the turn permanently (every later message is rejected).
+        """
         target = Path(event.transcript_path) if event.transcript_path else None
         if target is None:
             return
         binding = self._find_binding_by_transcript(target)
         if binding is None:
-            # Either the event belongs to a desktop/other Claude session
-            # (transcript_path in excluded_transcripts), or pocket-cc hasn't
-            # locked onto this transcript yet. Either way, nothing to do.
-            return
+            binding = self._match_waiting_binding(event)
+            if binding is None:
+                # Truly not ours (desktop/other Claude), or ambiguous → leave it.
+                return
+            # Lazily lock so this Stop — and any later events — attribute.
+            if self._on_session_start is not None:
+                self._on_session_start(binding, event)
         callback = self._on_stop_failure if failed else self._on_stop
         if callback is not None:
             callback(binding, event)
