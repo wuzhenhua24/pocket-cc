@@ -291,6 +291,39 @@ class TurnAccumulator:
             current_mode=self.current_mode,
         )
 
+    def snapshot_from(
+        self,
+        *,
+        text_start: int,
+        tool_start: int,
+        thinking_start: int,
+        state: CardState = "running",
+        error: str = "",
+        waiting_for: WaitingFor | None = None,
+    ) -> TurnSnapshot:
+        """Render a snapshot of parts[start:] for each list — the complement of
+        :meth:`snapshot_window`'s parts[committed:end].
+
+        Used by chunked rotation to compute the *continuation* card's content
+        (everything after the sealed window) **before** committing, so the new
+        card can be sent first and the commit deferred until that send succeeds.
+        After a matching ``commit_to(end)`` this equals
+        ``snapshot(from_committed=True)``.
+        """
+        text_parts = self._assistant_text_parts[text_start:]
+        tool_calls = self._tool_calls[tool_start:]
+        thinking_parts = self._thinking_parts[thinking_start:]
+        return TurnSnapshot(
+            user_prompt=self.user_prompt,
+            assistant_text="\n\n".join(p for p in text_parts if p),
+            tool_calls=list(tool_calls),
+            thinking="\n\n".join(p for p in thinking_parts if p),
+            state=state,
+            error=error,
+            waiting_for=waiting_for,
+            current_mode=self.current_mode,
+        )
+
     def find_fit_window(self, max_chars: int) -> tuple[int, int, int]:
         """Find the largest split such that snapshot_window renders ≤ max_chars.
 

@@ -574,18 +574,49 @@ class TurnController:
         # accumulator (see `find_fit_window` docstring).
         text_end, tool_end, thinking_end = turn.accumulator.find_fit_window(ROTATE_AT_CHARS)
 
-        sealing_snapshot = turn.accumulator.snapshot_window(
-            text_end=text_end,
-            tool_end=tool_end,
-            thinking_end=thinking_end,
-            state="running",
-        )
+        # Build both cards up front, *without* mutating any state. The sealing
+        # card is parts[committed:end]; the continuation card is parts[end:]
+        # (snapshot_from, so we don't need to commit first).
         sealing_card = render_card(
-            sealing_snapshot,
+            turn.accumulator.snapshot_window(
+                text_end=text_end,
+                tool_end=tool_end,
+                thinking_end=thinking_end,
+                state="running",
+            ),
             is_continuation=turn.is_continuation,
             ends_with_continuation_marker=True,
             show_thinking=self._config.show_thinking,
         )
+        new_card = render_card(
+            turn.accumulator.snapshot_from(
+                text_start=text_end,
+                tool_start=tool_end,
+                thinking_start=thinking_end,
+                state="running",
+            ),
+            is_continuation=True,
+            show_thinking=self._config.show_thinking,
+        )
+
+        # Send the continuation card FIRST — it's the only fallible external
+        # call, and ordering it ahead of the irreversible local mutations
+        # (closing the old stream, advancing the commit cursor) means a failed
+        # send leaves the turn fully intact: the old stream stays live and the
+        # tail stays uncommitted, so the next render just retries the rotation
+        # instead of orphaning the card.
+        try:
+            new_message_id = self._lark.send_card(binding.chat_id, new_card)
+        except LarkApiError:
+            logger.warning(
+                "rotation: failed to send continuation card — keeping current "
+                "card live, will retry on next render",
+                extra={"chat_id": binding.chat_id},
+                exc_info=True,
+            )
+            return
+
+        # Send succeeded → now commit the irreversible local steps.
         try:
             turn.card_stream.close(sealing_card)
         except Exception:
@@ -594,31 +625,14 @@ class TurnController:
                 extra={"chat_id": binding.chat_id},
                 exc_info=True,
             )
-
-        # Commit *only* what we just sealed. Any leftover uncommitted
-        # parts will show up on the next card (and trigger another
-        # rotation iteration in `_publish_card` if they're still too big).
+        # Commit *only* what we just sealed. Any leftover uncommitted parts show
+        # up on the next card (and trigger another rotation iteration if still
+        # too big).
         turn.accumulator.commit_to(
             text_end=text_end,
             tool_end=tool_end,
             thinking_end=thinking_end,
         )
-
-        # Open a fresh continuation card.
-        starter_snapshot = turn.accumulator.snapshot(state="running", from_committed=True)
-        new_card = render_card(
-            starter_snapshot, is_continuation=True, show_thinking=self._config.show_thinking
-        )
-        try:
-            new_message_id = self._lark.send_card(binding.chat_id, new_card)
-        except LarkApiError:
-            logger.exception(
-                "rotation: failed to send continuation card — turn is now orphaned",
-                extra={"chat_id": binding.chat_id},
-            )
-            # Leave the old (closed) card_stream in place. Subsequent
-            # updates will be no-ops; that's at least better than crashing.
-            return
 
         new_stream = CardStream(
             self._lark, new_message_id, interval_s=self._config.patch_interval_s

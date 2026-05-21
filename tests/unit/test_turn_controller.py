@@ -12,7 +12,8 @@ from typing import Any, cast
 
 from pocket_cc.app.config import Config
 from pocket_cc.app.persistence import ChatBinding, TurnState
-from pocket_cc.lark.client import FakeLarkClient
+from pocket_cc.claude.transcript import AssistantText
+from pocket_cc.lark.client import FakeLarkClient, LarkApiError
 from pocket_cc.relay.card_renderer import TurnAccumulator
 from pocket_cc.relay.card_stream import CardStream
 from pocket_cc.relay.turn_controller import TurnController, TurnPhase
@@ -177,6 +178,56 @@ def test_stale_stop_does_not_seal_the_superseding_turn(tmp_path: Path) -> None:
     # Stop(B) lands → pops gen_b == active → seals B.
     controller.seal_on_stop(state="done")
     assert binding.current_turn is None
+
+
+# ===================================================== rotation failure
+
+
+class _FlakyLark(FakeLarkClient):
+    """FakeLarkClient whose send_card can be made to fail on demand."""
+
+    fail_send: bool = False
+
+    def send_card(self, chat_id: str, card: dict[str, Any]) -> str:
+        if self.fail_send:
+            raise LarkApiError(500, "simulated send_card failure")
+        return super().send_card(chat_id, card)
+
+
+def test_rotation_send_failure_is_recoverable(tmp_path: Path) -> None:
+    """If the continuation card send fails mid-rotation, the turn must stay
+    intact (old stream live, tail uncommitted) so the next render retries —
+    instead of orphaning the card (old stream closed + cursor advanced)."""
+    binding = _binding(tmp_path)
+    lark = _FlakyLark()
+    controller = TurnController(binding=binding, lark=lark, config=_config(tmp_path))
+    controller.open_turn("hi")  # initial card sent + stream started
+    turn = binding.current_turn
+    assert turn is not None
+    # Oversized body so the next render triggers rotation.
+    turn.accumulator.ingest(AssistantText(uuid="a", timestamp="t", text="A" * 5000))
+    old_stream = turn.card_stream
+    old_msg_id = turn.card_message_id
+
+    lark.fail_send = True
+    controller.ingest_events([])  # render → rotation → continuation send fails
+
+    # Fully intact: stream not swapped, old stream still live, nothing committed.
+    assert binding.current_turn is turn
+    assert turn.card_stream is old_stream
+    assert not old_stream._closed.is_set()
+    assert turn.card_message_id == old_msg_id
+    # Nothing committed → the from-committed view still holds the whole body.
+    assert (
+        turn.accumulator.snapshot(state="running", from_committed=True).assistant_text.count("A")
+        == 5000
+    )
+
+    # Recovery: once the send works, the next render rotates successfully.
+    lark.fail_send = False
+    controller.ingest_events([])
+    assert turn.card_message_id != old_msg_id
+    assert old_stream._closed.is_set()
 
 
 # ===================================================== cancel_active_turn
