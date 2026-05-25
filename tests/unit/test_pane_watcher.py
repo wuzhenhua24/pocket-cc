@@ -156,7 +156,7 @@ def test_build_waiting_for_maps_numbered_options_to_text_response() -> None:
         ),
         fingerprint="fp-xyz",
     )
-    waiting = _build_waiting_for(p)
+    waiting = _build_waiting_for(p, _make_binding_with_turn())
     assert isinstance(waiting, WaitingFor)
     assert waiting.source == "permission"
     assert waiting.fingerprint == "fp-xyz"
@@ -167,6 +167,93 @@ def test_build_waiting_for_maps_numbered_options_to_text_response() -> None:
         assert isinstance(opt, WaitingOption)
         assert isinstance(opt.response, TextResponse)
         assert opt.response.text == str(i)
+
+
+def _make_binding_with_ask_user(
+    questions: Any, chat_id: str = "oc_ask"
+) -> ChatBinding:
+    """Binding whose accumulator carries _latest_ask_user_questions.
+
+    Uses a real TurnAccumulator so the relay code path that reads the
+    private field actually returns the wired tuple (vs _FakeAny which
+    proxies everything as itself)."""
+    from pocket_cc.relay.card_renderer import TurnAccumulator
+
+    binding = ChatBinding(
+        chat_id=chat_id,
+        window=cast("WindowInfo", _StubWindow()),
+        cwd=Path("/tmp"),
+    )
+    acc = TurnAccumulator()
+    acc._latest_ask_user_questions = questions
+    binding.current_turn = TurnState(
+        card_message_id="om_x",
+        card_stream=cast("Any", _FakeAny()),
+        accumulator=acc,
+    )
+    return binding
+
+
+def test_build_waiting_for_ask_user_pulls_questions_from_accumulator() -> None:
+    """For ask_user_question kind, the labels + descriptions come from
+    transcript (via accumulator), NOT from the sparse pane prompt."""
+    from pocket_cc.claude.pane_inspector import ParsedPrompt
+    from pocket_cc.relay.card_renderer import AskUserOption, AskUserQuestion
+
+    q1 = AskUserQuestion(
+        question="日志主要来自哪里？",
+        header="日志来源",
+        options=(
+            AskUserOption(label="本地/服务器文件", description="用 Read/Grep 直接读"),
+            AskUserOption(label="ELK / OpenSearch", description="通过 Elasticsearch API 查询"),
+            AskUserOption(label="云日志服务", description="如 SLS / CloudWatch"),
+        ),
+        multi_select=True,
+    )
+    p = ParsedPrompt(
+        kind="ask_user_question",
+        question="",  # sparse
+        context="",
+        options=(),  # sparse
+        fingerprint="fp-pane-hash",
+    )
+    binding = _make_binding_with_ask_user((q1,))
+
+    waiting = _build_waiting_for(p, binding)
+
+    assert waiting.source == "ask_user_question"
+    assert waiting.fingerprint == "fp-pane-hash"
+    assert "日志主要来自哪里" in waiting.question
+    # Options come from accumulator: 3 transcript options, each with the
+    # description preserved and digit-N response.
+    assert len(waiting.options) == 3
+    assert waiting.options[0].label == "本地/服务器文件"
+    assert waiting.options[0].description == "用 Read/Grep 直接读"
+    assert isinstance(waiting.options[0].response, TextResponse)
+    assert waiting.options[0].response.text == "1"
+    assert waiting.options[2].response.text == "3"  # type: ignore[union-attr]
+
+
+def test_build_waiting_for_ask_user_placeholder_when_transcript_lags() -> None:
+    """If the pane sees the AskUserQuestion widget before the transcript
+    poller ingests the tool_use, _build_waiting_for must not crash — it
+    returns a placeholder WaitingFor so the next tick can refresh."""
+    from pocket_cc.claude.pane_inspector import ParsedPrompt
+
+    p = ParsedPrompt(
+        kind="ask_user_question",
+        question="",
+        context="",
+        options=(),
+        fingerprint="fp-pane",
+    )
+    binding = _make_binding_with_ask_user(())  # empty — transcript not in yet
+
+    waiting = _build_waiting_for(p, binding)
+
+    assert waiting.source == "ask_user_question"
+    assert waiting.options == ()
+    assert "加载" in waiting.question  # placeholder hint visible to user
 
 
 def test_build_waiting_for_routes_plan_kind_to_plan_source() -> None:
@@ -191,7 +278,7 @@ def test_build_waiting_for_routes_plan_kind_to_plan_source() -> None:
         ),
         fingerprint="fp-plan",
     )
-    waiting = _build_waiting_for(p)
+    waiting = _build_waiting_for(p, _make_binding_with_turn())
     assert waiting.source == "plan"
     assert len(waiting.options) == 4
     # Labels passed through verbatim — no translation, no truncation here.

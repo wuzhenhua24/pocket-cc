@@ -29,6 +29,7 @@ from pocket_cc.tmux import TmuxError
 
 if TYPE_CHECKING:
     from pocket_cc.app.persistence import ChatBinding, Registry
+    from pocket_cc.relay.card_renderer import AskUserQuestion
     from pocket_cc.relay.turn_controller import TurnController
     from pocket_cc.tmux import TmuxManager
 
@@ -103,7 +104,7 @@ class PaneWatcher:
             return
 
         prompt = inspect_pane(pane)
-        new_waiting = _build_waiting_for(prompt) if prompt is not None else None
+        new_waiting = _build_waiting_for(prompt, binding) if prompt is not None else None
         # Permission mode is read from the same capture. detect_mode returns
         # None when no banner is shown — the controller *ignores* None rather
         # than forcing "default", so a transient capture miss (or a mode banner
@@ -120,20 +121,25 @@ class PaneWatcher:
             )
 
 
-def _build_waiting_for(prompt: ParsedPrompt) -> WaitingFor:
+def _build_waiting_for(prompt: ParsedPrompt, binding: ChatBinding) -> WaitingFor:
     """Convert a :class:`ParsedPrompt` into the relay-side waiting model.
 
     Each numbered option becomes a WaitingOption whose response is the
     number digit (Claude TUI accepts `1` / `2` as shortcuts — empirically
-    verified for permission, plan, and any future numbered-list prompt).
+    verified for permission, plan, and AskUserQuestion).
     Cursor ``selected`` is NOT propagated: pocket-cc users see the same
     option list regardless of where Claude's TUI cursor sits.
 
-    Option labels are passed through verbatim. For plan-mode that means the
-    full original English ("Yes, auto-accept edits", etc.) — the card
-    renderer truncates per-button if needed, and Lark's button limit caps
-    how many fit; remaining options stay listed in the body.
+    AskUserQuestion is special-cased: pane_inspector returns a sparse
+    ParsedPrompt (just enough to fingerprint), and this function pulls the
+    real options + question text from the binding's accumulator
+    (transcript-sourced, with descriptions). If the accumulator hasn't
+    ingested the AskUserQuestion tool_use yet (transcript poll lagging the
+    pane), we fall back to a placeholder waiting state — the next tick
+    re-renders with real data.
     """
+    if prompt.kind == "ask_user_question":
+        return _build_ask_user_waiting(prompt, binding)
     options = tuple(
         WaitingOption(
             label=o.label,
@@ -145,6 +151,46 @@ def _build_waiting_for(prompt: ParsedPrompt) -> WaitingFor:
     return WaitingFor(
         source=prompt.kind,
         question=question,
+        options=options,
+        fingerprint=prompt.fingerprint,
+    )
+
+
+def _build_ask_user_waiting(prompt: ParsedPrompt, binding: ChatBinding) -> WaitingFor:
+    """Build a WaitingFor for an AskUserQuestion widget.
+
+    Pulls Q1's options from the accumulator (transcript-sourced, with
+    descriptions). Buttons act on Q1 only; the card body lists the full
+    question(s) so the user knows what they're answering and whether more
+    questions remain. The fingerprint stays the pane-derived one so multi-
+    question flow naturally re-renders when Claude advances.
+    """
+    questions: tuple[AskUserQuestion, ...] = ()
+    turn = binding.current_turn
+    if turn is not None:
+        questions = turn.accumulator._latest_ask_user_questions
+    if not questions:
+        # Transcript hasn't caught up yet — show a placeholder. The next
+        # tick (after transcript poll ingests the tool_use) will replace
+        # this with the real content.
+        return WaitingFor(
+            source="ask_user_question",
+            question="Claude 在向你提问，正在加载选项…",
+            options=(),
+            fingerprint=prompt.fingerprint,
+        )
+    q1 = questions[0]
+    options = tuple(
+        WaitingOption(
+            label=opt.label,
+            description=opt.description,
+            response=TextResponse(text=str(i + 1)),
+        )
+        for i, opt in enumerate(q1.options)
+    )
+    return WaitingFor(
+        source="ask_user_question",
+        question=q1.question,
         options=options,
         fingerprint=prompt.fingerprint,
     )

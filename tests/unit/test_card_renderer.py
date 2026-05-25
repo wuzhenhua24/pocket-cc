@@ -216,6 +216,179 @@ def test_render_waiting_card_permission_source_does_not_inject_plan() -> None:
     assert "stale plan from earlier" not in body
 
 
+def test_accumulator_captures_ask_user_question_payload() -> None:
+    """AskUserQuestion tool_use → structured AskUserQuestion list on accumulator."""
+    acc = TurnAccumulator()
+    acc.ingest(
+        ToolUse(
+            uuid="a1",
+            timestamp="t",
+            tool_use_id="t-ask-1",
+            tool_name="AskUserQuestion",
+            tool_input={
+                "questions": [
+                    {
+                        "question": "日志来自哪里？",
+                        "header": "日志来源",
+                        "multiSelect": True,
+                        "options": [
+                            {"label": "本地文件", "description": "用 Read/Grep"},
+                            {"label": "ELK", "description": "走 Elasticsearch API"},
+                        ],
+                    },
+                    {
+                        "question": "运行形态？",
+                        "header": "运行形态",
+                        "multiSelect": False,
+                        "options": [{"label": "CI 一次性"}, {"label": "交互式"}],
+                    },
+                ]
+            },
+        )
+    )
+    snap = acc.snapshot()
+    qs = snap.latest_ask_user_questions
+    assert len(qs) == 2
+    assert qs[0].header == "日志来源"
+    assert qs[0].multi_select is True
+    assert qs[0].options[0].label == "本地文件"
+    assert qs[0].options[0].description == "用 Read/Grep"
+    assert qs[1].multi_select is False
+    # Optional `description` defaults to "" when absent.
+    assert qs[1].options[0].description == ""
+    # Tool-call one-liner shows up in the tool_calls list too.
+    assert any("AskUserQuestion" in t for t in snap.tool_calls)
+
+
+def test_accumulator_ask_user_questions_empty_for_malformed_payload() -> None:
+    acc = TurnAccumulator()
+    # No `questions` key at all.
+    acc.ingest(
+        ToolUse(
+            uuid="a1",
+            timestamp="t",
+            tool_use_id="t-x",
+            tool_name="AskUserQuestion",
+            tool_input={},
+        )
+    )
+    assert acc.snapshot().latest_ask_user_questions == ()
+
+
+def test_format_tool_call_ask_user_question_has_dedicated_label() -> None:
+    s = format_tool_call("AskUserQuestion", {"questions": []})
+    assert "AskUserQuestion" in s
+    assert "❓" in s
+
+
+def test_render_waiting_card_ask_user_shows_question_header_and_options() -> None:
+    """The ask_user waiting card body must include the question header,
+    question text, all option labels + descriptions, and the multi-select
+    hint when applicable."""
+    from pocket_cc.relay.card_renderer import AskUserOption, AskUserQuestion
+    from pocket_cc.relay.waiting import TextResponse, WaitingFor, WaitingOption
+
+    acc = TurnAccumulator()
+    # Inject the structured questions directly (mimics what _parse_…
+    # produced from a real transcript).
+    acc._latest_ask_user_questions = (
+        AskUserQuestion(
+            question="日志主要来自哪里？",
+            header="日志来源",
+            options=(
+                AskUserOption(label="本地文件", description="用 Read/Grep 直接读"),
+                AskUserOption(label="ELK", description="通过 Elasticsearch API"),
+            ),
+            multi_select=True,
+        ),
+    )
+    waiting = WaitingFor(
+        source="ask_user_question",
+        question="日志主要来自哪里？",
+        options=(
+            WaitingOption(label="本地文件", description="用 Read/Grep 直接读",
+                          response=TextResponse(text="1")),
+            WaitingOption(label="ELK", description="通过 Elasticsearch API",
+                          response=TextResponse(text="2")),
+        ),
+        fingerprint="fp",
+    )
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    assert "日志来源" in body  # header
+    assert "日志主要来自哪里" in body  # question text
+    assert "多选" in body  # multi-select hint
+    assert "本地文件" in body and "用 Read/Grep 直接读" in body
+    assert "ELK" in body and "通过 Elasticsearch API" in body
+
+
+def test_render_waiting_card_ask_user_surfaces_remaining_questions_hint() -> None:
+    """When there are multiple questions, the body must tell the user how
+    many more remain (so they know the buttons only act on Q1)."""
+    from pocket_cc.relay.card_renderer import AskUserOption, AskUserQuestion
+    from pocket_cc.relay.waiting import TextResponse, WaitingFor, WaitingOption
+
+    acc = TurnAccumulator()
+    acc._latest_ask_user_questions = (
+        AskUserQuestion(
+            question="Q1?",
+            header="日志来源",
+            options=(AskUserOption(label="A"), AskUserOption(label="B")),
+        ),
+        AskUserQuestion(question="Q2?", header="运行形态", options=()),
+        AskUserQuestion(question="Q3?", header="分析目标", options=()),
+    )
+    waiting = WaitingFor(
+        source="ask_user_question",
+        question="Q1?",
+        options=(WaitingOption(label="A", response=TextResponse(text="1")),),
+        fingerprint="fp",
+    )
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    assert "还问了 2 个问题" in body
+    assert "运行形态" in body
+    assert "分析目标" in body
+
+
+def test_render_waiting_card_ask_user_single_question_no_remaining_hint() -> None:
+    """One question → no "还有 N 题" line (would be misleading)."""
+    from pocket_cc.relay.card_renderer import AskUserOption, AskUserQuestion
+    from pocket_cc.relay.waiting import TextResponse, WaitingFor, WaitingOption
+
+    acc = TurnAccumulator()
+    acc._latest_ask_user_questions = (
+        AskUserQuestion(
+            question="only one?",
+            header="only",
+            options=(AskUserOption(label="A"),),
+        ),
+    )
+    waiting = WaitingFor(
+        source="ask_user_question",
+        question="only one?",
+        options=(WaitingOption(label="A", response=TextResponse(text="1")),),
+        fingerprint="fp",
+    )
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    assert "还问了" not in body
+
+
+def test_render_waiting_card_ask_user_placeholder_when_accumulator_empty() -> None:
+    """If pane saw the widget but transcript hasn't ingested the tool_use yet,
+    we render a graceful "loading" message rather than crashing."""
+    from pocket_cc.relay.waiting import WaitingFor
+
+    acc = TurnAccumulator()
+    waiting = WaitingFor(
+        source="ask_user_question",
+        question="Claude 在向你提问，正在加载选项…",
+        options=(),
+        fingerprint="fp",
+    )
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    # Doesn't crash; the placeholder question text appears.
+    assert "Claude" in body
+
+
 def test_render_waiting_card_plan_source_empty_plan_gracefully_omits_section() -> None:
     """Defensive: if somehow the waiting state flips to "plan" without a
     plan body in the accumulator (e.g. transcript lag), don't crash and

@@ -392,7 +392,7 @@ pocket-cc/
 - [ ] **验收**：手机发"实现 xxx 功能" → 看到 Claude 工作流式刷一张卡片；中途发 `/clear` 也能正常透传
 
 ### M2 — 交互式 UX (3-5 天)
-- [ ] AskUserQuestion 渲染（选项按钮 → 翻译成方向键+Enter）
+- [x] AskUserQuestion 渲染（pane footer 检测 + transcript 拉结构化 questions/options + Q1 按钮发数字）
 - [x] ExitPlanMode 渲染（pane 检测 + 4 选项按钮 + plan markdown 渲染进卡片 body）
 - [x] Permission prompt 渲染（allow / deny / always）（pane_inspector 检测 + waiting 卡 + 1/2/3 按钮）
 - [x] 完成态 / 失败态卡片收尾（Stop/StopFailure hook → seal_on_stop → done/failed 终态卡 + 重试 + 兜底通知）

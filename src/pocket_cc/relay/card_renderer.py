@@ -96,6 +96,29 @@ def mode_label(mode: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class AskUserOption:
+    """One option in an AskUserQuestion question — label + free-form description.
+
+    Sourced from the transcript's ``AskUserQuestion`` tool_use input (much
+    cleaner than scraping the pane's `[ ]` checkbox rendering)."""
+
+    label: str
+    description: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AskUserQuestion:
+    """One question in an AskUserQuestion call. A single tool_use may carry
+    multiple questions — we render Q1 with buttons and surface "还有 N 题"
+    in the body so the user knows the rest must be answered in the terminal."""
+
+    question: str
+    header: str
+    options: tuple[AskUserOption, ...]
+    multi_select: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class TurnSnapshot:
     """Render-ready summary of a turn. Pure data, no Lark concepts.
 
@@ -122,6 +145,10 @@ class TurnSnapshot:
     # buttons (the pane-side detector intentionally doesn't extract it, since
     # long plans overflow the captured pane viewport).
     latest_plan: str = ""
+    # Most recent AskUserQuestion tool_use payload (one tool_use may contain
+    # several questions — the whole list is retained so the waiting card can
+    # show "还有 N 题待答" when N > 1).
+    latest_ask_user_questions: tuple[AskUserQuestion, ...] = ()
 
 
 @dataclass
@@ -158,6 +185,10 @@ class TurnAccumulator:
     # so the waiting card can render the proposal inline above the option
     # buttons. Overwritten on each ExitPlanMode (Claude may refine and re-emit).
     _latest_plan: str = ""
+    # Latest AskUserQuestion payload parsed from a tool_use. Tuple keeps
+    # multiple questions for the body to display; pane_watcher pulls Q1's
+    # options for buttons. Overwritten on each AskUserQuestion call.
+    _latest_ask_user_questions: tuple[AskUserQuestion, ...] = ()
 
     def ingest(self, event: Event) -> None:
         """Fold a single Event into the running snapshot.
@@ -192,6 +223,8 @@ class TurnAccumulator:
                 plan_text = event.tool_input.get("plan")
                 if isinstance(plan_text, str):
                     self._latest_plan = plan_text
+            elif event.tool_name == "AskUserQuestion":
+                self._latest_ask_user_questions = _parse_ask_user_questions(event.tool_input)
             return
         if isinstance(event, AssistantThinking):
             self._thinking_parts.append(event.text)
@@ -277,6 +310,7 @@ class TurnAccumulator:
             waiting_for=waiting_for,
             current_mode=self.current_mode,
             latest_plan=self._latest_plan,
+            latest_ask_user_questions=self._latest_ask_user_questions,
         )
 
     def snapshot_window(
@@ -308,6 +342,7 @@ class TurnAccumulator:
             waiting_for=waiting_for,
             current_mode=self.current_mode,
             latest_plan=self._latest_plan,
+            latest_ask_user_questions=self._latest_ask_user_questions,
         )
 
     def snapshot_from(
@@ -342,6 +377,7 @@ class TurnAccumulator:
             waiting_for=waiting_for,
             current_mode=self.current_mode,
             latest_plan=self._latest_plan,
+            latest_ask_user_questions=self._latest_ask_user_questions,
         )
 
     def find_fit_window(self, max_chars: int) -> tuple[int, int, int]:
@@ -519,7 +555,52 @@ def format_tool_call(name: str, input_data: dict[str, Any]) -> str:
         # `_render_waiting_body`); this one-liner just marks that the call
         # happened so the tool-call counter stays consistent.
         return "📋 **ExitPlanMode** 等待用户确认方案"
+    if name == "AskUserQuestion":
+        # Structured questions are rendered separately in the waiting card
+        # (see `_render_waiting_body`); one-liner keeps the counter honest.
+        return "❓ **AskUserQuestion** 等待用户回答"
     return f"🔧 **{name}**"
+
+
+def _parse_ask_user_questions(
+    tool_input: dict[str, Any],
+) -> tuple[AskUserQuestion, ...]:
+    """Convert an ``AskUserQuestion`` tool_use input into structured questions.
+
+    Defensive throughout: malformed transcripts (missing keys, wrong types)
+    yield empty tuples or empty options rather than raising — the waiting
+    card just degrades to "Claude is asking you something" instead of
+    breaking the whole turn render.
+    """
+    raw_questions = tool_input.get("questions")
+    if not isinstance(raw_questions, list):
+        return ()
+    parsed: list[AskUserQuestion] = []
+    for raw in raw_questions:
+        if not isinstance(raw, dict):
+            continue
+        raw_options = raw.get("options")
+        options: list[AskUserOption] = []
+        if isinstance(raw_options, list):
+            for opt in raw_options:
+                if not isinstance(opt, dict):
+                    continue
+                label = opt.get("label")
+                if not isinstance(label, str):
+                    continue
+                description = opt.get("description", "")
+                if not isinstance(description, str):
+                    description = ""
+                options.append(AskUserOption(label=label, description=description))
+        parsed.append(
+            AskUserQuestion(
+                question=str(raw.get("question", "")),
+                header=str(raw.get("header", "")),
+                options=tuple(options),
+                multi_select=bool(raw.get("multiSelect", False)),
+            )
+        )
+    return tuple(parsed)
 
 
 # -------------------------------------------------------------------- helpers
@@ -527,7 +608,12 @@ def format_tool_call(name: str, input_data: dict[str, Any]) -> str:
 
 def _render_waiting_body(snapshot: TurnSnapshot, waiting: WaitingFor) -> str:
     sections: list[str] = []
-    if waiting.question:
+    # AskUserQuestion gets a richer section header that includes the question
+    # number / header and a multi-select hint (the buttons can only pick one
+    # option per tap, so multi-select questions need a terminal fallback).
+    if waiting.source == "ask_user_question":
+        sections.append(_render_ask_user_question_header(snapshot, waiting))
+    elif waiting.question:
         sections.append(f"**{waiting.question}**")
     # Plan-source waiting: surface the proposed plan inline so the user can
     # actually read what they're approving. Sits above the option list since
@@ -544,6 +630,20 @@ def _render_waiting_body(snapshot: TurnSnapshot, waiting: WaitingFor) -> str:
                 line += f" — {opt.description}"
             bullets.append(line)
         sections.append("\n".join(bullets))
+    # AskUserQuestion may carry multiple questions per tool_use; we only show
+    # buttons for Q1 because the buttons send a single keystroke. Tell the
+    # user how many more questions remain so they know to follow up.
+    if waiting.source == "ask_user_question":
+        remaining = max(0, len(snapshot.latest_ask_user_questions) - 1)
+        if remaining > 0:
+            other_headers = [
+                q.header or f"Q{i + 2}"
+                for i, q in enumerate(snapshot.latest_ask_user_questions[1:])
+            ]
+            sections.append(
+                f"_Claude 还问了 {remaining} 个问题（{' / '.join(other_headers)}），"
+                f"请在终端继续完成或用文字回复。_"
+            )
     # Show recent assistant text if any (gives context for what Claude was
     # doing when the prompt fired).
     if snapshot.assistant_text:
@@ -552,6 +652,24 @@ def _render_waiting_body(snapshot: TurnSnapshot, waiting: WaitingFor) -> str:
     if len(body) > _BODY_MAX_CHARS:
         body = "…(已截断早期内容)…\n\n" + body[-(_BODY_MAX_CHARS - 30) :]
     return body
+
+
+def _render_ask_user_question_header(snapshot: TurnSnapshot, waiting: WaitingFor) -> str:
+    """Header line(s) for an AskUserQuestion waiting card.
+
+    Uses the snapshot's structured questions list (richer than waiting.question
+    alone) to render: "❓ Q1 [<header>] (多选): <question>". Falls back to
+    just the waiting.question text when accumulator data isn't ready.
+    """
+    if not snapshot.latest_ask_user_questions:
+        return f"**❓ {waiting.question}**" if waiting.question else "**❓ Claude 在向你提问**"
+    q1 = snapshot.latest_ask_user_questions[0]
+    label = q1.header or "Q1"
+    multi = "（多选 · 飞书一次选一项，多选请去终端）" if q1.multi_select else ""
+    head = f"**❓ {label}**{multi}"
+    if q1.question:
+        head = f"{head}\n\n{q1.question}"
+    return head
 
 
 def _render_waiting_actions(waiting: WaitingFor) -> list[CardButton]:
