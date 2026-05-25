@@ -189,6 +189,124 @@ def test_parsed_dataclasses_are_frozen() -> None:
     assert dataclasses.is_dataclass(ParsedOption)
 
 
+# ============================================================ plan-mode
+
+# A realistic capture of the ExitPlanMode confirmation, taken from a live
+# Claude Code session running with `--permission-mode plan`. The plan body
+# above (which would be hundreds of lines) is deliberately abbreviated here
+# — pane_inspector does NOT extract plan context (see module docstring), so
+# the test fixture only needs the prompt block itself for assertions.
+_REAL_PLAN_PROMPT = textwrap.dedent(
+    """\
+    ────────────────────────────────────────────────────────────
+     Ready to code?
+
+     Here is Claude's plan:
+    ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+     用 claude-agent-sdk-python 搭建微服务日志分析机器人
+
+     ...（plan 主体，可能很长）...
+    ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
+    ────────────────────────────────────────────────────────────
+     Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+     ❯ 1. Yes, auto-accept edits
+       2. Yes, manually approve edits
+       3. No, refine with Ultraplan on Claude Code on the web
+       4. Tell Claude what to change
+          shift+tab to approve with this feedback
+
+     ctrl-g to edit in  VS Code  · ~/.claude/plans/sdk-harmonic-flame.md
+    """
+)
+
+
+def test_real_world_plan_prompt_detected() -> None:
+    parsed = inspect_pane(_REAL_PLAN_PROMPT)
+    assert parsed is not None
+    assert parsed.kind == "plan"
+    assert parsed.question.startswith("Claude has written up a plan")
+    assert parsed.question.endswith("Would you like to proceed?")
+
+
+def test_plan_prompt_extracts_all_four_options() -> None:
+    parsed = inspect_pane(_REAL_PLAN_PROMPT)
+    assert parsed is not None
+    assert [o.number for o in parsed.options] == [1, 2, 3, 4]
+    assert parsed.options[0].label == "Yes, auto-accept edits"
+    assert parsed.options[1].label == "Yes, manually approve edits"
+    assert parsed.options[2].label == "No, refine with Ultraplan on Claude Code on the web"
+    assert parsed.options[3].label == "Tell Claude what to change"
+    # The `shift+tab to approve…` continuation line under option 4 is NOT
+    # captured — it doesn't match the numbered-option pattern, so
+    # `_extract_options` terminates there. Losing that hint is acceptable
+    # (it's not actionable from Lark anyway).
+
+
+def test_plan_prompt_cursor_on_first_option() -> None:
+    parsed = inspect_pane(_REAL_PLAN_PROMPT)
+    assert parsed is not None
+    assert parsed.options[0].selected is True
+    assert all(not o.selected for o in parsed.options[1:])
+
+
+def test_plan_prompt_context_is_empty() -> None:
+    """pane_inspector intentionally skips plan-body extraction (see module
+    docstring). The card renderer will pull the full plan from the
+    transcript's ExitPlanMode tool_use payload instead."""
+    parsed = inspect_pane(_REAL_PLAN_PROMPT)
+    assert parsed is not None
+    assert parsed.context == ""
+
+
+def test_plan_prompt_without_options_returns_none() -> None:
+    """Defensive: a stray plan-question line without numbered options must
+    not be treated as an active prompt."""
+    pane = textwrap.dedent(
+        """\
+        Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+        $ next prompt
+        """
+    )
+    assert inspect_pane(pane) is None
+
+
+def test_plan_and_permission_distinguished_by_question_wording() -> None:
+    """The two prompts must not collide — `Do you want to proceed?` is
+    permission, `Would you like to proceed?` (with the plan preamble) is plan."""
+    permission = inspect_pane(_REAL_PROMPT)
+    plan = inspect_pane(_REAL_PLAN_PROMPT)
+    assert permission is not None and plan is not None
+    assert permission.kind == "permission"
+    assert plan.kind == "plan"
+
+
+def test_plan_after_permission_in_same_capture_picks_latest() -> None:
+    """Bottom-up scan returns the most recent prompt regardless of kind."""
+    pane = _REAL_PROMPT + "\n" + _REAL_PLAN_PROMPT
+    parsed = inspect_pane(pane)
+    assert parsed is not None
+    assert parsed.kind == "plan"
+
+
+def test_permission_after_plan_in_same_capture_picks_latest() -> None:
+    pane = _REAL_PLAN_PROMPT + "\n" + _REAL_PROMPT
+    parsed = inspect_pane(pane)
+    assert parsed is not None
+    assert parsed.kind == "permission"
+
+
+def test_plan_fingerprint_stable_across_cursor_moves() -> None:
+    a = inspect_pane(_REAL_PLAN_PROMPT)
+    moved = _REAL_PLAN_PROMPT.replace("❯ 1. Yes, auto-accept edits", "  1. Yes, auto-accept edits")
+    moved = moved.replace("  2. Yes, manually", "❯ 2. Yes, manually")
+    b = inspect_pane(moved)
+    assert a is not None and b is not None
+    assert a.fingerprint == b.fingerprint
+
+
 # ============================================================== detect_mode
 
 

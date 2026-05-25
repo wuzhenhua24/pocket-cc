@@ -1,14 +1,13 @@
 """Parse Claude Code TUI pane text to detect interactive prompts.
 
-The Permission prompt (and AskUserQuestion / ExitPlanMode in M2-A/B) does
-**not** appear in the JSONL transcript — it's a TUI dialog rendered straight
-to the terminal. To project it into a Lark card we have to peek at the tmux
-pane and recognize it ourselves.
+The Permission prompt and the ExitPlanMode confirmation do **not** appear in
+the JSONL transcript — they're TUI dialogs rendered straight to the terminal.
+To project them into a Lark card we peek at the tmux pane and recognize them
+ourselves.
 
 `tmux capture-pane -p` strips ANSI by default (no `-e`), so the input is
-already plain text and we can match on it with regex. If we later need
-cursor state (which option is highlighted by `❯`) we'll layer pyte on top;
-M2-C uses the `❯` glyph directly since it's preserved in plain capture.
+already plain text and we can match on it with regex. The `❯` cursor glyph
+is preserved in plain capture, so we use it directly without pyte.
 
 Single public entry point: :func:`inspect_pane`. Returns None when the pane
 doesn't look like a known prompt — never raises. Detection is conservative
@@ -18,10 +17,14 @@ Currently detects:
   - **Permission prompt** — "Do you want to proceed?" followed by a numbered
     option list, ended by an "Esc to cancel" footer. Triggered when Claude
     is about to run a Bash/Edit/Write call that needs user approval.
+  - **ExitPlanMode confirmation** — "Claude has written up a plan and is
+    ready to execute. Would you like to proceed?" followed by 4 numbered
+    options (auto-accept / manual / refine / tell-what-to-change). Plan
+    body itself is NOT extracted here — it can easily exceed the captured
+    pane viewport; callers get it from the transcript ExitPlanMode tool_use.
 
-Not yet detected (future M2-A/B work using this same module):
+Not yet detected:
   - AskUserQuestion menus (multi-question, richer options)
-  - ExitPlanMode confirmation
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ import re
 from dataclasses import dataclass
 from typing import Final, Literal
 
-PromptKind = Literal["permission"]
+PromptKind = Literal["permission", "plan"]
 
 # --- Permission-mode (Shift-Tab) detection -------------------------------
 # Claude Code's bottom chrome shows the active permission mode on its own
@@ -60,21 +63,44 @@ _MODE_SCAN_LINES: Final[int] = 20
 # the visible question text — Claude emits it on its own line.
 _PERMISSION_QUESTION_RE: Final[re.Pattern[str]] = re.compile(r"^\s*Do you want to proceed\?\s*$")
 
+# Core sentinel for the ExitPlanMode confirmation. Wording is more specific
+# than the permission prompt's so we can distinguish them with a single
+# bottom-up scan that tries both.
+_PLAN_QUESTION_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\s*Claude has written up a plan and is ready to execute\.\s*"
+    r"Would you like to proceed\?\s*$"
+)
+
+# Question patterns checked in order during the bottom-up scan. First hit
+# wins — both have unique wording so order isn't load-bearing, but listing
+# the more frequent prompt first is a micro-optimization.
+_QUESTION_PATTERNS: Final[tuple[tuple[PromptKind, re.Pattern[str]], ...]] = (
+    ("permission", _PERMISSION_QUESTION_RE),
+    ("plan", _PLAN_QUESTION_RE),
+)
+
 # Numbered option: optional `❯` cursor marker, integer, ". ", label.
 # The marker shows which option is currently highlighted (Claude's default
 # is option 1). Label may contain spaces but no newlines.
 _OPTION_RE: Final[re.Pattern[str]] = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.+?)\s*$")
 
-# Footer that bounds the option list from below.
+# Footer that bounds the option list from below. The permission prompt uses
+# "Esc to cancel" / "Tab to amend"; the plan prompt's footer is different
+# (`ctrl-g to edit in VS Code · ~/.claude/plans/...`) but `_extract_options`
+# already terminates on the first non-option line after seeing an option,
+# so missing a footer hint there is harmless.
 _FOOTER_HINT_RE: Final[re.Pattern[str]] = re.compile(r"Esc to cancel|Tab to amend")
 
 # How many lines above the question to look for context (the command being
-# asked about + any rationale lines).
+# asked about + any rationale lines). Only used by the permission prompt —
+# plan prompts skip context extraction entirely since plan bodies routinely
+# exceed the pane viewport and are recovered from the transcript instead.
 _CONTEXT_LOOKBACK_LINES: Final[int] = 12
 
 # Cap options so a malformed pane (e.g. "999. ..." far below) can't cause
-# unbounded scanning.
-_OPTIONS_LOOKAHEAD_LINES: Final[int] = 12
+# unbounded scanning. Bumped to 16 to accommodate plan-mode's 4 options plus
+# their occasional continuation lines (e.g. "shift+tab to approve…").
+_OPTIONS_LOOKAHEAD_LINES: Final[int] = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +129,7 @@ def inspect_pane(pane_text: str) -> ParsedPrompt | None:
     Only the *latest* prompt is returned — earlier ones (scrolled up but
     still visible in the capture) are ignored, because the user can only
     interact with the bottom-most one. We do this by scanning from the
-    bottom upward for the question sentinel.
+    bottom upward for any known question sentinel; the first hit wins.
     """
     if not pane_text:
         return None
@@ -112,28 +138,37 @@ def inspect_pane(pane_text: str) -> ParsedPrompt | None:
     if not lines:
         return None
 
-    # Find the latest occurrence of the permission question.
+    # Bottom-up scan for any registered prompt kind. Stop at the first hit so
+    # only the latest prompt is acted on.
     question_idx: int | None = None
+    question_kind: PromptKind | None = None
     for i in range(len(lines) - 1, -1, -1):
-        if _PERMISSION_QUESTION_RE.match(lines[i]):
-            question_idx = i
+        for kind, pattern in _QUESTION_PATTERNS:
+            if pattern.match(lines[i]):
+                question_idx = i
+                question_kind = kind
+                break
+        if question_idx is not None:
             break
-    if question_idx is None:
+    if question_idx is None or question_kind is None:
         return None
 
     options = _extract_options(lines, start=question_idx + 1)
     if not options:
-        # A "Do you want to proceed?" without options is suspicious —
-        # likely a stale render. Refuse to treat it as an active prompt.
+        # A question line without options is suspicious — likely a stale
+        # render. Refuse to treat it as an active prompt.
         return None
 
-    context = _extract_context(lines, end=question_idx)
+    # Plan-mode bodies routinely exceed the captured viewport and we'd only
+    # capture a tail-slice anyway; the transcript's ExitPlanMode tool_use
+    # carries the full plan, so the card renderer will pull it from there.
+    context = "" if question_kind == "plan" else _extract_context(lines, end=question_idx)
     question = lines[question_idx].strip()
 
     fingerprint = _fingerprint(question, context, options)
 
     return ParsedPrompt(
-        kind="permission",
+        kind=question_kind,
         question=question,
         context=context,
         options=options,
