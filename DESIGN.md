@@ -394,9 +394,9 @@ pocket-cc/
 ### M2 — 交互式 UX (3-5 天)
 - [ ] AskUserQuestion 渲染（选项按钮 → 翻译成方向键+Enter）
 - [ ] ExitPlanMode 渲染（accept / modify / cancel）
-- [ ] Permission prompt 渲染（allow / deny / always）
-- [ ] 完成态 / 失败态卡片收尾
-- [ ] 持久化 + 断电重启恢复
+- [x] Permission prompt 渲染（allow / deny / always）（pane_inspector 检测 + waiting 卡 + 1/2/3 按钮）
+- [x] 完成态 / 失败态卡片收尾（Stop/StopFailure hook → seal_on_stop → done/failed 终态卡 + 重试 + 兜底通知）
+- [x] 持久化 + 断电重启恢复（StateStore 事件驱动写盘 + bootstrap restore + 孤儿卡收尸）
 
 ### M3 — 团队多人 (Phase 2)
 - [ ] 多用户白名单 + 多 workspace
