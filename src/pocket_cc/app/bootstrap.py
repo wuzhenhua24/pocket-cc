@@ -26,27 +26,157 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pocket_cc.app.config import events_jsonl_path, pocket_cc_dir
-from pocket_cc.app.persistence import Registry, StateStore
+from pocket_cc.app.persistence import ChatBinding, Registry, StateStore
 from pocket_cc.claude.events import EventsReader
 from pocket_cc.claude.hooks import all_installed as hooks_all_installed
-from pocket_cc.lark.client import LarkOapiClient
+from pocket_cc.lark.card import build_restart_notice_card
+from pocket_cc.lark.client import LarkApiError, LarkClient, LarkOapiClient
 from pocket_cc.lark.event_loop import LarkEventLoop
 from pocket_cc.relay.events_router import EventsPoller, HookEventsDispatcher
 from pocket_cc.relay.input import InputRouter
 from pocket_cc.relay.output import TranscriptPoller
 from pocket_cc.relay.pane_watcher import PaneWatcher
 from pocket_cc.relay.turn_controller import TurnController
-from pocket_cc.tmux import TmuxManager
+from pocket_cc.tmux import TmuxError, TmuxManager
 
 if TYPE_CHECKING:
     from pocket_cc.app.config import Config
-    from pocket_cc.app.persistence import ChatBinding
     from pocket_cc.claude.events import HookEvent
 
 logger = logging.getLogger(__name__)
+
+
+def restore_bindings(
+    *,
+    tmux: TmuxManager,
+    lark: LarkClient,
+    registry: Registry,
+    state_store: StateStore,
+) -> None:
+    """Re-attach bindings persisted by a previous process.
+
+    Three-way split per binding entry:
+      - tmux window gone   → drop the binding (user's next message re-creates)
+      - tmux window alive  → rebuild ChatBinding and register it; if an
+                             active_card pointer was persisted, patch that
+                             Lark message with the "已重启" notice so the
+                             user doesn't stare at a ⏳ card forever
+
+    We deliberately do not replay transcript history. The TranscriptReader
+    will be re-created lazily on the next message and starts at end-of-file
+    (the poller's normal swap path), so the user just continues from a
+    clean slate. The active_card patch is the only side-effect that bridges
+    the restart for the user.
+
+    Best-effort throughout: any per-binding failure is logged and skipped
+    rather than aborting the whole restore (one bad entry must not block
+    unrelated chats from coming back online).
+    """
+    data = state_store.load()
+    if data is None:
+        return
+    bindings = data.get("bindings")
+    if not isinstance(bindings, dict):
+        logger.warning("restore: state file missing bindings dict — skipping")
+        return
+
+    restored = 0
+    for chat_id, entry in bindings.items():
+        if not isinstance(entry, dict):
+            logger.warning("restore: malformed entry — skipping", extra={"chat_id": chat_id})
+            continue
+        if _restore_one_binding(chat_id, entry, tmux=tmux, lark=lark, registry=registry):
+            restored += 1
+
+    # Rewrite the snapshot so cleared active_card pointers (orphans we just
+    # patched) and dropped bindings (dead windows) are reflected on disk.
+    # Without this, a second restart would try to patch the same orphan card
+    # again. Always save — even when restored==0, the file may need to be
+    # pruned to reflect dropped bindings.
+    state_store.save()
+    logger.info("restore complete", extra={"restored": restored, "total": len(bindings)})
+
+
+def _restore_one_binding(
+    chat_id: str,
+    entry: dict[str, Any],
+    *,
+    tmux: TmuxManager,
+    lark: LarkClient,
+    registry: Registry,
+) -> bool:
+    """Restore a single binding entry. Returns True on success."""
+    window_id = entry.get("window_id")
+    if not isinstance(window_id, str):
+        logger.warning("restore: entry missing window_id", extra={"chat_id": chat_id})
+        return False
+
+    try:
+        window = tmux.find_window_by_id(window_id)
+    except TmuxError:
+        logger.warning(
+            "restore: tmux lookup failed — dropping binding",
+            extra={"chat_id": chat_id, "window_id": window_id},
+            exc_info=True,
+        )
+        return False
+    if window is None:
+        logger.info(
+            "restore: tmux window gone — dropping binding",
+            extra={"chat_id": chat_id, "window_id": window_id},
+        )
+        return False
+
+    try:
+        binding = ChatBinding(
+            chat_id=chat_id,
+            window=window,
+            cwd=Path(str(entry.get("cwd", ""))),
+            created_at=float(entry.get("created_at", 0.0)),
+            excluded_transcripts=frozenset(
+                Path(p) for p in entry.get("excluded_transcripts", []) if isinstance(p, str)
+            ),
+            current_mode=str(entry.get("current_mode", "default")),
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            "restore: failed to rebuild ChatBinding — skipping",
+            extra={"chat_id": chat_id},
+            exc_info=True,
+        )
+        return False
+
+    registry.set(binding)
+    # The persisted active_card pointer is now stale (no live CardStream
+    # behind it). Patch the orphan and let the next user message open a
+    # fresh turn from scratch.
+    active_card = entry.get("active_card")
+    if isinstance(active_card, dict):
+        _patch_orphan_card(chat_id, active_card, lark=lark)
+    logger.info(
+        "restore: binding re-attached",
+        extra={"chat_id": chat_id, "window_id": window_id, "cwd": str(binding.cwd)},
+    )
+    return True
+
+
+def _patch_orphan_card(
+    chat_id: str, active_card: dict[str, Any], *, lark: LarkClient
+) -> None:
+    message_id = active_card.get("message_id")
+    if not isinstance(message_id, str) or not message_id:
+        return
+    try:
+        lark.patch_card(message_id, build_restart_notice_card())
+    except LarkApiError:
+        logger.warning(
+            "restore: orphan card patch failed (Lark side)",
+            extra={"chat_id": chat_id, "message_id": message_id},
+            exc_info=True,
+        )
 
 
 class Pocketcc:
@@ -119,6 +249,10 @@ class Pocketcc:
         """Boot all subsystems and block on the Lark WS loop."""
         self._config.workspace_root.mkdir(parents=True, exist_ok=True)
         self._tmux.ensure_session()
+        # Re-attach bindings from the previous process **before** any poller
+        # starts touching the registry — otherwise a restored binding could
+        # race a transcript / pane tick that sees an empty Registry first.
+        self._restore_bindings()
         if not hooks_all_installed():
             logger.warning(
                 "Claude hooks not fully installed — card completion will be "
@@ -159,6 +293,17 @@ class Pocketcc:
                     exc_info=True,
                 )
                 binding.current_turn = None
+
+    # ---------------------------------------------------------------- restore
+
+    def _restore_bindings(self) -> None:
+        """Bootstrap-side wrapper around :func:`restore_bindings`."""
+        restore_bindings(
+            tmux=self._tmux,
+            lark=self._lark,
+            registry=self._registry,
+            state_store=self._state_store,
+        )
 
     # -------------------------------------------------------------- internal
 

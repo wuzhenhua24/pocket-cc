@@ -94,6 +94,17 @@ def test_text_card_has_no_header() -> None:
     assert card["elements"] == [{"tag": "markdown", "content": "just a note"}]
 
 
+def test_restart_notice_card_is_grey_and_actionless() -> None:
+    from pocket_cc.lark.card import build_restart_notice_card
+
+    card = build_restart_notice_card()
+    assert card["header"]["template"] == "grey"
+    assert "已重启" in card["header"]["title"]["content"]
+    # No action row — restart is informational; user sends a new message
+    # to start a fresh turn.
+    assert not any(el.get("tag") == "action" for el in card["elements"])
+
+
 def test_default_running_actions_shape() -> None:
     assert all(isinstance(b, CardButton) for b in DEFAULT_RUNNING_ACTIONS)
     cancel = next(b for b in DEFAULT_RUNNING_ACTIONS if b.value.get("action") == "cancel")

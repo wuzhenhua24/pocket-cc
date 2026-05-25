@@ -122,6 +122,21 @@ def build_text_card(*, body: str) -> dict[str, Any]:
     }
 
 
+def build_restart_notice_card() -> dict[str, Any]:
+    """Card patched onto an orphaned "running" card after a pocket-cc restart.
+
+    The previous process died holding this card stream, so Lark would have
+    left it stuck on ⏳ forever. Flipping it to ⏹ cancelled with a short
+    notice closes the loop visually and makes it obvious that the next user
+    message starts a fresh turn (rather than continuing the dead one).
+    """
+    return build_status_card(
+        title="pocket-cc 已重启",
+        body="⚠️ 上一轮的状态未能保留——可发送新消息重新开始。",
+        state="cancelled",
+    )
+
+
 # ----------------------------------------------------------- markdown normalize
 # Lark's interactive-card `markdown` tag renders only a subset of GFM:
 #   ✓ **bold** / *italic* / `code` / ```code block``` / [link](…) / - lists /
