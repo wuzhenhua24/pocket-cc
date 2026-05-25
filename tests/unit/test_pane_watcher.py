@@ -169,6 +169,47 @@ def test_build_waiting_for_maps_numbered_options_to_text_response() -> None:
         assert opt.response.text == str(i)
 
 
+def test_build_waiting_for_routes_plan_kind_to_plan_source() -> None:
+    """ParsedPrompt(kind="plan") → WaitingFor(source="plan"). Same numeric
+    response mapping; labels passed through verbatim (English, no translation)."""
+    from pocket_cc.claude.pane_inspector import ParsedOption, ParsedPrompt
+
+    p = ParsedPrompt(
+        kind="plan",
+        question="Claude has written up a plan and is ready to execute. "
+        "Would you like to proceed?",
+        context="",  # plan never carries pane-side context
+        options=(
+            ParsedOption(number=1, label="Yes, auto-accept edits", selected=True),
+            ParsedOption(number=2, label="Yes, manually approve edits", selected=False),
+            ParsedOption(
+                number=3,
+                label="No, refine with Ultraplan on Claude Code on the web",
+                selected=False,
+            ),
+            ParsedOption(number=4, label="Tell Claude what to change", selected=False),
+        ),
+        fingerprint="fp-plan",
+    )
+    waiting = _build_waiting_for(p)
+    assert waiting.source == "plan"
+    assert len(waiting.options) == 4
+    # Labels passed through verbatim — no translation, no truncation here.
+    assert [o.label for o in waiting.options] == [
+        "Yes, auto-accept edits",
+        "Yes, manually approve edits",
+        "No, refine with Ultraplan on Claude Code on the web",
+        "Tell Claude what to change",
+    ]
+    # Responses are still the numeric digits — Claude TUI accepts these for
+    # plan-mode the same as for permission.
+    assert [
+        opt.response.text for opt in waiting.options if isinstance(opt.response, TextResponse)
+    ] == ["1", "2", "3", "4"]
+    # Context-less plan question renders as just the question line.
+    assert waiting.question.startswith("Claude has written up a plan")
+
+
 # ============================================================ watcher ticks
 
 

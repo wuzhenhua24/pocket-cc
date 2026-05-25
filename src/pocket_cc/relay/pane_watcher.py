@@ -125,8 +125,14 @@ def _build_waiting_for(prompt: ParsedPrompt) -> WaitingFor:
 
     Each numbered option becomes a WaitingOption whose response is the
     number digit (Claude TUI accepts `1` / `2` as shortcuts — empirically
-    verified). Cursor `selected` is NOT propagated: pocket-cc users see
-    the same option list regardless of where Claude's TUI cursor sits.
+    verified for permission, plan, and any future numbered-list prompt).
+    Cursor ``selected`` is NOT propagated: pocket-cc users see the same
+    option list regardless of where Claude's TUI cursor sits.
+
+    Option labels are passed through verbatim. For plan-mode that means the
+    full original English ("Yes, auto-accept edits", etc.) — the card
+    renderer truncates per-button if needed, and Lark's button limit caps
+    how many fit; remaining options stay listed in the body.
     """
     options = tuple(
         WaitingOption(
@@ -137,7 +143,7 @@ def _build_waiting_for(prompt: ParsedPrompt) -> WaitingFor:
     )
     question = _compose_question(prompt)
     return WaitingFor(
-        source="permission",
+        source=prompt.kind,
         question=question,
         options=options,
         fingerprint=prompt.fingerprint,
