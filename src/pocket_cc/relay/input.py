@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from pocket_cc.app.config import Config
-    from pocket_cc.app.persistence import Registry
+    from pocket_cc.app.persistence import Registry, StateStore
     from pocket_cc.lark.card import CardState
     from pocket_cc.lark.client import LarkClient
     from pocket_cc.lark.event_loop import CardAction, IncomingMessage
@@ -93,6 +93,7 @@ class InputRouter:
         lark: LarkClient,
         registry: Registry,
         controller_for: Callable[[ChatBinding], TurnController],
+        state_store: StateStore | None = None,
     ) -> None:
         self._config = config
         self._tmux = tmux
@@ -103,6 +104,10 @@ class InputRouter:
         # — every state transition (open / seal / clear-waiting / mode) goes
         # through a controller method so it stays serialized per binding.
         self._controller_for = controller_for
+        # Optional: persists L1 binding fields when a new binding is created.
+        # Default None keeps existing tests untouched; bootstrap passes a real
+        # store in production.
+        self._state_store = state_store
         self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
         # chat_id → monotonic timestamp of the last "Claude is busy" notice,
         # so a burst of messages while busy yields at most one notice per
@@ -250,6 +255,12 @@ class InputRouter:
             excluded_transcripts=existing,
         )
         self._registry.set(binding)
+        # Persist L1 (the hard binding) so a restart can re-attach to this
+        # tmux window without forcing the user to re-trigger creation.
+        # Best-effort: failures are logged inside StateStore; don't abort
+        # the create path on a disk hiccup.
+        if self._state_store is not None:
+            self._state_store.save()
         logger.info(
             "created binding",
             extra={

@@ -28,8 +28,8 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pocket_cc.app.config import events_jsonl_path
-from pocket_cc.app.persistence import Registry
+from pocket_cc.app.config import events_jsonl_path, pocket_cc_dir
+from pocket_cc.app.persistence import Registry, StateStore
 from pocket_cc.claude.events import EventsReader
 from pocket_cc.claude.hooks import all_installed as hooks_all_installed
 from pocket_cc.lark.client import LarkOapiClient
@@ -59,6 +59,10 @@ class Pocketcc:
         self._lark = LarkOapiClient(config.app_id, config.app_secret, domain=config.lark_domain)
         self._loop = LarkEventLoop(config.app_id, config.app_secret, domain=config.lark_domain)
         self._registry = Registry()
+        # Persists the registry (L1 binding fields + L2 active-card pointer) to
+        # ~/.pocket-cc/state.json on turn-lifecycle events. Step 1 is write-only
+        # — restore (Step 2) reads back on startup and re-attaches to tmux.
+        self._state_store = StateStore(pocket_cc_dir() / "state.json", self._registry)
         # One TurnController per binding (keyed by chat_id), created lazily on
         # first use. Bootstrap owns construction so InputRouter / pollers never
         # build one themselves — they only ever reach a controller via the
@@ -71,6 +75,7 @@ class Pocketcc:
             lark=self._lark,
             registry=self._registry,
             controller_for=self._controller_for,
+            state_store=self._state_store,
         )
         self._poller = TranscriptPoller(
             registry=self._registry,
@@ -168,7 +173,12 @@ class Pocketcc:
         with self._controllers_lock:
             controller = self._controllers.get(binding.chat_id)
             if controller is None or controller.binding is not binding:
-                controller = TurnController(binding=binding, lark=self._lark, config=self._config)
+                controller = TurnController(
+                    binding=binding,
+                    lark=self._lark,
+                    config=self._config,
+                    state_store=self._state_store,
+                )
                 self._controllers[binding.chat_id] = controller
             return controller
 

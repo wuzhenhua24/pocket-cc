@@ -1,31 +1,38 @@
-"""In-memory binding registry — chat_id → tmux window + active turn.
-
-M1 keeps this purely in memory; restarting the bot drops all bindings (and
-the user can just re-message the bot to re-create them on demand). M2 will
-add a JSON dump for persistence across restarts, when there's a real
-"multi-day continuity" story.
+"""Binding registry + on-disk state snapshot.
 
 Concepts:
   - ChatBinding   — long-lived state per Lark chat (one tmux window, one cwd,
                     the live transcript reader).
   - TurnState     — short-lived state per "running card" (= per user message);
                     owns the CardStream + Accumulator.
-  - Registry      — thread-safe dict of ChatBindings.
+  - Registry      — thread-safe dict of ChatBindings (in-memory).
+  - StateStore    — writes the registry's "hard" + "card pointer" fields to a
+                    JSON file so a restarted process can recover bindings
+                    instead of orphaning users + cards. See M2 §持久化.
 
 Locking model: the Registry has a coarse lock around the mapping itself.
 :class:`TurnState` and :class:`ChatBinding` are plain data — they carry no
 lock. All concurrent access to a binding's turn state is serialized by its
 :class:`pocket_cc.relay.turn_controller.TurnController`, which is the single
 owner of those mutations (see that module for the threading model).
+
+The StateStore writes opportunistically at fixed turn-lifecycle events
+(binding created / mode changed / turn opened / card rotated / turn sealed).
+It never reads back what it wrote — restore is Step 2's job; Step 1 only
+establishes the write path.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path  # noqa: TC003 — used as dataclass field type, must be eager
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Final
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -35,6 +42,8 @@ if TYPE_CHECKING:
     from pocket_cc.relay.card_stream import CardStream
     from pocket_cc.relay.waiting import WaitingFor
     from pocket_cc.tmux import WindowInfo
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -139,3 +148,135 @@ class Registry:
     def __len__(self) -> int:
         with self._lock:
             return len(self._bindings)
+
+
+# ---------------------------------------------------------------- StateStore
+
+# Bumped only when the on-disk shape changes incompatibly. A mismatch on
+# load() is treated as "no state" so an old snapshot can't crash startup;
+# we'd rather drop bindings and let users re-trigger them than die.
+_SCHEMA_VERSION: Final[int] = 1
+
+
+class StateStore:
+    """JSON-on-disk snapshot of the live Registry.
+
+    Holds a reference to the Registry it serves so callers (TurnController,
+    InputRouter) only need a single ``store.save()`` invocation at each
+    write point — they don't pass the registry through.
+
+    Atomicity: writes go to a tempfile in the target dir, get fsync'd, then
+    ``os.replace``'d onto the final path. Same-directory rename is atomic on
+    POSIX so a crashed process either leaves the previous good file or the
+    new good file — never a half-written one.
+
+    Concurrency: an internal lock serializes concurrent saves. Snapshot
+    reads of binding fields are pointer-atomic in Python, so a concurrent
+    mutation in another binding shows up as the old or new value — never
+    a torn read.
+
+    Step-1 scope: write-only. ``load()`` parses the file (or returns None
+    on missing / corrupt / version-mismatch) but no caller consumes it yet
+    — Step 2 wires restoration into bootstrap.
+    """
+
+    def __init__(self, path: Path, registry: Registry) -> None:
+        self._path = path
+        self._registry = registry
+        self._lock = threading.Lock()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def save(self) -> None:
+        """Snapshot the registry and atomically write it to disk.
+
+        Logs and swallows IO / serialization errors — persistence is a
+        best-effort observer of the live system; a failed save must never
+        take down the running turn.
+        """
+        try:
+            snapshot = self._snapshot()
+            payload = json.dumps(snapshot, indent=2, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            logger.warning("state save: snapshot/serialize failed", exc_info=True)
+            return
+        with self._lock:
+            try:
+                self._write_atomic(payload)
+            except OSError:
+                logger.warning("state save: atomic write failed", exc_info=True)
+
+    def load(self) -> dict[str, Any] | None:
+        """Read the snapshot back as a raw dict, or None when unusable.
+
+        Returns None for: missing file, unreadable file, malformed JSON,
+        non-dict top level, or schema-version mismatch. The intent is that
+        startup degrades to "empty Registry" rather than crashes — a corrupt
+        state file shouldn't keep the bot down.
+        """
+        with self._lock:
+            try:
+                raw = self._path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return None
+            except OSError:
+                logger.warning("state load: read failed", exc_info=True)
+                return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("state load: corrupt JSON — ignoring snapshot")
+            return None
+        if not isinstance(data, dict):
+            logger.warning("state load: top-level is not an object — ignoring snapshot")
+            return None
+        if data.get("version") != _SCHEMA_VERSION:
+            logger.warning(
+                "state load: version mismatch — ignoring snapshot",
+                extra={"got": data.get("version"), "want": _SCHEMA_VERSION},
+            )
+            return None
+        return data
+
+    # -------------------------------------------------------------- internal
+
+    def _snapshot(self) -> dict[str, Any]:
+        bindings: dict[str, dict[str, Any]] = {}
+        for b in self._registry.all():
+            entry: dict[str, Any] = {
+                "window_id": b.window.window_id,
+                "window_name": b.window.name,
+                "cwd": str(b.cwd),
+                "created_at": b.created_at,
+                "excluded_transcripts": sorted(str(p) for p in b.excluded_transcripts),
+                "current_mode": b.current_mode,
+                "active_card": None,
+            }
+            turn = b.current_turn
+            if turn is not None:
+                entry["active_card"] = {
+                    "message_id": turn.card_message_id,
+                    "is_continuation": turn.is_continuation,
+                }
+            bindings[b.chat_id] = entry
+        return {"version": _SCHEMA_VERSION, "bindings": bindings}
+
+    def _write_atomic(self, payload: str) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=self._path.name + ".",
+            suffix=".tmp",
+            dir=str(self._path.parent),
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(self._path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise

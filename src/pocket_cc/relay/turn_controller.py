@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from pocket_cc.app.config import Config
-    from pocket_cc.app.persistence import ChatBinding
+    from pocket_cc.app.persistence import ChatBinding, StateStore
     from pocket_cc.claude.transcript import Event
     from pocket_cc.lark.card import CardState
     from pocket_cc.lark.client import LarkClient
@@ -109,10 +109,20 @@ class TurnPhase(enum.Enum):
 class TurnController:
     """Owns the render/rotate/seal/re-render lifecycle for one binding's turn."""
 
-    def __init__(self, *, binding: ChatBinding, lark: LarkClient, config: Config) -> None:
+    def __init__(
+        self,
+        *,
+        binding: ChatBinding,
+        lark: LarkClient,
+        config: Config,
+        state_store: StateStore | None = None,
+    ) -> None:
         self._binding = binding
         self._lark = lark
         self._config = config
+        # Optional so existing tests that don't care about persistence keep
+        # working unchanged. Production wires a real StateStore via bootstrap.
+        self._state_store = state_store
         # The single per-binding lock. Every turn-state transition (open / seal
         # / ingest / pane-apply / mode / transcript swap) runs under it, so the
         # transcript-poller, pane-watcher, events-poller, WS and shutdown
@@ -326,7 +336,11 @@ class TurnController:
                 accumulator=accumulator,
             )
             self._binding.current_turn = turn
-            return self.begin_turn()
+            gen = self.begin_turn()
+            # Persist L2 (active_card pointer) so a restart can patch the
+            # orphan card instead of leaving it stuck "运行中".
+            self._persist_state()
+            return gen
 
     def poll_transcript(self, found: Path | None) -> None:
         """Adopt/swap the active transcript and ingest any new events.
@@ -407,12 +421,16 @@ class TurnController:
                 elif current is None or current.fingerprint != new_waiting.fingerprint:
                     turn.waiting_for = new_waiting
                     changed = True
+                mode_changed = False
                 if detected_mode is not None and detected_mode != self._binding.current_mode:
                     self._binding.current_mode = detected_mode
                     turn.accumulator.current_mode = detected_mode
                     changed = True
+                    mode_changed = True
                 if changed:
                     pending = self._render_locked(turn)
+                if mode_changed:
+                    self._persist_state()
         if pending is not None:
             pending[0].update(pending[1])
 
@@ -492,6 +510,9 @@ class TurnController:
         # Enter scheduled for this turn) sees a stale gen and aborts instead of
         # acting on a closed/next turn.
         self._active_gen = None
+        # Clear the persisted active-card pointer — the card is being closed,
+        # so on a future restart there's no orphan to recover.
+        self._persist_state()
         return _FinalCloseJob(stream=stream, final_card=final_card, chat_id=binding.chat_id)
 
     def _close_final_stream(self, job: _FinalCloseJob) -> None:
@@ -562,15 +583,30 @@ class TurnController:
         """
         pending = None
         with self._lock:
+            mode_changed = self._binding.current_mode != mode
             self._binding.current_mode = mode
             turn = self._binding.current_turn
             if turn is not None:
                 turn.accumulator.current_mode = mode
                 pending = self._render_locked(turn)
+            if mode_changed:
+                self._persist_state()
         if pending is not None:
             pending[0].update(pending[1])
 
     # ----------------------------------------------------------------- internal
+
+    def _persist_state(self) -> None:
+        """Write the registry snapshot to disk. No-op when no store is wired.
+
+        Called from inside the controller lock — keeps the write linearized
+        with the mutation that triggered it, so consecutive saves observe
+        consistent in-memory state for *this* binding. StateStore has its own
+        lock for cross-binding serialization.
+        """
+        if self._state_store is None:
+            return
+        self._state_store.save()
 
     def _ingest_locked(self, events: list[Event]) -> tuple[CardStream, dict[str, Any]] | None:
         """Fold events into the accumulator and render. **Lock must be held.**
@@ -580,9 +616,13 @@ class TurnController:
         binding mode even between turns so the next turn opens with it.
         """
         binding = self._binding
+        mode_changed = False
         for ev in events:
-            if isinstance(ev, ModeChange):
+            if isinstance(ev, ModeChange) and binding.current_mode != ev.mode:
                 binding.current_mode = ev.mode
+                mode_changed = True
+        if mode_changed:
+            self._persist_state()
         turn = binding.current_turn
         if turn is None:
             return None
@@ -710,6 +750,9 @@ class TurnController:
         turn.card_stream = new_stream
         turn.card_message_id = new_message_id
         turn.is_continuation = True
+        # Persist the new active-card pointer — the previous message_id is no
+        # longer the orphan target; the continuation card is.
+        self._persist_state()
         logger.info(
             "rotated card (continuation)",
             extra={
