@@ -307,6 +307,105 @@ def test_plan_fingerprint_stable_across_cursor_moves() -> None:
     assert a.fingerprint == b.fingerprint
 
 
+# ======================================================= AskUserQuestion
+
+# A real capture of the AskUserQuestion widget — three questions, the first
+# is multiSelect (the `[ ]` checkbox markers next to each option are the
+# multiSelect rendering; single-select questions render without them).
+_REAL_ASK_USER_PROMPT = textwrap.dedent(
+    """\
+    ──────────────────────────────────────────────────────────
+    ←  ☐ 日志来源  ☐ 运行形态  ☐ 分析目标  ✔ Submit  →
+
+    测试环境日志主要来自哪里？这决定了我们怎么把日志喂给 Claude（直接读文件 vs 写 MCP/自定义工具调 API）。
+
+    ❯ 1. [ ] 本地/服务器文件
+      日志直接落在文件系统（如 /var/log），可以用 Read/Grep 直接读
+      2. [ ] ELK / OpenSearch
+      需要通过 Elasticsearch API 查询，要写自定义工具
+      3. [ ] 云日志服务
+      如阿里云 SLS、AWS CloudWatch、GCP Logging，需要对应 SDK 集成
+      4. [ ] Loki / Grafana
+      通过 LogQL 查询，需要 API 集成
+      5. [ ] Type something
+         Next
+    ──────────────────────────────────────────────────────────
+      6. Chat about this
+
+    Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+    """
+)
+
+
+def test_ask_user_widget_detected_via_footer() -> None:
+    parsed = inspect_pane(_REAL_ASK_USER_PROMPT)
+    assert parsed is not None
+    assert parsed.kind == "ask_user_question"
+
+
+def test_ask_user_returns_sparse_prompt_for_transcript_to_fill() -> None:
+    """For AskUserQuestion, pane data is only used to detect "is the widget
+    open?" and to fingerprint. The actual question text + options come from
+    the transcript (richer + cleaner), so ParsedPrompt's content fields are
+    deliberately empty."""
+    parsed = inspect_pane(_REAL_ASK_USER_PROMPT)
+    assert parsed is not None
+    assert parsed.kind == "ask_user_question"
+    assert parsed.question == ""
+    assert parsed.context == ""
+    assert parsed.options == ()
+    # Fingerprint is non-empty and deterministic.
+    assert parsed.fingerprint
+    assert parsed.fingerprint == inspect_pane(_REAL_ASK_USER_PROMPT).fingerprint  # type: ignore[union-attr]
+
+
+def test_ask_user_takes_priority_over_permission_in_mixed_pane() -> None:
+    """If both signals appear (e.g. stale permission text scrolled up), the
+    AskUserQuestion widget — which is what the user can interact with right
+    now — wins."""
+    pane = _REAL_PROMPT + "\n" + _REAL_ASK_USER_PROMPT
+    parsed = inspect_pane(pane)
+    assert parsed is not None
+    assert parsed.kind == "ask_user_question"
+
+
+def test_ask_user_fingerprint_changes_when_question_advances() -> None:
+    """Simulate Claude advancing from Q1 to Q2 in a multi-question call —
+    the visible question text differs, so the fingerprint must too."""
+    a = inspect_pane(_REAL_ASK_USER_PROMPT)
+    advanced = _REAL_ASK_USER_PROMPT.replace(
+        "测试环境日志主要来自哪里？",
+        "你希望这个分析工具以什么形态运行？",
+    )
+    b = inspect_pane(advanced)
+    assert a is not None and b is not None
+    assert a.fingerprint != b.fingerprint
+
+
+def test_ask_user_fingerprint_stable_across_cursor_moves() -> None:
+    """User moving the ❯ cursor inside the same question (e.g. via arrow
+    keys in tmux) must not generate a new fingerprint — same prompt."""
+    a = inspect_pane(_REAL_ASK_USER_PROMPT)
+    moved = _REAL_ASK_USER_PROMPT.replace("❯ 1. [ ]", "  1. [ ]")
+    moved = moved.replace("  2. [ ]", "❯ 2. [ ]", 1)
+    b = inspect_pane(moved)
+    assert a is not None and b is not None
+    assert a.fingerprint == b.fingerprint
+
+
+def test_ask_user_widget_returns_none_when_footer_absent() -> None:
+    """A pane that *looks* like AskUserQuestion (tab bar + options) but is
+    missing the footer (e.g. stale render mid-tick) must not be detected."""
+    pane = _REAL_ASK_USER_PROMPT.replace(
+        "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+        "(footer hidden / stale frame)",
+    )
+    parsed = inspect_pane(pane)
+    # Falls through to the permission/plan scan — there's no permission/plan
+    # question text in this pane, so result is None.
+    assert parsed is None
+
+
 # ============================================================== detect_mode
 
 

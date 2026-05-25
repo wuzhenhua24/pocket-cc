@@ -22,9 +22,12 @@ Currently detects:
     options (auto-accept / manual / refine / tell-what-to-change). Plan
     body itself is NOT extracted here — it can easily exceed the captured
     pane viewport; callers get it from the transcript ExitPlanMode tool_use.
-
-Not yet detected:
-  - AskUserQuestion menus (multi-question, richer options)
+  - **AskUserQuestion widget** — a multi-question / multi-option dialog with
+    its own footer "Enter to select · Tab/Arrow keys to navigate · Esc to
+    cancel". The structured questions (with descriptions, multiSelect flag)
+    live in the transcript's AskUserQuestion tool_use — pane inspection only
+    confirms the widget is currently open and pulls just enough text to
+    fingerprint which question is being shown right now.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ import re
 from dataclasses import dataclass
 from typing import Final, Literal
 
-PromptKind = Literal["permission", "plan"]
+PromptKind = Literal["permission", "plan", "ask_user_question"]
 
 # --- Permission-mode (Shift-Tab) detection -------------------------------
 # Claude Code's bottom chrome shows the active permission mode on its own
@@ -91,6 +94,19 @@ _OPTION_RE: Final[re.Pattern[str]] = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.+?)\s
 # so missing a footer hint there is harmless.
 _FOOTER_HINT_RE: Final[re.Pattern[str]] = re.compile(r"Esc to cancel|Tab to amend")
 
+# AskUserQuestion footer — unique enough to act as the widget's
+# "is it open right now?" sentinel. Matched anywhere in the bottom of the
+# pane (not whole-line) because the widget's actual rendering may leave
+# trailing chrome below it.
+_ASK_USER_FOOTER_RE: Final[re.Pattern[str]] = re.compile(
+    r"Enter to select.+Tab/Arrow keys to navigate.+Esc to cancel"
+)
+# How far up from the bottom of the pane to look for the AskUserQuestion
+# footer. Larger than the mode scan because the widget often pushes useful
+# chrome (tab bar + question text) above the option list, and we want to
+# see the active-question text for fingerprint stability.
+_ASK_USER_SCAN_LINES: Final[int] = 40
+
 # How many lines above the question to look for context (the command being
 # asked about + any rationale lines). Only used by the permission prompt —
 # plan prompts skip context extraction entirely since plan bodies routinely
@@ -129,7 +145,7 @@ def inspect_pane(pane_text: str) -> ParsedPrompt | None:
     Only the *latest* prompt is returned — earlier ones (scrolled up but
     still visible in the capture) are ignored, because the user can only
     interact with the bottom-most one. We do this by scanning from the
-    bottom upward for any known question sentinel; the first hit wins.
+    bottom upward for any known sentinel; the first hit wins.
     """
     if not pane_text:
         return None
@@ -138,8 +154,18 @@ def inspect_pane(pane_text: str) -> ParsedPrompt | None:
     if not lines:
         return None
 
-    # Bottom-up scan for any registered prompt kind. Stop at the first hit so
-    # only the latest prompt is acted on.
+    # AskUserQuestion is recognized by its distinctive footer (not by a
+    # question-line regex like permission/plan) because the question text
+    # itself is dynamic and lives in the AskUserQuestion tool_use input.
+    # Checked first because its footer is the cheapest, most-specific marker
+    # and AskUserQuestion is mutually exclusive with the other two prompt
+    # kinds (Claude can only show one TUI dialog at a time).
+    ask_user = _try_parse_ask_user(lines)
+    if ask_user is not None:
+        return ask_user
+
+    # Bottom-up scan for permission/plan question lines. Stop at the first
+    # hit so only the latest prompt is acted on.
     question_idx: int | None = None
     question_kind: PromptKind | None = None
     for i in range(len(lines) - 1, -1, -1):
@@ -172,6 +198,50 @@ def inspect_pane(pane_text: str) -> ParsedPrompt | None:
         question=question,
         context=context,
         options=options,
+        fingerprint=fingerprint,
+    )
+
+
+def _try_parse_ask_user(lines: list[str]) -> ParsedPrompt | None:
+    """Detect the AskUserQuestion widget by its footer, or return None.
+
+    The structured questions / options / descriptions live in the transcript
+    (``AskUserQuestion`` tool_use input). pane inspection only:
+      1. confirms the widget is currently open (footer match), and
+      2. fingerprints **which question** is being shown right now, so when
+         Claude advances to the next question (in a multi-question call) the
+         pane_watcher sees a fresh fingerprint and re-renders.
+
+    Returns a sparse ParsedPrompt — ``question`` / ``options`` are left
+    empty because the widget's structure (tab bar + indented descriptions +
+    special "Type something" / "Chat about this" rows) doesn't fit our
+    numbered-option model cleanly, and the relay layer pulls richer data
+    from the transcript anyway. The fingerprint hashes the widget body
+    region (between the bottom of the pane and the footer, capped at
+    ``_ASK_USER_SCAN_LINES``) with the ``❯`` cursor glyph stripped so
+    arrow-key moves within the same question don't churn the hash.
+    """
+    tail_start = max(0, len(lines) - _ASK_USER_SCAN_LINES)
+    footer_idx: int | None = None
+    for i in range(len(lines) - 1, tail_start - 1, -1):
+        if _ASK_USER_FOOTER_RE.search(lines[i]):
+            footer_idx = i
+            break
+    if footer_idx is None:
+        return None
+
+    # Replace "❯ " (cursor + its trailing space) with two spaces so a
+    # cursor-only move doesn't change line indentation and churn the hash.
+    # The cursor occupies the same visual width as two spaces in the
+    # non-selected option lines (e.g. "  2. [ ] ..."), so this keeps the
+    # body byte-for-byte stable regardless of cursor position.
+    body = "\n".join(lines[tail_start:footer_idx]).replace("❯ ", "  ")
+    fingerprint = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return ParsedPrompt(
+        kind="ask_user_question",
+        question="",
+        context="",
+        options=(),
         fingerprint=fingerprint,
     )
 
