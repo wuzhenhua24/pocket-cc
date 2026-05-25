@@ -89,6 +89,151 @@ def test_format_tool_call_bash_long_command_truncated() -> None:
     assert len(s) < 150  # bounded
 
 
+def test_format_tool_call_exit_plan_mode_has_dedicated_label() -> None:
+    """ExitPlanMode gets its own one-liner — the actual plan body is rendered
+    separately in the waiting card, so this line just records the call."""
+    s = format_tool_call("ExitPlanMode", {"plan": "# Plan\n\nstuff"})
+    assert "ExitPlanMode" in s
+    assert "📋" in s
+    # The plan content itself must NOT leak into the tool-call list (that's
+    # the waiting card body's job).
+    assert "Plan\n" not in s
+    assert "stuff" not in s
+
+
+def test_accumulator_captures_exit_plan_mode_payload() -> None:
+    acc = TurnAccumulator()
+    acc.ingest(
+        ToolUse(
+            uuid="p1",
+            timestamp="t",
+            tool_use_id="t-plan-1",
+            tool_name="ExitPlanMode",
+            tool_input={"plan": "# Refactor turn_controller\n\n- step 1\n- step 2"},
+        )
+    )
+    snap = acc.snapshot()
+    assert snap.latest_plan == "# Refactor turn_controller\n\n- step 1\n- step 2"
+    # The one-line summary still shows up in tool_calls — the plan content is
+    # additional, not a replacement.
+    assert any("ExitPlanMode" in t for t in snap.tool_calls)
+
+
+def test_accumulator_overwrites_plan_on_each_exit_plan_mode_call() -> None:
+    """If Claude refines and re-emits the plan, the latest wins."""
+    acc = TurnAccumulator()
+    acc.ingest(
+        ToolUse(
+            uuid="p1",
+            timestamp="t",
+            tool_use_id="t1",
+            tool_name="ExitPlanMode",
+            tool_input={"plan": "old plan"},
+        )
+    )
+    acc.ingest(
+        ToolUse(
+            uuid="p2",
+            timestamp="t",
+            tool_use_id="t2",
+            tool_name="ExitPlanMode",
+            tool_input={"plan": "refined plan"},
+        )
+    )
+    assert acc.snapshot().latest_plan == "refined plan"
+
+
+def test_accumulator_plan_field_empty_when_no_exit_plan_mode_seen() -> None:
+    acc = TurnAccumulator()
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="just talking"))
+    assert acc.snapshot().latest_plan == ""
+
+
+def test_render_waiting_card_plan_source_renders_plan_above_options() -> None:
+    """Plan card body must include the proposed plan markdown so the user
+    can actually read what they're approving."""
+    from pocket_cc.relay.waiting import TextResponse, WaitingFor, WaitingOption
+
+    acc = TurnAccumulator()
+    acc.ingest(UserText(uuid="u", timestamp="t", text="重构一下吧"))
+    acc.ingest(
+        ToolUse(
+            uuid="p",
+            timestamp="t",
+            tool_use_id="t-p",
+            tool_name="ExitPlanMode",
+            tool_input={"plan": "# 重构方案\n\n- 拆 generation 出去\n- 加单测"},
+        )
+    )
+    waiting = WaitingFor(
+        source="plan",
+        question="Claude has written up a plan and is ready to execute. "
+        "Would you like to proceed?",
+        options=(
+            WaitingOption(label="Yes, auto-accept edits", response=TextResponse(text="1")),
+            WaitingOption(label="Yes, manually approve edits", response=TextResponse(text="2")),
+        ),
+        fingerprint="fp",
+    )
+    card = render_card(acc.snapshot(state="waiting", waiting_for=waiting))
+    body = card["elements"][0]["content"]
+    # Plan markdown is in the body, above the option bullets.
+    assert "重构方案" in body
+    assert "拆 generation 出去" in body
+    plan_idx = body.index("重构方案")
+    options_idx = body.index("Yes, auto-accept edits")
+    assert plan_idx < options_idx
+    # Header is orange waiting state.
+    assert card["header"]["template"] == "orange"
+
+
+def test_render_waiting_card_permission_source_does_not_inject_plan() -> None:
+    """A plan that arrived earlier in the turn (e.g. session was in plan
+    mode, exited, then asked for permission) must not bleed into a
+    permission-source waiting card."""
+    from pocket_cc.relay.waiting import TextResponse, WaitingFor, WaitingOption
+
+    acc = TurnAccumulator()
+    # latest_plan is set from an earlier ExitPlanMode call…
+    acc.ingest(
+        ToolUse(
+            uuid="p",
+            timestamp="t",
+            tool_use_id="t-p",
+            tool_name="ExitPlanMode",
+            tool_input={"plan": "stale plan from earlier"},
+        )
+    )
+    waiting = WaitingFor(
+        source="permission",
+        question="Do you want to proceed?",
+        options=(WaitingOption(label="Yes", response=TextResponse(text="1")),),
+        fingerprint="fp-perm",
+    )
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    # …but the permission card shouldn't surface it (it's not what this prompt
+    # is about). Confirm with substring check.
+    assert "stale plan from earlier" not in body
+
+
+def test_render_waiting_card_plan_source_empty_plan_gracefully_omits_section() -> None:
+    """Defensive: if somehow the waiting state flips to "plan" without a
+    plan body in the accumulator (e.g. transcript lag), don't crash and
+    don't render an empty "📋 方案" header."""
+    from pocket_cc.relay.waiting import TextResponse, WaitingFor, WaitingOption
+
+    acc = TurnAccumulator()
+    waiting = WaitingFor(
+        source="plan",
+        question="Claude has written up a plan…",
+        options=(WaitingOption(label="Yes", response=TextResponse(text="1")),),
+        fingerprint="fp",
+    )
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    assert "📋 方案" not in body  # no empty heading
+    assert "Yes" in body  # options still render
+
+
 def test_render_card_running_state_has_blue_header_and_actions() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "fix the bug"

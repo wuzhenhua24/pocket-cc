@@ -117,6 +117,11 @@ class TurnSnapshot:
     # renderer mirrors this onto the Mode button label so users in Lark
     # can see at a glance which mode Claude is in.
     current_mode: str = DEFAULT_PERMISSION_MODE
+    # Most recent plan markdown from an ExitPlanMode tool_use, or "". The
+    # waiting card uses this to show the actual plan body above the option
+    # buttons (the pane-side detector intentionally doesn't extract it, since
+    # long plans overflow the captured pane viewport).
+    latest_plan: str = ""
 
 
 @dataclass
@@ -149,6 +154,10 @@ class TurnAccumulator:
     # while Claude is in (say) acceptEdits doesn't briefly flash "default"
     # on the button before the next permission-mode record lands.
     current_mode: str = DEFAULT_PERMISSION_MODE
+    # Latest plan markdown from an ExitPlanMode tool_use — kept turn-scoped
+    # so the waiting card can render the proposal inline above the option
+    # buttons. Overwritten on each ExitPlanMode (Claude may refine and re-emit).
+    _latest_plan: str = ""
 
     def ingest(self, event: Event) -> None:
         """Fold a single Event into the running snapshot.
@@ -175,6 +184,14 @@ class TurnAccumulator:
             return
         if isinstance(event, ToolUse):
             self._tool_calls.append(format_tool_call(event.tool_name, event.tool_input))
+            # ExitPlanMode carries the user-visible plan in its `plan` input.
+            # Stash it separately so the waiting card can render the full
+            # markdown body above the option buttons; the one-line entry above
+            # still appears in the tool-call list for accounting.
+            if event.tool_name == "ExitPlanMode":
+                plan_text = event.tool_input.get("plan")
+                if isinstance(plan_text, str):
+                    self._latest_plan = plan_text
             return
         if isinstance(event, AssistantThinking):
             self._thinking_parts.append(event.text)
@@ -259,6 +276,7 @@ class TurnAccumulator:
             error=error,
             waiting_for=waiting_for,
             current_mode=self.current_mode,
+            latest_plan=self._latest_plan,
         )
 
     def snapshot_window(
@@ -289,6 +307,7 @@ class TurnAccumulator:
             error=error,
             waiting_for=waiting_for,
             current_mode=self.current_mode,
+            latest_plan=self._latest_plan,
         )
 
     def snapshot_from(
@@ -322,6 +341,7 @@ class TurnAccumulator:
             error=error,
             waiting_for=waiting_for,
             current_mode=self.current_mode,
+            latest_plan=self._latest_plan,
         )
 
     def find_fit_window(self, max_chars: int) -> tuple[int, int, int]:
@@ -494,6 +514,11 @@ def format_tool_call(name: str, input_data: dict[str, Any]) -> str:
     if name == "Task":
         desc = input_data.get("description", "")
         return f"🤖 **Task** {_shorten(str(desc), 60)}" if desc else "🤖 **Task**"
+    if name == "ExitPlanMode":
+        # The plan body is rendered separately in the waiting card (see
+        # `_render_waiting_body`); this one-liner just marks that the call
+        # happened so the tool-call counter stays consistent.
+        return "📋 **ExitPlanMode** 等待用户确认方案"
     return f"🔧 **{name}**"
 
 
@@ -504,6 +529,13 @@ def _render_waiting_body(snapshot: TurnSnapshot, waiting: WaitingFor) -> str:
     sections: list[str] = []
     if waiting.question:
         sections.append(f"**{waiting.question}**")
+    # Plan-source waiting: surface the proposed plan inline so the user can
+    # actually read what they're approving. Sits above the option list since
+    # the options refer to the plan ("Yes, auto-accept edits" only makes
+    # sense if you can see the edits being proposed). Sourced from the
+    # ExitPlanMode tool_use payload, not the pane (which can't fit it).
+    if waiting.source == "plan" and snapshot.latest_plan:
+        sections.append(f"**📋 方案**\n\n{snapshot.latest_plan}")
     if waiting.options:
         bullets = []
         for i, opt in enumerate(waiting.options, start=1):
