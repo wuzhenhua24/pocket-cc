@@ -245,14 +245,15 @@ class InputRouter:
 
     def _create_binding(self, msg: IncomingMessage) -> ChatBinding | None:
         # `_is_allowed` already gated this open_id; the lookup must hit.
-        cwd = self._config.users[msg.sender_open_id].workspace
+        user = self._config.users[msg.sender_open_id]
+        cwd = user.workspace
         # Snapshot *before* spawning Claude — so the snapshot reflects the
         # pre-bot state of the projects dir. Any jsonl that appears after
         # this point is necessarily our Claude's.
         existing = snapshot_existing_transcripts(cwd, self._config.claude_projects_dir)
         try:
             window = self._tmux.new_window(
-                name=f"chat-{msg.chat_id[-8:] or 'unknown'}",
+                name=f"chat-{user.display_name}",
                 cwd=str(cwd),
                 command=self._config.claude_command,
             )
@@ -264,6 +265,7 @@ class InputRouter:
 
         binding = ChatBinding(
             chat_id=msg.chat_id,
+            open_id=msg.sender_open_id,
             window=window,
             cwd=cwd,
             excluded_transcripts=existing,

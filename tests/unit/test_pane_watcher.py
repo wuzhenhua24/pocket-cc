@@ -89,6 +89,7 @@ class _FakeAny:
 def _make_binding_with_turn(chat_id: str = "oc_x") -> ChatBinding:
     binding = ChatBinding(
         chat_id=chat_id,
+        open_id="ou_user1",
         window=cast("WindowInfo", _StubWindow()),
         cwd=Path("/tmp"),
     )
@@ -177,6 +178,7 @@ def _make_binding_with_ask_user(questions: Any, chat_id: str = "oc_ask") -> Chat
 
     binding = ChatBinding(
         chat_id=chat_id,
+        open_id="ou_user1",
         window=cast("WindowInfo", _StubWindow()),
         cwd=Path("/tmp"),
     )
@@ -301,6 +303,7 @@ def test_tick_no_active_turn_skips_capture_and_controller() -> None:
     registry.set(
         ChatBinding(
             chat_id="x",
+            open_id="ou_user1",
             window=cast("WindowInfo", _StubWindow()),
             cwd=Path("/tmp"),
         )

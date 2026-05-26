@@ -23,8 +23,13 @@ class _StubWindow:
     pane_id: str = "%0"
 
 
-def _stub_binding(chat_id: str) -> ChatBinding:
-    return ChatBinding(chat_id=chat_id, window=_StubWindow(), cwd=Path("/tmp"))  # type: ignore[arg-type]
+def _stub_binding(chat_id: str, *, open_id: str = "ou_user1") -> ChatBinding:
+    return ChatBinding(
+        chat_id=chat_id,
+        open_id=open_id,
+        window=_StubWindow(),  # type: ignore[arg-type]
+        cwd=Path("/tmp"),
+    )
 
 
 def _stub_turn(message_id: str) -> TurnState:
@@ -119,6 +124,7 @@ def test_iter_works() -> None:
 def _make_binding(
     chat_id: str,
     *,
+    open_id: str = "ou_user1",
     window_id: str = "@7",
     window_name: str = "chat-abcdef",
     cwd: str = "/tmp/wsp",
@@ -133,6 +139,7 @@ def _make_binding(
     """
     binding = ChatBinding(
         chat_id=chat_id,
+        open_id=open_id,
         window=_StubWindow(window_id=window_id, name=window_name, cwd=cwd),  # type: ignore[arg-type]
         cwd=Path(cwd),
         created_at=created_at,
@@ -150,7 +157,7 @@ def test_state_store_save_creates_file_with_versioned_envelope(tmp_path: Path) -
     store.save()
 
     data = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
-    assert data["version"] == 1
+    assert data["version"] == 2
     assert set(data["bindings"]) == {"chat-1"}
 
 
@@ -172,6 +179,7 @@ def test_state_store_save_serializes_all_l1_fields(tmp_path: Path) -> None:
     store.save()
     entry = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))["bindings"]["chat-1"]
 
+    assert entry["open_id"] == "ou_user1"
     assert entry["window_id"] == "@9"
     assert entry["window_name"] == "chat-zz"
     assert entry["cwd"] == "/tmp/wsp"
@@ -303,7 +311,7 @@ def test_state_store_load_returns_parsed_dict_round_trip(tmp_path: Path) -> None
 
     data = store.load()
     assert data is not None
-    assert data["version"] == 1
+    assert data["version"] == 2
     assert data["bindings"]["chat-1"]["current_mode"] == "bypassPermissions"
 
 

@@ -112,6 +112,12 @@ def _restore_one_binding(
     if not isinstance(window_id, str):
         logger.warning("restore: entry missing window_id", extra={"chat_id": chat_id})
         return False
+    open_id = entry.get("open_id")
+    if not isinstance(open_id, str) or not open_id:
+        # Without an open_id we can't route this binding (step 4 will also need
+        # it to reconcile against config.users). Drop and let the user re-trigger.
+        logger.warning("restore: entry missing open_id", extra={"chat_id": chat_id})
+        return False
 
     try:
         window = tmux.find_window_by_id(window_id)
@@ -132,6 +138,7 @@ def _restore_one_binding(
     try:
         binding = ChatBinding(
             chat_id=chat_id,
+            open_id=open_id,
             window=window,
             cwd=Path(str(entry.get("cwd", ""))),
             created_at=float(entry.get("created_at", 0.0)),

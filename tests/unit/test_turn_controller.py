@@ -45,6 +45,7 @@ def _config(tmp_path: Path) -> Config:
 def _binding(tmp_path: Path) -> ChatBinding:
     return ChatBinding(
         chat_id="oc_chat1",
+        open_id="ou_user1",
         window=WindowInfo(
             session="pocket-cc", window_id="@1", name="chat-x", cwd="/tmp", pane_id="%1"
         ),

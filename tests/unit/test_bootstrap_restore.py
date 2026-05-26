@@ -49,11 +49,12 @@ def _win(window_id: str, name: str = "chat-x", cwd: str = "/tmp/wsp") -> WindowI
 # schema shape (assertions can't pass by accident if the StateStore writer
 # drifts; the read side is independently exercised).
 def _write_state(path: Path, *, bindings: dict[str, Any]) -> None:
-    path.write_text(json.dumps({"version": 1, "bindings": bindings}), encoding="utf-8")
+    path.write_text(json.dumps({"version": 2, "bindings": bindings}), encoding="utf-8")
 
 
 def _entry(
     *,
+    open_id: str = "ou_user1",
     window_id: str = "@5",
     window_name: str = "chat-abc",
     cwd: str = "/tmp/wsp",
@@ -63,6 +64,7 @@ def _entry(
     active_card: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
+        "open_id": open_id,
         "window_id": window_id,
         "window_name": window_name,
         "cwd": cwd,
@@ -106,6 +108,7 @@ def test_restore_attaches_binding_when_window_alive(tmp_path: Path) -> None:
     assert len(registry) == 1
     binding = registry.get("chat-1")
     assert binding is not None
+    assert binding.open_id == "ou_user1"
     assert binding.window.window_id == "@5"
     assert binding.cwd == Path("/tmp/wsp")
     assert binding.current_mode == "acceptEdits"
@@ -199,24 +202,27 @@ def test_restore_keeps_binding_even_when_orphan_patch_fails(tmp_path: Path) -> N
 
 def test_restore_drops_bindings_individually_on_malformed_entries(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
+    bad_no_open_id = _entry(window_id="@6")
+    del bad_no_open_id["open_id"]
     _write_state(
         state_path,
         bindings={
             "chat-ok": _entry(window_id="@5"),
             "chat-no-window-id": {"cwd": "/tmp"},  # missing window_id
+            "chat-no-open-id": bad_no_open_id,  # missing open_id → can't route
             "chat-not-a-dict": "string instead of object",  # type: ignore[dict-item]
         },
     )
     registry = Registry()
     store = StateStore(state_path, registry)
-    tmux = _FakeTmux(windows={"@5": _win("@5")})
+    tmux = _FakeTmux(windows={"@5": _win("@5"), "@6": _win("@6")})
     lark = FakeLarkClient()
 
     restore_bindings(tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     # Only the good entry survives; bad ones are skipped with a warning, not
     # aborted.
-    assert set(b.chat_id for b in registry.all()) == {"chat-ok"}
+    assert {b.chat_id for b in registry.all()} == {"chat-ok"}
 
 
 def test_restore_handles_multiple_bindings_partial_alive(tmp_path: Path) -> None:

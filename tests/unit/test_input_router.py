@@ -336,10 +336,12 @@ def test_first_message_creates_binding_and_sends_initial_card(tmp_path: Path) ->
     router.handle_message(_message(text="实现一个 hello world"))
 
     # tmux: new_window called with the configured claude command + workspace cwd
+    # + window named after the user's display_name (chat-{display_name}).
     new_window_calls = [c for c in tmux.calls if c.method == "new_window"]
     assert len(new_window_calls) == 1
     assert new_window_calls[0].kwargs["command"] == cfg.claude_command
     assert new_window_calls[0].kwargs["cwd"] == str(tmp_path)
+    assert new_window_calls[0].kwargs["name"] == "chat-test"
 
     # tmux: send_text called with user's text and the right window
     send_text_calls = [c for c in tmux.calls if c.method == "send_text"]

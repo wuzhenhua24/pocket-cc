@@ -33,6 +33,7 @@ def _binding(
 ) -> ChatBinding:
     b = ChatBinding(
         chat_id=chat_id,
+        open_id="ou_user1",
         window=_StubWindow(),  # type: ignore[arg-type]
         cwd=cwd,
         transcript_path=transcript_path,

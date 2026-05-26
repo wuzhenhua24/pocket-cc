@@ -82,6 +82,12 @@ class ChatBinding:
     """Per-Lark-chat persistent state."""
 
     chat_id: str
+    # The Lark `open_id` of the user this binding was created for. In DM
+    # (the only supported chat_type) chat_id ↔ open_id is 1:1, but storing
+    # it explicitly lets restore look up the user's current config workspace
+    # without a reverse-lookup over `Config.users` keyed by chat_id (which
+    # wouldn't work anyway — chat_id isn't a user identity).
+    open_id: str
     window: WindowInfo
     cwd: Path
     transcript_path: Path | None = None
@@ -155,7 +161,11 @@ class Registry:
 # Bumped only when the on-disk shape changes incompatibly. A mismatch on
 # load() is treated as "no state" so an old snapshot can't crash startup;
 # we'd rather drop bindings and let users re-trigger them than die.
-_SCHEMA_VERSION: Final[int] = 1
+#
+# v2: ChatBinding gained the required `open_id` field (M3 step3) — pre-v2
+# snapshots can't be safely restored because the per-binding routing needs
+# it. Old snapshots get dropped and users re-create bindings on next message.
+_SCHEMA_VERSION: Final[int] = 2
 
 
 class StateStore:
@@ -246,6 +256,7 @@ class StateStore:
         bindings: dict[str, dict[str, Any]] = {}
         for b in self._registry.all():
             entry: dict[str, Any] = {
+                "open_id": b.open_id,
                 "window_id": b.window.window_id,
                 "window_name": b.window.name,
                 "cwd": str(b.cwd),
