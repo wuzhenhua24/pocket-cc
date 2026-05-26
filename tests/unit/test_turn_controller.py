@@ -8,9 +8,10 @@ deferred/async work relies on to avoid acting on a superseded/sealed turn.
 from __future__ import annotations
 
 from pathlib import Path  # noqa: TC003 — used in test signatures
+from types import MappingProxyType
 from typing import Any, cast
 
-from pocket_cc.app.config import Config
+from pocket_cc.app.config import Config, User
 from pocket_cc.app.persistence import ChatBinding, TurnState
 from pocket_cc.claude.transcript import AssistantText
 from pocket_cc.lark.client import FakeLarkClient, LarkApiError
@@ -22,20 +23,18 @@ from pocket_cc.tmux import WindowInfo
 
 
 def _waiting(fingerprint: str) -> WaitingFor:
-    return WaitingFor(
-        source="permission", question="Proceed?", options=(), fingerprint=fingerprint
-    )
+    return WaitingFor(source="permission", question="Proceed?", options=(), fingerprint=fingerprint)
 
 
 def _config(tmp_path: Path) -> Config:
+    user = User(open_id="ou_user1", workspace=tmp_path, display_name="test")
     return Config(
         app_id="cli_x",
         app_secret="secret",
         lark_domain="https://open.feishu.cn",
-        workspace_root=tmp_path,
+        users=MappingProxyType({"ou_user1": user}),
         claude_command="claude",
         tmux_session="pocket-cc-test",
-        user_whitelist=frozenset(),
         patch_interval_s=10.0,  # don't actually patch during the test
         transcript_poll_s=0.5,
         events_poll_s=0.5,
@@ -67,7 +66,9 @@ def _attach_turn(binding: ChatBinding, lark: FakeLarkClient) -> TurnState:
 
 
 def test_begin_turn_increments_and_marks_current(tmp_path: Path) -> None:
-    controller = TurnController(binding=_binding(tmp_path), lark=FakeLarkClient(), config=_config(tmp_path))
+    controller = TurnController(
+        binding=_binding(tmp_path), lark=FakeLarkClient(), config=_config(tmp_path)
+    )
     g1 = controller.begin_turn()
     g2 = controller.begin_turn()
     assert (g1, g2) == (1, 2)
@@ -93,9 +94,7 @@ def test_seal_retires_active_generation(tmp_path: Path) -> None:
 
 def test_mark_submit_cancelled_blocks_deferred_enter(tmp_path: Path) -> None:
     binding = _binding(tmp_path)
-    controller = TurnController(
-        binding=binding, lark=FakeLarkClient(), config=_config(tmp_path)
-    )
+    controller = TurnController(binding=binding, lark=FakeLarkClient(), config=_config(tmp_path))
     gen = controller.begin_turn()
     assert controller.should_submit_deferred_enter(gen) is True
     controller.mark_submit_cancelled()
@@ -104,9 +103,7 @@ def test_mark_submit_cancelled_blocks_deferred_enter(tmp_path: Path) -> None:
 
 def test_should_submit_deferred_enter_false_for_superseded_gen(tmp_path: Path) -> None:
     binding = _binding(tmp_path)
-    controller = TurnController(
-        binding=binding, lark=FakeLarkClient(), config=_config(tmp_path)
-    )
+    controller = TurnController(binding=binding, lark=FakeLarkClient(), config=_config(tmp_path))
     gen_a = controller.begin_turn()
     controller.begin_turn()  # supersede → gen_a no longer active
     assert controller.should_submit_deferred_enter(gen_a) is False
@@ -233,9 +230,7 @@ def test_rotation_send_failure_is_recoverable(tmp_path: Path) -> None:
 # ===================================================== final-close failure
 
 
-def test_seal_final_patch_failure_sends_fallback_notice(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
+def test_seal_final_patch_failure_sends_fallback_notice(tmp_path: Path, monkeypatch: Any) -> None:
     """If the terminal card patch fails every retry, the turn is still sealed
     internally (current_turn cleared) but the user gets a fallback text notice
     instead of being silently stranded on a 'running' card."""
@@ -468,9 +463,7 @@ def test_apply_pane_state_ignores_none_mode(tmp_path: Path) -> None:
 
 def test_apply_pane_state_noop_without_turn(tmp_path: Path) -> None:
     binding = _binding(tmp_path)
-    controller = TurnController(
-        binding=binding, lark=FakeLarkClient(), config=_config(tmp_path)
-    )
+    controller = TurnController(binding=binding, lark=FakeLarkClient(), config=_config(tmp_path))
     # No current turn → must not raise.
     controller.apply_pane_state(_waiting("fp1"), "plan")
     assert binding.current_turn is None

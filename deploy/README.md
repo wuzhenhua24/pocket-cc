@@ -182,16 +182,31 @@ LARK_APP_ID=cli_xxxxxxxxxxxxxxxx
 LARK_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-强烈建议**也设这两项**：
-```bash
-# Claude 真正工作的目录 — 改成你想让它操作的项目根目录
-POCKET_CC_WORKSPACE=/home/your-user/projects/some-repo
+其他可选项见 `.env.example` 注释。
 
-# 白名单 — 多人部署必填，自用可省略
-POCKET_CC_USER_WHITELIST=ou_aaa111,ou_bbb222
+### 6.1 配置授权用户（必填）— `~/.pocket-cc/users.toml`
+
+白名单 + 每个用户的工作目录都写在这个 TOML 文件里。**至少要有一个用户条目**，否则启动会报错。
+
+```bash
+mkdir -p ~/.pocket-cc
+cat > ~/.pocket-cc/users.toml <<'EOF'
+[users.ou_aaa111]
+workspace = "/home/your-user/workspace/alice"
+display_name = "alice"
+
+[users.ou_bbb222]
+workspace = "/home/your-user/workspace/bob"
+display_name = "bob"
+EOF
 ```
 
-其他可选项见 `.env.example` 注释。
+每个用户：
+- key 是飞书 `open_id`（用户首次发消息时 pocket-cc 会拒收并在日志里打出对应 open_id，复制回来即可）
+- `workspace`：该用户 Claude 的 cwd，**必须是已存在、可写、且与其他用户互不包含的目录**
+- `display_name`：tmux window 命名 + 日志用，纯展示
+
+修改后必须重启 pocket-cc 进程才会生效。
 
 ---
 
@@ -325,8 +340,8 @@ systemctl --user restart pocket-cc    # 重启
 
 ## 12. 安全建议
 
-- **白名单非空**：生产环境一定填 `POCKET_CC_USER_WHITELIST`
-- **workspace 限制**：让 `POCKET_CC_WORKSPACE` 指向单一项目目录，不要指 `/` 或 `~`
+- **`users.toml` 维护好**：白名单 = users 表的 keys，没列进去的 `open_id` 一律拒收
+- **workspace 隔离**：每个用户独立目录，不要指 `/` 或 `~`；config 加载时已经禁止用户间互相包含
 - **不要用 root 跑 pocket-cc**：Claude Code 跑啥都用这个用户的权限
 - **不要用 bypass 模式**（除非沙箱环境）：默认 `claude`（不带 `--permission-mode bypassPermissions`）让 Claude 该问就问，pocket-cc 会把 permission prompt 投到飞书让你确认
 

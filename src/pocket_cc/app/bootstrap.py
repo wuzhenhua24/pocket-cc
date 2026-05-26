@@ -6,7 +6,6 @@ clients. It's constructed once with a :class:`Config`, exposes `start()`
 
 Lifecycle:
     1. start()
-       ├─ mkdir workspace_root if missing
        ├─ tmux.ensure_session
        ├─ TranscriptPoller.start()        ← background thread
        └─ LarkEventLoop.start()            ← blocks here
@@ -163,9 +162,7 @@ def _restore_one_binding(
     return True
 
 
-def _patch_orphan_card(
-    chat_id: str, active_card: dict[str, Any], *, lark: LarkClient
-) -> None:
+def _patch_orphan_card(chat_id: str, active_card: dict[str, Any], *, lark: LarkClient) -> None:
     message_id = active_card.get("message_id")
     if not isinstance(message_id, str) or not message_id:
         return
@@ -247,7 +244,8 @@ class Pocketcc:
 
     def start(self) -> None:
         """Boot all subsystems and block on the Lark WS loop."""
-        self._config.workspace_root.mkdir(parents=True, exist_ok=True)
+        # Per-user workspaces are validated (existence + writability) at config
+        # load time; nothing to create here.
         self._tmux.ensure_session()
         # Re-attach bindings from the previous process **before** any poller
         # starts touching the registry — otherwise a restored binding could
@@ -266,8 +264,10 @@ class Pocketcc:
             "pocket-cc starting",
             extra={
                 "tmux_session": self._config.tmux_session,
-                "workspace": str(self._config.workspace_root),
-                "whitelist_open": self._config.is_whitelist_open,
+                "users": [
+                    {"open_id": u.open_id, "workspace": str(u.workspace)}
+                    for u in self._config.users.values()
+                ],
             },
         )
         try:

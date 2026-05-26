@@ -214,9 +214,7 @@ class InputRouter:
     # ================================================================ helpers
 
     def _is_allowed(self, sender_open_id: str) -> bool:
-        if self._config.is_whitelist_open:
-            return True
-        return sender_open_id in self._config.user_whitelist
+        return sender_open_id in self._config.users
 
     def _is_duplicate(self, key: str) -> bool:
         """Return True if ``key`` was seen recently; otherwise record it."""
@@ -230,13 +228,13 @@ class InputRouter:
         return False
 
     def _create_binding(self, msg: IncomingMessage) -> ChatBinding | None:
-        cwd = self._config.workspace_root
+        # `_is_allowed` already gated this open_id; the lookup must hit.
+        cwd = self._config.users[msg.sender_open_id].workspace
         # Snapshot *before* spawning Claude — so the snapshot reflects the
         # pre-bot state of the projects dir. Any jsonl that appears after
         # this point is necessarily our Claude's.
         existing = snapshot_existing_transcripts(cwd, self._config.claude_projects_dir)
         try:
-            cwd.mkdir(parents=True, exist_ok=True)
             window = self._tmux.new_window(
                 name=f"chat-{msg.chat_id[-8:] or 'unknown'}",
                 cwd=str(cwd),

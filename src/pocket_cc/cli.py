@@ -42,11 +42,10 @@ def run(verbose: bool) -> None:
 
     click.echo("pocket-cc starting…")
     click.echo(f"  tmux session  : {cfg.tmux_session}")
-    click.echo(f"  workspace     : {cfg.workspace_root}")
     click.echo(f"  claude command: {cfg.claude_command}")
-    click.echo(
-        f"  whitelist     : {'open (any user)' if cfg.is_whitelist_open else f'{len(cfg.user_whitelist)} user(s)'}"
-    )
+    click.echo(f"  users         : {len(cfg.users)}")
+    for user in cfg.users.values():
+        click.echo(f"    - {user.display_name} ({user.open_id}) → {user.workspace}")
     click.echo(f"  patch interval: {cfg.patch_interval_s}s")
     click.echo(f"  poll interval : {cfg.transcript_poll_s}s")
     click.echo()

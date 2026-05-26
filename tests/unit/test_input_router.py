@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path  # noqa: TC003 — used in test signatures
+from types import MappingProxyType
 from typing import Any, cast
 
-from pocket_cc.app.config import Config
+from pocket_cc.app.config import Config, User
 from pocket_cc.app.persistence import ChatBinding, Registry
 from pocket_cc.lark.client import FakeLarkClient
 from pocket_cc.lark.event_loop import CardAction, IncomingMessage
@@ -75,15 +76,25 @@ class FakeTmuxManager:
         return self.capture_pane_text
 
 
-def _make_config(*, workspace: Path, whitelist: frozenset[str] = frozenset()) -> Config:
+def _make_config(
+    *,
+    workspace: Path,
+    open_id: str = "ou_user1",
+    extra_users: dict[str, Path] | None = None,
+) -> Config:
+    users: dict[str, User] = {
+        open_id: User(open_id=open_id, workspace=workspace, display_name="test"),
+    }
+    if extra_users:
+        for oid, ws in extra_users.items():
+            users[oid] = User(open_id=oid, workspace=ws, display_name=oid)
     return Config(
         app_id="cli_x",
         app_secret="secret",
         lark_domain="https://open.feishu.cn",
-        workspace_root=workspace,
+        users=MappingProxyType(users),
         claude_command="claude --permission-mode bypassPermissions",
         tmux_session="pocket-cc-test",
-        user_whitelist=whitelist,
         patch_interval_s=10.0,  # so the bg stream thread doesn't actually patch during tests
         transcript_poll_s=0.5,
         events_poll_s=0.5,
@@ -123,9 +134,7 @@ def _real_controller_for(lark: FakeLarkClient, config: Config) -> Any:
     def provider(binding: ChatBinding) -> TurnController:
         controller = cache.get(binding.chat_id)
         if controller is None or controller.binding is not binding:
-            controller = TurnController(
-                binding=binding, lark=cast("Any", lark), config=config
-            )
+            controller = TurnController(binding=binding, lark=cast("Any", lark), config=config)
             cache[binding.chat_id] = controller
         return controller
 
@@ -204,21 +213,21 @@ def _message(
 # ----------------------------------------------------------------- whitelist
 
 
-def test_open_whitelist_lets_anyone_in(tmp_path: Path) -> None:
-    cfg = _make_config(workspace=tmp_path)
+def test_whitelisted_user_creates_binding(tmp_path: Path) -> None:
+    cfg = _make_config(workspace=tmp_path, open_id="ou_user1")
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
     registry = Registry()
     router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
 
-    router.handle_message(_message(sender_open_id="ou_anyone"))
+    router.handle_message(_message(sender_open_id="ou_user1"))
 
     assert registry.get("oc_chat1") is not None
     assert any(c.method == "send_text" for c in tmux.calls)
 
 
-def test_closed_whitelist_denies_outsider(tmp_path: Path) -> None:
-    cfg = _make_config(workspace=tmp_path, whitelist=frozenset({"ou_allowed"}))
+def test_non_whitelisted_user_denied(tmp_path: Path) -> None:
+    cfg = _make_config(workspace=tmp_path, open_id="ou_allowed")
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
     registry = Registry()
@@ -509,9 +518,7 @@ def test_card_action_mode_btab_reads_mode_back_and_rerenders(tmp_path: Path) -> 
         input_module._MODE_READBACK_DELAY_S = orig_delay
 
     # BTab was sent to tmux
-    assert any(
-        c.method == "send_key" and c.kwargs["key"] == "BTab" for c in tmux.calls
-    )
+    assert any(c.method == "send_key" and c.kwargs["key"] == "BTab" for c in tmux.calls)
     # The pane was captured back, mode parsed, binding updated, card re-rendered.
     binding = registry.get("oc_chat1")
     assert binding is not None
