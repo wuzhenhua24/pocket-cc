@@ -16,6 +16,7 @@ Schema docs: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/im-v1/message
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 
@@ -216,11 +217,19 @@ def _convert_tables(text: str) -> str:
         if i + 1 < n and _TABLE_ROW_RE.match(lines[i]) and _TABLE_SEP_RE.match(lines[i + 1]):
             header = _parse_row(lines[i])
             i += 2  # consume header + separator
+            data_rows: list[list[str]] = []
             while i < n and _TABLE_ROW_RE.match(lines[i]):
                 row = _parse_row(lines[i])
                 if row:
-                    out.append(_render_row_as_list_item(header, row))
+                    data_rows.append(row)
                 i += 1
+            # Decide rendering mode for the *whole* table — mixing code-block
+            # and bullet rows in one table would look incoherent.
+            if _should_use_code_block_table(header, data_rows):
+                out.append(_render_as_code_block_table(header, data_rows))
+            else:
+                for row in data_rows:
+                    out.append(_render_row_as_list_item(header, row))
             continue
         out.append(lines[i])
         i += 1
@@ -265,6 +274,77 @@ def _render_row_as_list_item(header: list[str], row: list[str]) -> str:
         else:
             pairs.append(value)
     return "- " + " · ".join(pairs)
+
+
+# ---- code-block table rendering --------------------------------------------
+# When a table's cells are short and free of inline markdown, rendering it as
+# a fenced ``` block lets Lark's monospace font preserve column alignment —
+# users *see* a table instead of a bullet list. Falls back to bullets when:
+#   - only one column (the bullet form is already cleaner)
+#   - any cell contains inline markdown (bold / code / link) that would print
+#     as literal text inside a code fence — a regression vs the bullet form
+#   - any cell exceeds ``_CODE_BLOCK_CELL_WIDTH_LIMIT`` display chars (long
+#     prose would force horizontal scroll on mobile, worse than wrapping
+#     bullets)
+
+_CODE_BLOCK_CELL_WIDTH_LIMIT: Final[int] = 24
+
+# Inline markdown markers whose literals would survive a code fence and look
+# wrong: ``**bold**``, ``__under__``, `` `code` ``, ``[text](url)``.
+_INLINE_MD_IN_CELL_RE: Final[re.Pattern[str]] = re.compile(r"\*\*|__|`|\[.+?\]\(")
+
+
+def _display_width(s: str) -> int:
+    """Monospace display width: CJK / fullwidth = 2 cells, other = 1.
+
+    Uses :func:`unicodedata.east_asian_width` — ``W`` (Wide) / ``F`` (Fullwidth)
+    get 2, everything else 1. Good enough for the alignment we need; doesn't
+    handle combining marks (rare in Claude output) or emoji (variable across
+    fonts but ASCII-width is usually close enough).
+    """
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+
+def _should_use_code_block_table(header: list[str], rows: list[list[str]]) -> bool:
+    if len(header) < 2:
+        return False
+    all_cells = [*header, *(c for r in rows for c in r)]
+    if any(_INLINE_MD_IN_CELL_RE.search(c) for c in all_cells):
+        return False
+    if any(_display_width(c) > _CODE_BLOCK_CELL_WIDTH_LIMIT for c in all_cells):
+        return False
+    return True
+
+
+def _render_as_code_block_table(header: list[str], rows: list[list[str]]) -> str:
+    """Render a header + rows as a fenced code block with pipe-aligned columns.
+
+    Example output (back-tick-fenced)::
+
+        模块            | 说明
+        ------------- | ----------------------
+        ploto-bff     | Backend for Frontend 层
+        ploto-monitor | 监控指标功能
+    """
+    n_cols = len(header)
+    col_widths = [_display_width(h) for h in header]
+    for row in rows:
+        for i in range(min(n_cols, len(row))):
+            col_widths[i] = max(col_widths[i], _display_width(row[i]))
+
+    def _pad(cell: str, width: int) -> str:
+        # Pad right with spaces, accounting for east-asian width.
+        return cell + " " * (width - _display_width(cell))
+
+    sep_cells = ["-" * w for w in col_widths]
+    body_lines = [" | ".join(_pad(h, w) for h, w in zip(header, col_widths))]
+    body_lines.append(" | ".join(sep_cells))
+    for row in rows:
+        padded = list(row) + [""] * max(0, n_cols - len(row))
+        body_lines.append(
+            " | ".join(_pad(c, w) for c, w in zip(padded[:n_cols], col_widths))
+        )
+    return "```\n" + "\n".join(body_lines) + "\n```"
 
 
 # -------------------------------------------------------------------- helpers
