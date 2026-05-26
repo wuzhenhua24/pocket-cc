@@ -187,17 +187,26 @@ class InputRouter:
 
     # ============================================================ card actions
 
-    def handle_card_action(self, action: CardAction) -> None:
+    def handle_card_action(self, action: CardAction) -> dict[str, Any] | None:
+        """Route a card-button click and optionally return the patched card.
+
+        When a handler returns a dict, the LarkEventLoop ships it back in the
+        same WS frame as the trigger — Lark renders the new card immediately,
+        with no follow-up REST PATCH and no 1.5s throttle wait. Returning
+        ``None`` is the default ("no card update") and is what every handler
+        does unless instant feedback is worth the wiring (today: only the
+        waiting-response button).
+        """
         if self._is_duplicate(f"card:{action.token}"):
             logger.info(
                 "dropped duplicate card action",
                 extra={"token": action.token, "message_id": action.message_id},
             )
-            return
+            return None
         binding = self._registry.find_by_card_message_id(action.message_id)
         if binding is None:
             logger.info("card_action on unknown card", extra={"message_id": action.message_id})
-            return
+            return None
 
         cmd = action.value.get("action", "")
         try:
@@ -217,7 +226,12 @@ class InputRouter:
             elif cmd == "show_pane":
                 self._dump_pane(binding)
             elif cmd == "waiting_response":
-                self._handle_waiting_response(binding, action.value)
+                # Only path that can benefit from the WS-return optimization:
+                # the user just tapped an option, the card needs to flip out
+                # of the ❓ waiting state right now or the buttons sit there
+                # looking unclicked. Returning the new card to the dispatcher
+                # makes that round-trip a single WS frame.
+                return self._handle_waiting_response(binding, action.value)
             else:
                 logger.info("unknown card action", extra={"value": action.value})
         except TmuxError:
@@ -226,6 +240,7 @@ class InputRouter:
                 extra={"chat_id": binding.chat_id, "cmd": cmd},
                 exc_info=True,
             )
+        return None
 
     # ================================================================ helpers
 
@@ -413,33 +428,44 @@ class InputRouter:
             logger.exception("tmux send_text failed during continuation")
             self._close_turn(binding, state="failed", error=str(e))
 
-    def _handle_waiting_response(self, binding: ChatBinding, value: dict[str, Any]) -> None:
-        """User tapped an option button on a waiting card."""
+    def _handle_waiting_response(
+        self, binding: ChatBinding, value: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """User tapped an option button on a waiting card.
+
+        Returns the cleared-waiting card dict so the dispatcher can ship it
+        back in the same WS frame — Lark renders the flipped-out-of-waiting
+        card instantly, no extra PATCH. ``None`` on the no-op paths (no
+        waiting state, malformed index) and on tmux failure (the failed seal
+        below issues its own terminal-state PATCH; returning the now-stale
+        "running" card via WS would briefly flicker before the seal lands).
+        """
         turn = binding.current_turn
         if turn is None or turn.waiting_for is None:
             logger.info(
                 "waiting_response on a turn without active waiting state",
                 extra={"chat_id": binding.chat_id},
             )
-            return
+            return None
         try:
             index = int(value.get("index", -1))
         except (TypeError, ValueError):
             logger.info("waiting_response with non-int index", extra={"value": value})
-            return
+            return None
         options = turn.waiting_for.options
         if not (0 <= index < len(options)):
             logger.info(
                 "waiting_response index out of range",
                 extra={"index": index, "n_options": len(options)},
             )
-            return
+            return None
         option = options[index]
-        # Clear waiting + flip the card back to running *now* (before the tmux
-        # send, even), so the buttons disappear immediately when the user taps.
-        # Otherwise the card sits in waiting state until the next poll tick — a
-        # noticeable lag in real-world testing.
-        self._controller_for(binding).clear_waiting_and_rerender()
+        # Clear waiting + build the next card under the controller lock, but
+        # *don't* push it through the throttled stream — return it so the
+        # dispatcher can deliver it in the WS response frame. The transcript
+        # poller's next tick will resume normal stream updates with whatever
+        # new content has arrived since.
+        new_card = self._controller_for(binding).clear_waiting_and_build_card()
         try:
             response = option.response
             if isinstance(response, TextResponse):
@@ -450,6 +476,8 @@ class InputRouter:
         except TmuxError as e:
             logger.exception("tmux failure dispatching waiting_response")
             self._close_turn(binding, state="failed", error=str(e))
+            return None
+        return new_card
 
     def _handle_key_sequence(self, binding: ChatBinding, value: dict[str, Any]) -> None:
         """Send multiple tmux keys with optional delay between them.

@@ -164,6 +164,13 @@ class _RecordingController:
         self._calls.append((self._real.binding.chat_id, "clear_waiting"))
         self._real.clear_waiting_and_rerender()
 
+    def clear_waiting_and_build_card(self) -> dict[str, Any] | None:
+        # WS-return variant: distinct method but the spy uses the same tag so
+        # existing call-order assertions keep working regardless of which path
+        # the router takes (text continuation → patch; button → WS return).
+        self._calls.append((self._real.binding.chat_id, "clear_waiting"))
+        return self._real.clear_waiting_and_build_card()
+
     def update_mode(self, mode: str) -> None:
         self._calls.append((self._real.binding.chat_id, f"mode:{mode}"))
         self._real.update_mode(mode)
@@ -915,8 +922,9 @@ def test_card_action_waiting_response_text_dispatches_send_text(tmp_path: Path) 
     router.handle_message(_message())
     card_id = lark.last_sent().message_id
     _set_waiting_on_active_turn(registry, "oc_chat1")
+    patches_before = len(lark.patches)
 
-    router.handle_card_action(
+    result = router.handle_card_action(
         CardAction(
             message_id=card_id,
             chat_id="oc_chat1",
@@ -934,6 +942,15 @@ def test_card_action_waiting_response_text_dispatches_send_text(tmp_path: Path) 
     assert binding is not None
     assert binding.current_turn is not None
     assert binding.current_turn.waiting_for is None
+    # WS round-trip optimization: the handler returns the cleared-waiting
+    # card so the dispatcher can ship it back in the same WS frame instead
+    # of issuing a follow-up PATCH. Lark renders the running-state card
+    # instantly when the user taps the option button.
+    assert isinstance(result, dict)
+    assert result["header"]["template"] == "blue"  # running state
+    # And we did NOT push a separate PATCH for that same rerender — the WS
+    # response carries it. (Future transcript ticks still PATCH normally.)
+    assert len(lark.patches) == patches_before
 
 
 def test_card_action_waiting_response_keys_dispatches_send_key_sequence(
@@ -997,6 +1014,50 @@ def test_card_action_waiting_response_index_out_of_range_is_noop(tmp_path: Path)
     assert binding.current_turn.waiting_for is not None
 
 
+def test_card_action_non_waiting_paths_return_none(tmp_path: Path) -> None:
+    """Only the waiting-response button benefits from the WS-return path —
+    every other action (cancel / key / key_sequence / show_pane / unknown)
+    returns None so the dispatcher uses the SDK's default no-card-update
+    response. Asserting this keeps the WS frame size small for the common
+    case of buttons that only side-effect tmux."""
+    import pocket_cc.relay.input as input_module
+
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+
+    def _act(value: dict[str, Any], token: str) -> dict[str, Any] | None:
+        return router.handle_card_action(
+            CardAction(
+                message_id=card_id,
+                chat_id="oc_chat1",
+                sender_open_id="ou_user1",
+                token=token,
+                tag="button",
+                value=value,
+            )
+        )
+
+    # Stretch the mode readback delay to 0 so the BTab-triggered pane scrape
+    # doesn't sleep the whole 0.35s during this test.
+    orig_mode_delay = input_module._MODE_READBACK_DELAY_S
+    input_module._MODE_READBACK_DELAY_S = 0.0
+    try:
+        assert _act({"action": "key", "key": "Escape"}, "t1") is None
+        assert _act({"action": "key", "key": "BTab"}, "t2") is None
+        assert (
+            _act({"action": "key_sequence", "keys": ["Up", "Enter"], "delay_ms": 0}, "t3") is None
+        )
+        assert _act({"action": "show_pane"}, "t4") is None
+        assert _act({"action": "whatever_unknown"}, "t5") is None
+    finally:
+        input_module._MODE_READBACK_DELAY_S = orig_mode_delay
+
+
 def test_card_action_waiting_response_no_active_waiting_is_noop(tmp_path: Path) -> None:
     cfg = _make_config(workspace=tmp_path)
     tmux = FakeTmuxManager()
@@ -1008,7 +1069,7 @@ def test_card_action_waiting_response_no_active_waiting_is_noop(tmp_path: Path) 
     tmux_calls_before = len(tmux.calls)
 
     # No waiting_for set — clicking the waiting button is a no-op
-    router.handle_card_action(
+    result = router.handle_card_action(
         CardAction(
             message_id=card_id,
             chat_id="oc_chat1",
@@ -1020,6 +1081,8 @@ def test_card_action_waiting_response_no_active_waiting_is_noop(tmp_path: Path) 
     )
 
     assert len(tmux.calls) == tmux_calls_before
+    # No-op paths return None so the WS dispatcher doesn't ship a stale card.
+    assert result is None
 
 
 def test_card_action_waiting_response_bad_index_type_is_noop(tmp_path: Path) -> None:

@@ -17,6 +17,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import lark_oapi as lark
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTriggerResponse,
+)
 
 if TYPE_CHECKING:
     from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
@@ -51,7 +54,12 @@ class CardAction:
 
 
 MessageHandler = Callable[[IncomingMessage], None]
-CardActionHandler = Callable[[CardAction], None]
+# Card action handlers may *optionally* return a card dict — the SDK ships it
+# back in the same WS frame as the user's button-click event so Lark renders
+# it without a follow-up REST PATCH. ``None`` means "no card update" (the
+# common case for buttons that only fire tmux keys). The dict, when present,
+# is the same shape ``lark.card.build_status_card`` produces.
+CardActionHandler = Callable[[CardAction], dict[str, Any] | None]
 
 
 class LarkEventLoop:
@@ -115,13 +123,33 @@ class LarkEventLoop:
         if msg is not None:
             handler(msg)
 
-    def _dispatch_card_action(self, data: P2CardActionTrigger) -> None:
+    def _dispatch_card_action(
+        self, data: P2CardActionTrigger
+    ) -> P2CardActionTriggerResponse | None:
+        """Run the registered handler and, if it returned a card dict, wrap it
+        in the SDK's response envelope so Lark renders the patched card from
+        the same WS frame — no extra REST PATCH.
+
+        Returning ``None`` (the default for buttons that only side-effect tmux)
+        leaves the SDK's outer dispatcher to ship the standard "no update"
+        response, matching the historical behaviour.
+        """
         handler = self._on_card_action
         if handler is None:
-            return
+            return None
         action = _to_card_action(data)
-        if action is not None:
-            handler(action)
+        if action is None:
+            return None
+        card = handler(action)
+        if card is None:
+            return None
+        # "raw" tells Lark `data` is the full card schema (the same dict shape
+        # our card.py builders produce), not a template id + variables pair.
+        # Pass the whole tree as nested dict literals — the SDK's ``init``
+        # walks ``_types`` and rebuilds the typed model from each sub-dict;
+        # passing pre-built ``CallBackCard`` instances trips its parser
+        # (which expects dicts at every nested level).
+        return P2CardActionTriggerResponse({"card": {"type": "raw", "data": card}})
 
 
 # ------------------------------------------------------------ field extractors

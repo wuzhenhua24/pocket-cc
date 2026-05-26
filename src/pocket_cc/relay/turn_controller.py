@@ -568,6 +568,30 @@ class TurnController:
         if pending is not None:
             pending[0].update(pending[1])
 
+    def clear_waiting_and_build_card(self) -> dict[str, Any] | None:
+        """Like :meth:`clear_waiting_and_rerender`, but returns the new card
+        dict for the caller to deliver out-of-band (e.g. via the WS card-action
+        response) instead of pushing it through the throttled :class:`CardStream`.
+
+        Used by the card-action path so the user sees the cleared-waiting card
+        in the same WS round-trip they tapped the button — no extra PATCH, no
+        1.5s throttle wait. Pure projection: we don't touch the stream's
+        ``_pending`` here, so if a transcript tick later renders fresher
+        content the stream's next flush is the normal patch with that newer
+        snapshot (not a redundant re-send of this card).
+
+        Returns ``None`` when no turn is active (the caller then returns None
+        from its handler, and the dispatcher falls back to the default
+        no-card-update response).
+        """
+        with self._lock:
+            turn = self._binding.current_turn
+            if turn is None:
+                return None
+            turn.waiting_for = None
+            _stream, card = self._render_locked(turn)
+            return card
+
     def update_mode(self, mode: str) -> None:
         """Record a permission-mode change and refresh the Mode button.
 

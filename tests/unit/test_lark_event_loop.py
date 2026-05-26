@@ -251,10 +251,35 @@ def test_dispatch_message_routes_to_registered_handler() -> None:
 def test_dispatch_card_action_routes_to_registered_handler() -> None:
     loop = LarkEventLoop(app_id="x", app_secret="y")
     received: list[CardAction] = []
-    loop.on_card_action(received.append)
-    loop._dispatch_card_action(_card_envelope(value={"action": "ack"}))
+
+    def handler(a: CardAction) -> None:
+        received.append(a)
+        return None
+
+    loop.on_card_action(handler)
+    response = loop._dispatch_card_action(_card_envelope(value={"action": "ack"}))
     assert len(received) == 1
     assert received[0].value == {"action": "ack"}
+    # Handler returned None → dispatcher returns None so the SDK ships its
+    # default no-update response.
+    assert response is None
+
+
+def test_dispatch_card_action_handler_returning_dict_wraps_into_ws_response() -> None:
+    """Handler that returns a card dict gets wrapped in
+    P2CardActionTriggerResponse with ``card.type="raw"`` + ``card.data=<dict>``.
+    This is the WS-return optimization: Lark renders the patched card from the
+    same trigger frame, no follow-up REST PATCH. Verifies our wrapper shape
+    matches the SDK schema so the JSON marshalled back to Lark is well-formed.
+    """
+    loop = LarkEventLoop(app_id="x", app_secret="y")
+    sample_card = {"header": {"template": "blue"}, "elements": []}
+    loop.on_card_action(lambda _a: sample_card)
+    response = loop._dispatch_card_action(_card_envelope(value={"action": "waiting_response"}))
+    assert response is not None
+    assert response.card is not None
+    assert response.card.type == "raw"
+    assert response.card.data == sample_card
 
 
 def test_dispatch_without_handler_does_not_crash() -> None:
