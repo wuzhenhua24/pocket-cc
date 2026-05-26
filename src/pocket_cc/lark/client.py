@@ -96,7 +96,11 @@ class LarkOapiClient:
             CreateMessageRequestBody.builder()
             .receive_id(chat_id)
             .msg_type("text")
-            .content(json.dumps({"text": text}))
+            # ensure_ascii=False keeps CJK literal in the wire payload —
+            # matches the rest of pocket-cc (persistence / events / hooks /
+            # card_stream all set this) and roughly halves the byte cost of
+            # Chinese card bodies vs the json default's \uXXXX escapes.
+            .content(json.dumps({"text": text}, ensure_ascii=False))
             .build()
         )
         return self._create_message(chat_id, body)
@@ -106,7 +110,7 @@ class LarkOapiClient:
             CreateMessageRequestBody.builder()
             .receive_id(chat_id)
             .msg_type("interactive")
-            .content(json.dumps(card))
+            .content(json.dumps(card, ensure_ascii=False))
             .build()
         )
         return self._create_message(chat_id, body)
@@ -115,7 +119,11 @@ class LarkOapiClient:
         req = (
             PatchMessageRequest.builder()
             .message_id(message_id)
-            .request_body(PatchMessageRequestBody.builder().content(json.dumps(card)).build())
+            .request_body(
+                PatchMessageRequestBody.builder()
+                .content(json.dumps(card, ensure_ascii=False))
+                .build()
+            )
             .build()
         )
         resp = self._rest.im.v1.message.patch(req)
