@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -323,6 +324,16 @@ class Pocketcc:
 
         self._loop.on_message(self._router.handle_message)
         self._loop.on_card_action(self._router.handle_card_action)
+        # Observability for WS disconnects: log when the SDK starts retrying
+        # and the downtime once it succeeds. EventsPoller / TranscriptPoller
+        # run independently of the WS so hooks + transcript updates keep
+        # flowing during a brief drop; the visible failure mode is *inbound*
+        # (messages + card actions Lark queued while we were unreachable).
+        # These logs make "user says they sent a message but nothing
+        # happened" trivially correlatable with a downtime window.
+        self._ws_disconnect_started_at: float | None = None
+        self._loop.on_reconnecting(self._handle_ws_reconnecting)
+        self._loop.on_reconnected(self._handle_ws_reconnected)
 
     # -------------------------------------------------------------- lifecycle
 
@@ -444,6 +455,30 @@ class Pocketcc:
         )
         self._drain_transcript_for_seal(binding)
         self._controller_for(binding).seal_on_stop(state="failed", error=error_msg)
+
+    # --------------------------------------------------- ws reconnect callbacks
+
+    def _handle_ws_reconnecting(self) -> None:
+        """SDK began retrying after a dropped WS — start the downtime clock.
+
+        Fires on the SDK's asyncio loop thread. ``monotonic`` so the duration
+        is robust against wall-clock jumps (NTP corrections, suspend/resume).
+        A second drop before reconnect would overwrite the timestamp — fine,
+        we report the most recent gap.
+        """
+        self._ws_disconnect_started_at = time.monotonic()
+        logger.warning("ws reconnecting", extra={"event": "ws_reconnecting"})
+
+    def _handle_ws_reconnected(self) -> None:
+        """SDK re-established the WS — log downtime so we can correlate user
+        reports ("I sent a message and nothing happened") with the gap."""
+        started = self._ws_disconnect_started_at
+        downtime_s = round(time.monotonic() - started, 2) if started is not None else None
+        self._ws_disconnect_started_at = None
+        logger.info(
+            "ws reconnected",
+            extra={"event": "ws_reconnected", "downtime_s": downtime_s},
+        )
 
     def _drain_transcript_for_seal(self, binding: ChatBinding) -> None:
         """Pull any pending transcript events into the accumulator before sealing.

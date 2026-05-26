@@ -273,7 +273,7 @@ def test_dispatch_card_action_handler_returning_dict_wraps_into_ws_response() ->
     matches the SDK schema so the JSON marshalled back to Lark is well-formed.
     """
     loop = LarkEventLoop(app_id="x", app_secret="y")
-    sample_card = {"header": {"template": "blue"}, "elements": []}
+    sample_card: dict[str, Any] = {"header": {"template": "blue"}, "elements": []}
     loop.on_card_action(lambda _a: sample_card)
     response = loop._dispatch_card_action(_card_envelope(value={"action": "waiting_response"}))
     assert response is not None
@@ -294,3 +294,90 @@ def test_event_loop_construction_does_not_open_ws() -> None:
     loop.on_message(lambda _m: None)
     loop.on_card_action(lambda _a: None)
     assert loop._ws is None
+
+
+# --------------------------------------------------- reconnect-lifecycle wiring
+
+
+def test_reconnect_handlers_default_to_unset() -> None:
+    """Bare construction leaves the reconnect observers unset so
+    :meth:`start` will not overwrite the SDK's no-op defaults on ws.Client.
+    Tests that don't care about reconnect observability stay free of the
+    SDK plumbing.
+    """
+    loop = LarkEventLoop(app_id="x", app_secret="y")
+    assert loop._on_reconnecting is None
+    assert loop._on_reconnected is None
+
+
+def test_reconnect_handlers_round_trip_through_setters() -> None:
+    """Setters store the callable so :meth:`start` can later apply it onto
+    ws.Client. Re-registration overwrites — same contract as on_message."""
+    loop = LarkEventLoop(app_id="x", app_secret="y")
+    calls: list[str] = []
+    loop.on_reconnecting(lambda: calls.append("rcn"))
+    loop.on_reconnected(lambda: calls.append("rcd"))
+    assert loop._on_reconnecting is not None
+    assert loop._on_reconnected is not None
+    loop._on_reconnecting()
+    loop._on_reconnected()
+    assert calls == ["rcn", "rcd"]
+
+
+def test_start_propagates_reconnect_handlers_to_ws_client(monkeypatch: Any) -> None:
+    """``start`` wires our handlers onto the SDK's ws.Client so the SDK fires
+    them on the real reconnect lifecycle. Defaults that weren't set must not
+    overwrite the SDK's built-in no-op attributes.
+    """
+    import lark_oapi
+
+    from pocket_cc.lark import event_loop as event_loop_module
+
+    @dataclass
+    class FakeWsClient:
+        app_id: str
+        app_secret: str
+        event_handler: Any
+        log_level: Any
+        on_reconnecting: Any = None
+        on_reconnected: Any = None
+        started: bool = False
+
+        def __init__(
+            self, app_id: str, app_secret: str, *, event_handler: Any, log_level: Any
+        ) -> None:
+            self.app_id = app_id
+            self.app_secret = app_secret
+            self.event_handler = event_handler
+            self.log_level = log_level
+            # SDK installs no-op lambdas in its __init__; mimic that so the
+            # "default preserved" assertion isn't fooled by an attribute that
+            # never existed in the first place.
+            self.on_reconnecting = lambda: None
+            self.on_reconnected = lambda: None
+            self.started = False
+
+        def start(self) -> None:
+            # Real ws.Client.start() blocks on the asyncio loop forever; we
+            # just record the call so the test returns deterministically.
+            self.started = True
+
+    fake_ws_module = type("FakeWsModule", (), {"Client": FakeWsClient})()
+    monkeypatch.setattr(lark_oapi, "ws", fake_ws_module)
+    monkeypatch.setattr(event_loop_module.lark, "ws", fake_ws_module)
+
+    loop = LarkEventLoop(app_id="x", app_secret="y")
+    seen: list[str] = []
+    loop.on_reconnecting(lambda: seen.append("rcn"))
+    # Intentionally *don't* register on_reconnected — verifies that unset
+    # handlers leave the SDK default untouched.
+    loop.start()
+
+    ws: FakeWsClient = loop._ws  # type: ignore[assignment]
+    assert ws.started is True
+    # Registered handler propagated.
+    ws.on_reconnecting()
+    assert seen == ["rcn"]
+    # Unregistered handler stays as the SDK-installed no-op (callable, returns
+    # None, doesn't raise).
+    assert ws.on_reconnected() is None

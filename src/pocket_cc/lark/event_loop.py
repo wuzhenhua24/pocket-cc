@@ -60,6 +60,12 @@ MessageHandler = Callable[[IncomingMessage], None]
 # common case for buttons that only fire tmux keys). The dict, when present,
 # is the same shape ``lark.card.build_status_card`` produces.
 CardActionHandler = Callable[[CardAction], dict[str, Any] | None]
+# WS reconnect-lifecycle observers. The SDK fires ``on_reconnecting`` when it
+# decides the connection was lost and begins retrying, then ``on_reconnected``
+# on the first successful re-establishment. Both are best-effort and run on
+# the asyncio loop thread the SDK owns — callers must keep them fast and
+# non-blocking (logging / tiny state writes only).
+ReconnectHandler = Callable[[], None]
 
 
 class LarkEventLoop:
@@ -84,6 +90,8 @@ class LarkEventLoop:
         self._log_level = log_level if log_level is not None else lark.LogLevel.INFO
         self._on_message: MessageHandler | None = None
         self._on_card_action: CardActionHandler | None = None
+        self._on_reconnecting: ReconnectHandler | None = None
+        self._on_reconnected: ReconnectHandler | None = None
         self._ws: Any = None
 
     def on_message(self, handler: MessageHandler) -> None:
@@ -91,6 +99,23 @@ class LarkEventLoop:
 
     def on_card_action(self, handler: CardActionHandler) -> None:
         self._on_card_action = handler
+
+    def on_reconnecting(self, handler: ReconnectHandler) -> None:
+        """Register a callback fired when the SDK starts reconnecting.
+
+        Fires once per disconnect (not once per retry attempt). Runs on the
+        SDK's asyncio loop thread — keep the handler fast and non-blocking.
+        Replaces any previously-registered handler.
+        """
+        self._on_reconnecting = handler
+
+    def on_reconnected(self, handler: ReconnectHandler) -> None:
+        """Register a callback fired when the SDK re-establishes the WS.
+
+        Pairs with :meth:`on_reconnecting`. Same threading constraints apply.
+        Replaces any previously-registered handler.
+        """
+        self._on_reconnected = handler
 
     def start(self) -> None:
         """Open the WS connection. Blocks indefinitely (auto-reconnects on drop)."""
@@ -109,6 +134,14 @@ class LarkEventLoop:
             event_handler=dispatcher,
             log_level=self._log_level,
         )
+        # Wire reconnect-lifecycle observers if the caller registered any. The
+        # SDK exposes these as plain attributes (default to no-op lambdas); we
+        # overwrite only when we actually have a handler so unrelated tests /
+        # callers that don't care keep the SDK default.
+        if self._on_reconnecting is not None:
+            self._ws.on_reconnecting = self._on_reconnecting
+        if self._on_reconnected is not None:
+            self._ws.on_reconnected = self._on_reconnected
         # NOTE: SDK pins `proxy=None` so WS bypasses HTTPS_PROXY/ALL_PROXY by design.
         # Networks that require a proxy to reach Lark need to undo this — see DESIGN.md §10.
         self._ws.start()
