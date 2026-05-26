@@ -31,16 +31,37 @@ from lark_oapi.api.im.v1 import (
     PatchMessageRequestBody,
 )
 
+from pocket_cc.lark.error_codes import LarkErrorKind, classify, is_retryable
+
 
 class LarkApiError(RuntimeError):
-    """A Lark REST call returned a non-success response."""
+    """A Lark REST call returned a non-success response.
 
-    def __init__(self, code: int, msg: str, log_id: str | None = None) -> None:
+    ``kind`` is the classified taxonomy bucket (rate_limited /
+    target_revoked / format_error / permission_denied / unknown). Use
+    :attr:`retryable` to gate retry loops — non-retryable errors (format,
+    revoked target, permission) should fail fast instead of burning the
+    retry budget on calls that can't succeed.
+    """
+
+    def __init__(
+        self,
+        code: int,
+        msg: str,
+        log_id: str | None = None,
+        *,
+        kind: LarkErrorKind | None = None,
+    ) -> None:
         suffix = f" log_id={log_id}" if log_id else ""
         super().__init__(f"Lark API failed: code={code} msg={msg}{suffix}")
         self.code = code
         self.msg = msg
         self.log_id = log_id
+        self.kind: LarkErrorKind = kind if kind is not None else classify(code)
+
+    @property
+    def retryable(self) -> bool:
+        return is_retryable(self.kind)
 
 
 class LarkClient(Protocol):

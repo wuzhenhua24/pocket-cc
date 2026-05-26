@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from pocket_cc.lark.client import FakeLarkClient
+from pocket_cc.lark.client import FakeLarkClient, LarkApiError
 from pocket_cc.relay.card_stream import CardStream
 
 
@@ -128,6 +128,47 @@ def test_close_final_flush_returns_false_when_all_attempts_fail() -> None:
     stream.start()
     # retries=2 → 3 attempts, all fail → reports failure (caller sends fallback).
     assert stream.close({"final": True}, retries=2, backoff_s=0.0) is False
+
+
+def test_close_final_flush_short_circuits_on_non_retryable_error() -> None:
+    """Format / revoked-target / permission failures can't succeed on
+    retry — _flush_final must surface failure on the first attempt
+    instead of burning the retry budget."""
+
+    class FormatErrorClient(FakeLarkClient):
+        attempts: int = 0
+
+        def patch_card(self, message_id: str, card: dict[str, object]) -> None:
+            self.attempts += 1
+            raise LarkApiError(code=230001, msg="invalid content")
+
+    fake = FormatErrorClient()
+    stream = CardStream(fake, "om_abc", interval_s=10.0)
+    stream.start()
+    # retries=5 — but FORMAT_ERROR is non-retryable, so we expect exactly
+    # one attempt before returning False.
+    assert stream.close({"final": True}, retries=5, backoff_s=0.0) is False
+    assert fake.attempts == 1
+
+
+def test_close_final_flush_retries_rate_limited_error() -> None:
+    """RATE_LIMITED is retryable — verify we still consume retry budget
+    on classified-but-retryable errors."""
+
+    class RateLimitedClient(FakeLarkClient):
+        attempts: int = 0
+
+        def patch_card(self, message_id: str, card: dict[str, object]) -> None:
+            self.attempts += 1
+            if self.attempts < 3:
+                raise LarkApiError(code=11020, msg="too many requests")
+            super().patch_card(message_id, card)
+
+    fake = RateLimitedClient()
+    stream = CardStream(fake, "om_abc", interval_s=10.0)
+    stream.start()
+    assert stream.close({"final": True}, retries=3, backoff_s=0.0) is True
+    assert fake.attempts == 3
 
 
 def test_patch_failure_does_not_stop_the_stream() -> None:

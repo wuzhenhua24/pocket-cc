@@ -28,6 +28,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+from pocket_cc.lark.client import LarkApiError
+
 if TYPE_CHECKING:
     from pocket_cc.lark.client import LarkClient
 
@@ -156,9 +158,29 @@ class CardStream:
                 self._client.patch_card(self._message_id, card)
                 self._last_hash = h
                 return True
-            except Exception:
+            except LarkApiError as e:
                 logger.warning(
                     "final card patch attempt failed",
+                    extra={
+                        "message_id": self._message_id,
+                        "attempt": attempt + 1,
+                        "kind": e.kind.value,
+                        "code": e.code,
+                    },
+                    exc_info=True,
+                )
+                # Non-retryable kinds (format_error / target_revoked /
+                # permission_denied) cannot succeed on retry — burning the
+                # remaining attempts just delays the failure surface.
+                if not e.retryable:
+                    return False
+                if attempt < retries and backoff_s > 0:
+                    time.sleep(backoff_s)
+            except Exception:
+                # Network / SDK-level failures we couldn't classify — fall
+                # through to the retry loop. These do tend to be transient.
+                logger.warning(
+                    "final card patch attempt failed (unclassified)",
                     extra={"message_id": self._message_id, "attempt": attempt + 1},
                     exc_info=True,
                 )

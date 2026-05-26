@@ -15,6 +15,7 @@ from pocket_cc.lark.client import (
     LarkClient,
     LarkOapiClient,
 )
+from pocket_cc.lark.error_codes import LarkErrorKind
 from pocket_cc.lark.event_loop import (
     CardAction,
     CardActionHandler,
@@ -34,6 +35,7 @@ __all__ = [
     "IncomingMessage",
     "LarkApiError",
     "LarkClient",
+    "LarkErrorKind",
     "LarkEventLoop",
     "LarkOapiClient",
     "MessageHandler",
