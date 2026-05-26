@@ -16,11 +16,11 @@ resolves its cwd through the user table.
 
 ```toml
 [users.ou_abc123]
-workspace = "/home/haierops/workspace/alice"
+workspace = "/home/linuxuser/workspace/alice"
 display_name = "alice"
 
 [users.ou_def456]
-workspace = "/home/haierops/workspace/bob"
+workspace = "/home/linuxuser/workspace/bob"
 display_name = "bob"
 ```
 

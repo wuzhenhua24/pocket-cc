@@ -194,9 +194,9 @@ config 加载时会校验目录存在 + 可写 + 用户间互不包含；没建�
 
 ```bash
 # 共享目录（推荐）—— bot 进程的用户只要有 rwx 就行，不需要每个 user 各自的 unix 账号
-sudo mkdir -p /home/haierops/workspace/alice
-sudo mkdir -p /home/haierops/workspace/bob
-sudo chown -R haierops:haierops /home/haierops/workspace
+sudo mkdir -p /home/linuxuser/workspace/alice
+sudo mkdir -p /home/linuxuser/workspace/bob
+sudo chown -R linuxuser:linuxuser /home/linuxuser/workspace
 ```
 
 > 同一个用户的 workspace 之间**不能嵌套**（A 的目录是 B 的祖先 / 子孙都不行）—— 否则两边的 Claude 会污染同一份 `.claude/projects/` 缓存和 transcript。
@@ -207,11 +207,11 @@ sudo chown -R haierops:haierops /home/haierops/workspace
 mkdir -p ~/.pocket-cc
 cat > ~/.pocket-cc/users.toml <<'EOF'
 [users.ou_aaa111]
-workspace = "/home/haierops/workspace/alice"
+workspace = "/home/linuxuser/workspace/alice"
 display_name = "alice"
 
 [users.ou_bbb222]
-workspace = "/home/haierops/workspace/bob"
+workspace = "/home/linuxuser/workspace/bob"
 display_name = "bob"
 EOF
 ```
@@ -350,13 +350,13 @@ systemctl --user restart pocket-cc    # 重启
 1. 让对方先发一条消息给 bot，复制回来 denial 里的 `open_id`
 2. 给他建 workspace 目录并 chown 给 pocket-cc 跑的那个 unix 用户：
    ```bash
-   sudo mkdir -p /home/haierops/workspace/charlie
-   sudo chown -R haierops:haierops /home/haierops/workspace/charlie
+   sudo mkdir -p /home/linuxuser/workspace/charlie
+   sudo chown -R linuxuser:linuxuser /home/linuxuser/workspace/charlie
    ```
 3. 在 `~/.pocket-cc/users.toml` 加条目：
    ```toml
    [users.ou_ccc333]
-   workspace = "/home/haierops/workspace/charlie"
+   workspace = "/home/linuxuser/workspace/charlie"
    display_name = "charlie"
    ```
 4. 重启：`systemctl --user restart pocket-cc`
