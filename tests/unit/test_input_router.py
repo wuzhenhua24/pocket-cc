@@ -431,7 +431,10 @@ def test_busy_notices_are_throttled(tmp_path: Path) -> None:
     assert sum(1 for s in lark.sent if s.kind == "text") == 1
 
 
-def test_non_text_message_is_ignored(tmp_path: Path) -> None:
+def test_non_text_message_is_not_opened_as_turn(tmp_path: Path) -> None:
+    """Non-text messages must not create a binding or spawn a window —
+    that contract is unchanged. What's new is they no longer silently
+    drop (see the notice tests below)."""
     cfg = _make_config(workspace=tmp_path)
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
@@ -441,7 +444,104 @@ def test_non_text_message_is_ignored(tmp_path: Path) -> None:
     router.handle_message(_message(message_type="image", text=""))
 
     assert registry.get("oc_chat1") is None
+    assert all(c.method != "new_window" for c in tmux.calls)
+
+
+def test_post_message_replies_with_formatting_hint(tmp_path: Path) -> None:
+    """The most common trigger: mobile composer upgraded formatted text
+    to ``msg_type=post``. The notice must tell the user *what to do*
+    (cancel formatting), not just "unsupported"."""
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    router.handle_message(_message(message_type="post", text=""))
+
+    assert len(lark.sent) == 1
+    body = lark.last_sent().text
+    assert "post" in body
+    assert "格式" in body  # actionable hint for the user
+
+
+def test_image_message_replies_with_media_hint(tmp_path: Path) -> None:
+    """Media types get a distinct hint — "not yet supported" rather
+    than "cancel formatting", which would be misleading."""
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    router.handle_message(_message(message_type="image", text=""))
+
+    assert len(lark.sent) == 1
+    body = lark.last_sent().text
+    assert "image" in body
+    assert "格式" not in body  # image-vs-post hints must not collide
+
+
+def test_unsupported_notice_throttled_within_window(tmp_path: Path) -> None:
+    """User forwards 4 images in a row — only one reply, not four."""
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    for i in range(4):
+        router.handle_message(
+            _message(message_type="image", text="", message_id=f"om_img_{i}")
+        )
+
+    assert sum(1 for s in lark.sent if s.kind == "text") == 1
+
+
+def test_unsupported_notice_resumes_after_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Throttle is per-chat and time-based — after the quiet window a
+    fresh non-text message gets a fresh notice."""
+    import pocket_cc.relay.input as input_mod
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.t = 1000.0
+
+        def __call__(self) -> float:
+            return self.t
+
+    clock = _Clock()
+    monkeypatch.setattr(input_mod.time, "monotonic", clock)
+
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    router.handle_message(_message(message_type="post", text="", message_id="om1"))
+    clock.t += input_mod._UNSUPPORTED_NOTICE_THROTTLE_S + 1.0
+    router.handle_message(_message(message_type="post", text="", message_id="om2"))
+
+    assert sum(1 for s in lark.sent if s.kind == "text") == 2
+
+
+def test_empty_text_message_stays_silent(tmp_path: Path) -> None:
+    """A text-typed message with empty body (pure @mention etc.) is
+    not actionable and has no useful advice — must not trigger the
+    unsupported-type notice."""
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    router.handle_message(_message(message_type="text", text=""))
+
     assert lark.sent == []
+    assert registry.get("oc_chat1") is None
 
 
 def test_slash_commands_are_passed_through_verbatim(tmp_path: Path) -> None:

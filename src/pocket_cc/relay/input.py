@@ -117,6 +117,28 @@ _REJECT_NOTICE_THROTTLE_S = 5.0
 # trying we throttle the reply hard (a not-on-whitelist user has nothing to do
 # but ping the admin, so re-spamming them is just noise). Per-sender, monotonic.
 _UNAUTH_NOTICE_THROTTLE_S = 60.0
+# Authorized user sends a non-text message (post / image / merge_forward / …).
+# We can't process it but the previous behavior — silent drop — left users
+# staring at a non-responsive bot, especially when Lark's mobile composer
+# auto-upgraded any formatted text to ``post``. Per-chat throttle so a burst
+# of N forwarded items doesn't trigger N replies.
+_UNSUPPORTED_NOTICE_THROTTLE_S = 30.0
+
+# Type-aware hint shown after the generic "only plain text" line. Tells the
+# user *what to actually do*: cancel formatting for post-family types,
+# wait-for-a-future-version for media. Unmapped types fall through to the
+# generic message with no hint.
+_UNSUPPORTED_HINTS_BY_TYPE: dict[str, str] = {
+    "post": "（看起来是格式化文本，移动端长按输入框关掉格式后重发即可）",
+    "interactive": "（卡片消息暂不支持，请直接贴文字）",
+    "image": "（图片识别还在路上，先用文字描述一下需求吧）",
+    "file": "（文件附件暂不支持）",
+    "audio": "（语音暂不支持，请用文字）",
+    "video": "（视频暂不支持）",
+    "media": "（视频暂不支持）",
+    "sticker": "（表情消息没有内容可处理）",
+    "merge_forward": "（合并转发暂不支持，请把要讨论的内容贴成文字）",
+}
 
 
 class InputRouter:
@@ -155,6 +177,9 @@ class InputRouter:
         # `_UNAUTH_NOTICE_THROTTLE_S` are silently ignored — they already got the
         # message with their open_id; spamming back doesn't help.
         self._last_unauth_notice: dict[str, float] = {}
+        # chat_id → monotonic timestamp of the last "unsupported message type"
+        # reply. See `_notify_unsupported_message_type`.
+        self._last_unsupported_notice: dict[str, float] = {}
 
     # =============================================================== messages
 
@@ -182,8 +207,16 @@ class InputRouter:
             self._send_unauth_notice(msg)
             return
 
-        if msg.message_type != "text" or not msg.text:
-            # Non-text (image/file/post) is out of scope for M1.
+        if msg.message_type != "text":
+            # post / image / file / merge_forward / … — we can't ingest these
+            # yet, but a silent drop confuses users (especially the mobile
+            # `post`-upgrade case). Notify (throttled) so the user knows it
+            # arrived and what to do.
+            self._notify_unsupported_message_type(msg)
+            return
+        if not msg.text:
+            # Pure-mention / empty text-typed messages: nothing to act on, and
+            # no useful advice to give. Stay silent.
             return
 
         binding = self._registry.get(msg.chat_id)
@@ -428,6 +461,35 @@ class InputRouter:
             _log_lark_send_failure(
                 e, "failed to send denial",
                 chat_id=msg.chat_id, sender_open_id=msg.sender_open_id,
+            )
+
+    def _notify_unsupported_message_type(self, msg: IncomingMessage) -> None:
+        """Tell an authorized user we can't handle their non-text message.
+
+        The previous behavior was a silent drop — but the most common trigger
+        is Lark's mobile composer auto-upgrading any formatted input (bold,
+        list, multi-line) to ``msg_type=post``, leaving users staring at a
+        bot that "stopped responding". Per-chat throttled so a burst of
+        forwarded items doesn't yield N replies.
+
+        Hint text is picked from :data:`_UNSUPPORTED_HINTS_BY_TYPE` — for
+        ``post`` it actually tells the user what to *do* (turn off
+        formatting); for media we just say "not yet supported".
+        """
+        now = time.monotonic()
+        last = self._last_unsupported_notice.get(msg.chat_id, 0.0)
+        if now - last < _UNSUPPORTED_NOTICE_THROTTLE_S:
+            return
+        self._last_unsupported_notice[msg.chat_id] = now
+        kind = msg.message_type or "未知"
+        hint = _UNSUPPORTED_HINTS_BY_TYPE.get(msg.message_type, "")
+        body = f"🙏 我现在只看得懂纯文本，刚刚那条是 {kind} 类型{hint}"
+        try:
+            self._lark.send_text(msg.chat_id, body)
+        except LarkApiError as e:
+            _log_lark_send_failure(
+                e, "failed to send unsupported-type notice",
+                chat_id=msg.chat_id, message_type=msg.message_type,
             )
 
     def _reject_busy(self, binding: ChatBinding) -> None:
