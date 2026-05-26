@@ -16,7 +16,6 @@ Claude via `tmux.send_text`. pocket-cc has no commands of its own.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import threading
 import time
@@ -28,6 +27,7 @@ from pocket_cc.claude.pane_inspector import detect_mode
 from pocket_cc.claude.session_index import snapshot_existing_transcripts
 from pocket_cc.lark.card import build_text_card
 from pocket_cc.lark.client import LarkApiError
+from pocket_cc.lark.error_codes import LarkErrorKind
 from pocket_cc.relay.turn_controller import TurnPhase
 from pocket_cc.relay.waiting import KeysResponse, TextResponse
 from pocket_cc.tmux import TmuxError
@@ -46,6 +46,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _PANE_TAIL_CHARS = 2000
+
+# Map error taxonomy → logger level for best-effort notice sites. None of
+# these sites retry (they're short status messages — retrying delays the
+# real recovery path), but the failure mode tells an operator very
+# different things:
+#   - permission_denied / format_error: real bug — bot scope or a literal
+#     string we built is broken. Surface as ``error`` so it shows up in
+#     alerting.
+#   - target_revoked: chat exited / message deleted — totally normal in a
+#     long-running bot; demote to ``info`` so it doesn't pollute warnings.
+#   - rate_limited / unknown: transient — ``warning`` (the prior default).
+_LARK_SEND_FAILURE_LEVELS: dict[LarkErrorKind, int] = {
+    LarkErrorKind.PERMISSION_DENIED: logging.ERROR,
+    LarkErrorKind.FORMAT_ERROR: logging.ERROR,
+    LarkErrorKind.TARGET_REVOKED: logging.INFO,
+    LarkErrorKind.RATE_LIMITED: logging.WARNING,
+    LarkErrorKind.UNKNOWN: logging.WARNING,
+}
+
+
+def _log_lark_send_failure(err: LarkApiError, where: str, **extras: object) -> None:
+    """Log a Lark send failure at a level chosen by ``err.kind``.
+
+    ``where`` is a short tag identifying the call site (used as the log
+    message), ``extras`` are passed through to ``logger.log(extra=…)``
+    for structured fields. ``log_id`` and ``code`` are added
+    automatically so on-call doesn't have to dig.
+    """
+    level = _LARK_SEND_FAILURE_LEVELS.get(err.kind, logging.WARNING)
+    payload: dict[str, object] = {"kind": err.kind.value, "code": err.code, **extras}
+    if err.log_id:
+        payload["log_id"] = err.log_id
+    logger.log(level, where, extra=payload, exc_info=True)
 
 # Lark WS pushes events at-least-once: if our handler doesn't ack in time
 # (or the SDK doesn't surface success cleanly), the same event is re-delivered
@@ -274,8 +307,17 @@ class InputRouter:
             )
         except (OSError, TmuxError) as e:
             logger.exception("failed to create tmux window for chat")
-            with contextlib.suppress(LarkApiError):
+            try:
                 self._lark.send_text(msg.chat_id, f"❌ 启动 Claude 失败：{e}")
+            except LarkApiError as send_err:
+                # Previously silently suppressed — but a permission_denied
+                # here means the bot lost access to the chat entirely,
+                # which an operator wants to see.
+                _log_lark_send_failure(
+                    send_err,
+                    "failed to send startup failure notice",
+                    chat_id=msg.chat_id,
+                )
             return None
 
         binding = ChatBinding(
@@ -382,8 +424,11 @@ class InputRouter:
                 "🚫 你不在 pocket-cc 白名单 — 请把下面这个 open_id "
                 f"发给管理员加白：\n{msg.sender_open_id}",
             )
-        except LarkApiError:
-            logger.warning("failed to send denial", exc_info=True)
+        except LarkApiError as e:
+            _log_lark_send_failure(
+                e, "failed to send denial",
+                chat_id=msg.chat_id, sender_open_id=msg.sender_open_id,
+            )
 
     def _reject_busy(self, binding: ChatBinding) -> None:
         """Tell the user Claude is still busy, at most once per throttle window.
@@ -404,8 +449,10 @@ class InputRouter:
                 binding.chat_id,
                 "⏳ Claude 还在处理上一条消息——请等它完成，或点卡片上的 ⏹ 中断后再发。",
             )
-        except LarkApiError:
-            logger.warning("failed to send busy notice", exc_info=True)
+        except LarkApiError as e:
+            _log_lark_send_failure(
+                e, "failed to send busy notice", chat_id=binding.chat_id,
+            )
 
     def _continue_waiting_turn(self, binding: ChatBinding, text: str) -> None:
         """User's text is a reply to Claude's waiting prompt.
@@ -584,5 +631,7 @@ class InputRouter:
         body = pane.rstrip()[-_PANE_TAIL_CHARS:] if pane else "(空)"
         try:
             self._lark.send_card(binding.chat_id, build_text_card(body=f"```\n{body}\n```"))
-        except LarkApiError:
-            logger.warning("send pane dump failed", exc_info=True)
+        except LarkApiError as e:
+            _log_lark_send_failure(
+                e, "send pane dump failed", chat_id=binding.chat_id,
+            )
