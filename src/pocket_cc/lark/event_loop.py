@@ -39,6 +39,12 @@ class IncomingMessage:
     message_type: str  # "text" / "post" / "image" / ...
     text: str  # extracted plain text if message_type == "text", else ""
     raw_content: str  # original JSON `content` string from the API
+    # Server-recorded send time in milliseconds since epoch. Used by the
+    # relay to drop replayed events that are too old to still matter
+    # (WS reconnect after a multi-hour outage, etc). ``None`` means the
+    # field was absent from the event — caller should not treat the
+    # message as stale in that case (back-compat / fake messages).
+    create_time_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +220,12 @@ def _to_incoming_message(data: Any) -> IncomingMessage | None:
         if sender_id is not None:
             sender_open_id = sender_id.open_id or ""
 
+    # ``create_time`` is documented as ms since epoch but the wire format
+    # is a numeric string in many Lark response shapes — the SDK's own
+    # safety helpers normalize that. Be defensive: accept int / str /
+    # missing, and reject anything that doesn't look like a positive int.
+    create_time_ms = _coerce_create_time_ms(getattr(msg, "create_time", None))
+
     return IncomingMessage(
         message_id=msg.message_id or "",
         chat_id=msg.chat_id or "",
@@ -222,7 +234,25 @@ def _to_incoming_message(data: Any) -> IncomingMessage | None:
         message_type=message_type,
         text=text,
         raw_content=raw_content,
+        create_time_ms=create_time_ms,
     )
+
+
+def _coerce_create_time_ms(raw: Any) -> int | None:
+    """Parse Lark's ``create_time`` (int or numeric string ms) → int ms.
+
+    Returns ``None`` for missing / unparseable / non-positive values so
+    the relay can fall through to "treat as fresh" rather than guess.
+    Defensive against the SDK's wire-vs-typed mismatch (declared ``int``
+    but sometimes arrives as ``str``).
+    """
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _to_card_action(data: Any) -> CardAction | None:

@@ -204,6 +204,7 @@ def _message(
     sender_open_id: str = "ou_user1",
     message_type: str = "text",
     message_id: str | None = None,
+    create_time_ms: int | None = None,
 ) -> IncomingMessage:
     # Default to a text-derived id so distinct messages in a single test
     # don't collide with the dedupe cache.
@@ -217,6 +218,7 @@ def _message(
         message_type=message_type,
         text=text,
         raw_content=f'{{"text":"{text}"}}',
+        create_time_ms=create_time_ms,
     )
 
 
@@ -526,6 +528,60 @@ def test_unsupported_notice_resumes_after_window(
     router.handle_message(_message(message_type="post", text="", message_id="om2"))
 
     assert sum(1 for s in lark.sent if s.kind == "text") == 2
+
+
+def test_stale_message_is_dropped_silently(tmp_path: Path) -> None:
+    """A WS-replayed event older than the stale window must not open a
+    turn or notify — the user has moved on and a reply now would lie
+    about being live."""
+    import pocket_cc.relay.input as input_mod
+
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    now_ms = int(input_mod.time.time() * 1000)
+    stale = now_ms - input_mod._STALE_MESSAGE_WINDOW_MS - 5_000  # 5s past window
+    router.handle_message(_message(text="old prompt", create_time_ms=stale))
+
+    assert registry.get("oc_chat1") is None
+    assert all(c.method != "new_window" for c in tmux.calls)
+    assert lark.sent == []  # no notice, silent drop
+
+
+def test_fresh_message_at_window_edge_is_processed(tmp_path: Path) -> None:
+    """Just-inside-the-window messages still go through — the threshold
+    is "older than", not "as old as"."""
+    import pocket_cc.relay.input as input_mod
+
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    now_ms = int(input_mod.time.time() * 1000)
+    just_fresh = now_ms - input_mod._STALE_MESSAGE_WINDOW_MS + 1_000  # 1s inside
+    router.handle_message(_message(text="recent prompt", create_time_ms=just_fresh))
+
+    assert registry.get("oc_chat1") is not None  # binding created → turn opened
+
+
+def test_message_without_create_time_is_processed(tmp_path: Path) -> None:
+    """Back-compat: events that don't carry ``create_time_ms`` (older
+    fakes, malformed payloads) must not be accidentally dropped — we'd
+    rather process a message we can't time-check than silently lose it."""
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    router.handle_message(_message(text="hi", create_time_ms=None))
+
+    assert registry.get("oc_chat1") is not None
 
 
 def test_empty_text_message_stays_silent(tmp_path: Path) -> None:

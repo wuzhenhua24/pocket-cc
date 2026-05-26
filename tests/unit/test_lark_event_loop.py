@@ -39,6 +39,10 @@ class FakeMessage:
     chat_type: str | None
     message_type: str | None
     content: str | None
+    # Lark's event_message ``create_time`` is typed ``int`` but the wire
+    # value sometimes arrives as a numeric string — both forms must work.
+    # Default ``None`` keeps every existing test envelope unchanged.
+    create_time: int | str | None = None
 
 
 @dataclass
@@ -93,6 +97,7 @@ def _msg_envelope(
     message_type: str = "text",
     content: str | None = None,
     sender_open_id: str | None = "ou_z",
+    create_time: int | str | None = None,
 ) -> FakeMsgEnvelope:
     sender = FakeSender(sender_id=FakeSenderId(open_id=sender_open_id))
     return FakeMsgEnvelope(
@@ -103,6 +108,7 @@ def _msg_envelope(
                 chat_type=chat_type,
                 message_type=message_type,
                 content=content if content is not None else json.dumps({"text": "hi"}),
+                create_time=create_time,
             ),
             sender=sender,
         )
@@ -133,6 +139,45 @@ def test_text_with_invalid_json_yields_empty_text() -> None:
     assert isinstance(msg, IncomingMessage)
     assert msg.text == ""
     assert msg.raw_content == "not json at all"
+
+
+def test_create_time_as_int_is_extracted() -> None:
+    env = _msg_envelope(create_time=1_700_000_000_000)
+    msg = _to_incoming_message(env)
+    assert msg is not None
+    assert msg.create_time_ms == 1_700_000_000_000
+
+
+def test_create_time_as_numeric_string_is_extracted() -> None:
+    """Lark's wire format ships ``create_time`` as a string in some
+    response shapes; the coercer must accept both."""
+    env = _msg_envelope(create_time="1700000000000")
+    msg = _to_incoming_message(env)
+    assert msg is not None
+    assert msg.create_time_ms == 1_700_000_000_000
+
+
+def test_create_time_missing_yields_none() -> None:
+    env = _msg_envelope()  # no create_time field
+    msg = _to_incoming_message(env)
+    assert msg is not None
+    assert msg.create_time_ms is None
+
+
+def test_create_time_garbage_yields_none() -> None:
+    env = _msg_envelope(create_time="not a number")
+    msg = _to_incoming_message(env)
+    assert msg is not None
+    assert msg.create_time_ms is None
+
+
+def test_create_time_zero_yields_none() -> None:
+    """Zero or negative timestamps are meaningless — treat as missing
+    rather than "epoch start, definitely stale"."""
+    env = _msg_envelope(create_time=0)
+    msg = _to_incoming_message(env)
+    assert msg is not None
+    assert msg.create_time_ms is None
 
 
 def test_text_with_json_array_not_dict_yields_empty_text() -> None:

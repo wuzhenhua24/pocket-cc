@@ -66,6 +66,20 @@ _LARK_SEND_FAILURE_LEVELS: dict[LarkErrorKind, int] = {
 }
 
 
+def _is_stale_message(msg: IncomingMessage) -> bool:
+    """True when ``msg.create_time_ms`` is older than the stale window.
+
+    Returns False when the event carries no ``create_time_ms`` — we'd
+    rather process a message we can't time-check than wrongly drop one.
+    Uses ``time.time()`` (wall clock) since we're comparing against a
+    server-stamped wall-clock time, not a process-local interval.
+    """
+    if not msg.create_time_ms:
+        return False
+    age_ms = int(time.time() * 1000) - msg.create_time_ms
+    return age_ms > _STALE_MESSAGE_WINDOW_MS
+
+
 def _log_lark_send_failure(err: LarkApiError, where: str, **extras: object) -> None:
     """Log a Lark send failure at a level chosen by ``err.kind``.
 
@@ -117,6 +131,16 @@ _REJECT_NOTICE_THROTTLE_S = 5.0
 # trying we throttle the reply hard (a not-on-whitelist user has nothing to do
 # but ping the admin, so re-spamming them is just noise). Per-sender, monotonic.
 _UNAUTH_NOTICE_THROTTLE_S = 60.0
+# Messages older than this when they reach us are silently dropped. The
+# common case: WS disconnects for a while (laptop sleeps, network blips,
+# the bot process restarts), Lark buffers events on its side and replays
+# them on reconnect. By the time we process a 30-minute-old prompt the
+# user has typically moved on — replying as if it's live confuses them
+# and wastes a Claude turn. 30 min mirrors the SDK's default and is well
+# under "user fully forgot" while comfortably covering any normal WS
+# reconnect window.
+_STALE_MESSAGE_WINDOW_MS = 30 * 60 * 1000
+
 # Authorized user sends a non-text message (post / image / merge_forward / …).
 # We can't process it but the previous behavior — silent drop — left users
 # staring at a non-responsive bot, especially when Lark's mobile composer
@@ -188,6 +212,24 @@ class InputRouter:
             logger.info(
                 "dropped duplicate message",
                 extra={"message_id": msg.message_id, "chat_id": msg.chat_id},
+            )
+            return
+        if _is_stale_message(msg):
+            # Silent drop: a "sorry I was offline" notice on reconnect would
+            # fire for every buffered event from every chat, which is exactly
+            # the spam pattern we're trying to avoid. The user can just resend
+            # if they still want a reply.
+            logger.info(
+                "dropped stale message",
+                extra={
+                    "message_id": msg.message_id,
+                    "chat_id": msg.chat_id,
+                    "create_time_ms": msg.create_time_ms,
+                    "age_s": (
+                        (time.time() * 1000 - msg.create_time_ms) / 1000
+                        if msg.create_time_ms else None
+                    ),
+                },
             )
             return
         # Groups are out of scope (Phase 2 design: DM only). We silently drop
