@@ -337,7 +337,7 @@ systemctl --user restart pocket-cc    # 重启
 | 任务 | 命令 |
 |---|---|
 | 查看 pocket-cc 日志 | `journalctl --user -u pocket-cc -f` |
-| 接进 Claude 的 tmux 窗口看 | `tmux a -t pocket-cc`（多人时按 `Ctrl-B w` 出 window 列表，名字是 `chat-<display_name>`） |
+| 接进 Claude 的 tmux 窗口看 | `tmux a -t pocket-cc`（多人时按 `Ctrl-B w` 出 window 列表，每个用户是 `chat-<display_name>`；还会看到一个 `_idle` 占位 window，是 tmux 启 session 时强制要求的，pocket-cc 不用它） |
 | 看 hook 装好没 | `uv run pocket-cc hook status` |
 | 看 events.jsonl | `tail -f ~/.pocket-cc/events.jsonl` |
 | 看持久化 binding 状态 | `cat ~/.pocket-cc/state.json` |

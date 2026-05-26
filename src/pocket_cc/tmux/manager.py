@@ -122,12 +122,17 @@ class TmuxManager:
     def ensure_session(self) -> None:
         """Create the session in detached mode if it doesn't exist yet.
 
-        Idempotent. The session starts with one default window we ignore;
-        users should call :meth:`new_window` for real work.
+        Idempotent. tmux requires every session to host at least one window,
+        so we explicitly name that mandatory placeholder ``_idle`` — pocket-cc
+        never touches it, but the prefix makes its purpose obvious when an
+        operator runs ``tmux a -t pocket-cc`` and sees it next to the real
+        ``chat-<display_name>`` windows. Real work goes through :meth:`new_window`.
         """
         if self.session_exists():
             return
-        self._tmux("new-session", "-d", "-s", self.session_name, "-x", "200", "-y", "50")
+        self._tmux(
+            "new-session", "-d", "-s", self.session_name, "-n", "_idle", "-x", "200", "-y", "50"
+        )
 
     def kill_session(self) -> None:
         """Kill the entire session (all windows). No-op if it doesn't exist."""
