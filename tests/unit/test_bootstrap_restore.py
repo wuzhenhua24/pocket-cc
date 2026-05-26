@@ -11,10 +11,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from unittest.mock import ANY
 
 from pocket_cc.app.bootstrap import restore_bindings
+from pocket_cc.app.config import Config, User
 from pocket_cc.app.persistence import Registry, StateStore
 from pocket_cc.lark.client import FakeLarkClient, LarkApiError
 from pocket_cc.tmux import TmuxError, WindowInfo
@@ -24,15 +26,23 @@ from pocket_cc.tmux import TmuxError, WindowInfo
 
 @dataclass
 class _FakeTmux:
-    """Just enough TmuxManager surface for restore_bindings — find_window_by_id."""
+    """Just enough TmuxManager surface for restore_bindings — find_window_by_id
+    and kill_window (used by the reconcile-drop cleanup path)."""
 
     windows: dict[str, WindowInfo] = field(default_factory=dict)
     raise_on_lookup: TmuxError | None = None
+    raise_on_kill: TmuxError | None = None
+    killed: list[str] = field(default_factory=list)
 
     def find_window_by_id(self, window_id: str) -> WindowInfo | None:
         if self.raise_on_lookup is not None:
             raise self.raise_on_lookup
         return self.windows.get(window_id)
+
+    def kill_window(self, window_id: str) -> None:
+        self.killed.append(window_id)
+        if self.raise_on_kill is not None:
+            raise self.raise_on_kill
 
 
 def _win(window_id: str, name: str = "chat-x", cwd: str = "/tmp/wsp") -> WindowInfo:
@@ -75,6 +85,39 @@ def _entry(
     }
 
 
+def _config(
+    *,
+    open_id: str = "ou_user1",
+    workspace: str = "/tmp/wsp",
+    display_name: str = "test",
+    extra_users: dict[str, str] | None = None,
+) -> Config:
+    """Build a Config directly (bypasses _load_users + its fs validation).
+
+    Default matches `_entry`'s defaults so existing tests reconcile cleanly.
+    Tests exercising the drop-on-mismatch paths pass a different open_id /
+    workspace.
+    """
+    users: dict[str, User] = {
+        open_id: User(open_id=open_id, workspace=Path(workspace), display_name=display_name),
+    }
+    if extra_users:
+        for oid, ws in extra_users.items():
+            users[oid] = User(open_id=oid, workspace=Path(ws), display_name=oid)
+    return Config(
+        app_id="cli_x",
+        app_secret="secret",
+        lark_domain="https://open.feishu.cn",
+        users=MappingProxyType(users),
+        claude_command="claude",
+        tmux_session="pocket-cc-test",
+        patch_interval_s=10.0,
+        transcript_poll_s=0.5,
+        events_poll_s=0.5,
+        pane_poll_s=1.0,
+    )
+
+
 # =================================================================== tests
 
 
@@ -85,7 +128,7 @@ def test_restore_noop_when_state_file_missing(tmp_path: Path) -> None:
     lark = FakeLarkClient()
 
     # Should not raise, should not register anything, should not create state file.
-    restore_bindings(tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+    restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     assert len(registry) == 0
     assert lark.patches == []
@@ -103,7 +146,7 @@ def test_restore_attaches_binding_when_window_alive(tmp_path: Path) -> None:
     tmux = _FakeTmux(windows={"@5": _win("@5", name="chat-restored", cwd="/tmp/wsp")})
     lark = FakeLarkClient()
 
-    restore_bindings(tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+    restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     assert len(registry) == 1
     binding = registry.get("chat-1")
@@ -124,7 +167,7 @@ def test_restore_drops_binding_when_window_gone(tmp_path: Path) -> None:
     tmux = _FakeTmux(windows={})  # @99 not present
     lark = FakeLarkClient()
 
-    restore_bindings(tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+    restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     assert len(registry) == 0
     # Snapshot must be rewritten to reflect the drop — a subsequent restart
@@ -142,7 +185,7 @@ def test_restore_drops_binding_when_tmux_lookup_raises(tmp_path: Path) -> None:
     lark = FakeLarkClient()
 
     # Restore swallows tmux failures; one bad lookup must not crash startup.
-    restore_bindings(tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+    restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     assert len(registry) == 0
 
@@ -163,7 +206,7 @@ def test_restore_patches_orphan_card_and_clears_pointer(tmp_path: Path) -> None:
     tmux = _FakeTmux(windows={"@5": _win("@5")})
     lark = FakeLarkClient()
 
-    restore_bindings(tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+    restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     # Exactly one patch, against the orphaned message_id, with a cancelled card.
     assert len(lark.patches) == 1
@@ -193,7 +236,7 @@ def test_restore_keeps_binding_even_when_orphan_patch_fails(tmp_path: Path) -> N
     tmux = _FakeTmux(windows={"@5": _win("@5")})
     lark = _RaisingPatchLark()  # simulates Lark API rejecting the patch
 
-    restore_bindings(tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+    restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     # Binding is still attached — orphan patch is best-effort, the user still
     # gets a working chat.
@@ -218,7 +261,7 @@ def test_restore_drops_bindings_individually_on_malformed_entries(tmp_path: Path
     tmux = _FakeTmux(windows={"@5": _win("@5"), "@6": _win("@6")})
     lark = FakeLarkClient()
 
-    restore_bindings(tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+    restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     # Only the good entry survives; bad ones are skipped with a warning, not
     # aborted.
@@ -241,7 +284,7 @@ def test_restore_handles_multiple_bindings_partial_alive(tmp_path: Path) -> None
     tmux = _FakeTmux(windows={"@1": _win("@1"), "@3": _win("@3")})
     lark = FakeLarkClient()
 
-    restore_bindings(tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+    restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     assert set(b.chat_id for b in registry.all()) == {"chat-a", "chat-c"}
     # State file pruned to reflect the drop.
@@ -258,10 +301,107 @@ def test_restore_skips_on_corrupt_state_file(tmp_path: Path) -> None:
     lark = FakeLarkClient()
 
     # StateStore.load returns None → restore is a no-op (no patch, no save).
-    restore_bindings(tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+    restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     assert len(registry) == 0
     assert lark.patches == []
+
+
+# =========================================================== reconciliation
+
+
+def test_restore_drops_when_open_id_no_longer_in_users(tmp_path: Path) -> None:
+    """User was removed from users.toml between runs — privilege revoked.
+    The binding is dropped, its tmux window killed (so the stale Claude stops),
+    and any active card is patched with the restart notice."""
+    state_path = tmp_path / "state.json"
+    _write_state(
+        state_path,
+        bindings={
+            "chat-1": _entry(
+                open_id="ou_evicted",
+                window_id="@5",
+                active_card={"message_id": "om_orphan", "is_continuation": False},
+            ),
+        },
+    )
+    registry = Registry()
+    store = StateStore(state_path, registry)
+    tmux = _FakeTmux(windows={"@5": _win("@5")})
+    lark = FakeLarkClient()
+
+    # Config knows about a *different* user, not ou_evicted.
+    cfg = _config(open_id="ou_user1", workspace="/tmp/wsp")
+
+    restore_bindings(config=cfg, tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+
+    assert len(registry) == 0
+    assert tmux.killed == ["@5"]
+    assert len(lark.patches) == 1
+    assert lark.patches[0].message_id == "om_orphan"
+    # Disk snapshot now reflects the drop, so a second restart won't re-process it.
+    assert json.loads(state_path.read_text(encoding="utf-8"))["bindings"] == {}
+
+
+def test_restore_drops_when_workspace_changed_in_users_config(tmp_path: Path) -> None:
+    """users.toml moved this user's workspace elsewhere — fresh restart in new
+    cwd. Binding dropped, window killed, orphan card patched."""
+    state_path = tmp_path / "state.json"
+    _write_state(
+        state_path,
+        bindings={
+            "chat-1": _entry(
+                open_id="ou_user1",
+                window_id="@7",
+                cwd="/tmp/old-workspace",
+                active_card={"message_id": "om_orphan", "is_continuation": False},
+            ),
+        },
+    )
+    registry = Registry()
+    store = StateStore(state_path, registry)
+    tmux = _FakeTmux(windows={"@7": _win("@7", cwd="/tmp/old-workspace")})
+    lark = FakeLarkClient()
+
+    cfg = _config(open_id="ou_user1", workspace="/tmp/new-workspace")
+
+    restore_bindings(config=cfg, tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+
+    assert len(registry) == 0
+    assert tmux.killed == ["@7"]
+    assert len(lark.patches) == 1
+    assert lark.patches[0].message_id == "om_orphan"
+
+
+def test_restore_reconcile_drop_survives_tmux_kill_failure(tmp_path: Path) -> None:
+    """If kill_window fails (tmux gone, window already dead, etc.) we still
+    drop the binding and patch the orphan card — cleanup is best-effort."""
+    state_path = tmp_path / "state.json"
+    _write_state(
+        state_path,
+        bindings={
+            "chat-1": _entry(
+                open_id="ou_evicted",
+                window_id="@5",
+                active_card={"message_id": "om_orphan", "is_continuation": False},
+            ),
+        },
+    )
+    registry = Registry()
+    store = StateStore(state_path, registry)
+    tmux = _FakeTmux(
+        windows={"@5": _win("@5")},
+        raise_on_kill=TmuxError("window already gone"),
+    )
+    lark = FakeLarkClient()
+
+    cfg = _config(open_id="ou_user1", workspace="/tmp/wsp")
+    restore_bindings(config=cfg, tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
+
+    # Binding is still dropped; orphan card is still patched despite kill failing.
+    assert len(registry) == 0
+    assert tmux.killed == ["@5"]  # we attempted
+    assert len(lark.patches) == 1
 
 
 # ----------------------------------------------------------------- helpers

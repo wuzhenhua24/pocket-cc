@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 def restore_bindings(
     *,
+    config: Config,
     tmux: TmuxManager,
     lark: LarkClient,
     registry: Registry,
@@ -57,12 +58,23 @@ def restore_bindings(
 ) -> None:
     """Re-attach bindings persisted by a previous process.
 
-    Three-way split per binding entry:
-      - tmux window gone   → drop the binding (user's next message re-creates)
-      - tmux window alive  → rebuild ChatBinding and register it; if an
-                             active_card pointer was persisted, patch that
-                             Lark message with the "已重启" notice so the
-                             user doesn't stare at a ⏳ card forever
+    Per binding entry:
+      - missing window_id / open_id     → drop (malformed snapshot)
+      - open_id no longer in users.toml → drop, kill the stale tmux window,
+                                           patch the orphan card. Privilege
+                                           revoked; the Claude in there must
+                                           not keep running.
+      - workspace path changed in
+        users.toml since last run       → drop + kill + patch orphan. Users
+                                           config is authoritative; the next
+                                           user message opens a fresh binding
+                                           in the new cwd.
+      - tmux window gone                → drop (user's next message re-creates)
+      - tmux window alive + reconciled  → rebuild ChatBinding and register;
+                                           if an active_card pointer was
+                                           persisted, patch that Lark message
+                                           with the "已重启" notice so the
+                                           user doesn't stare at a ⏳ card
 
     We deliberately do not replay transcript history. The TranscriptReader
     will be re-created lazily on the next message and starts at end-of-file
@@ -87,7 +99,9 @@ def restore_bindings(
         if not isinstance(entry, dict):
             logger.warning("restore: malformed entry — skipping", extra={"chat_id": chat_id})
             continue
-        if _restore_one_binding(chat_id, entry, tmux=tmux, lark=lark, registry=registry):
+        if _restore_one_binding(
+            chat_id, entry, config=config, tmux=tmux, lark=lark, registry=registry
+        ):
             restored += 1
 
     # Rewrite the snapshot so cleared active_card pointers (orphans we just
@@ -103,6 +117,7 @@ def _restore_one_binding(
     chat_id: str,
     entry: dict[str, Any],
     *,
+    config: Config,
     tmux: TmuxManager,
     lark: LarkClient,
     registry: Registry,
@@ -117,6 +132,33 @@ def _restore_one_binding(
         # Without an open_id we can't route this binding (step 4 will also need
         # it to reconcile against config.users). Drop and let the user re-trigger.
         logger.warning("restore: entry missing open_id", extra={"chat_id": chat_id})
+        return False
+
+    # Reconcile against users.toml — the user table is the authoritative source
+    # of "who's allowed + where do they work". Run *before* tmux lookup so we
+    # actively tear down the stale Claude window instead of merely refusing to
+    # re-attach (the running process would otherwise keep going invisibly).
+    user = config.users.get(open_id)
+    if user is None:
+        logger.warning(
+            "restore: open_id no longer in users config — dropping binding",
+            extra={"chat_id": chat_id, "open_id": open_id, "window_id": window_id},
+        )
+        _cleanup_dropped_binding(chat_id, entry, window_id=window_id, tmux=tmux, lark=lark)
+        return False
+
+    stored_cwd = Path(str(entry.get("cwd", "")))
+    if stored_cwd != user.workspace:
+        logger.info(
+            "restore: workspace changed in users.toml — dropping for fresh start",
+            extra={
+                "chat_id": chat_id,
+                "open_id": open_id,
+                "old_cwd": str(stored_cwd),
+                "new_cwd": str(user.workspace),
+            },
+        )
+        _cleanup_dropped_binding(chat_id, entry, window_id=window_id, tmux=tmux, lark=lark)
         return False
 
     try:
@@ -167,6 +209,41 @@ def _restore_one_binding(
         extra={"chat_id": chat_id, "window_id": window_id, "cwd": str(binding.cwd)},
     )
     return True
+
+
+def _cleanup_dropped_binding(
+    chat_id: str,
+    entry: dict[str, Any],
+    *,
+    window_id: str,
+    tmux: TmuxManager,
+    lark: LarkClient,
+) -> None:
+    """Tear down a binding that reconcile refused to restore.
+
+    Used when users.toml no longer authorizes the binding's open_id, or moved
+    that user's workspace elsewhere. We:
+      - kill the orphaned tmux window so the stale Claude process is stopped
+        (privilege revocation must be effective; a running Claude in a
+        no-longer-authorized cwd is exactly what we don't want)
+      - patch any persisted active_card pointer with the "已重启" notice so
+        the user's Lark UI doesn't keep showing a ⏳ running card for a turn
+        the bot will never finish
+
+    Both side effects are best-effort: failures here mustn't block dropping
+    the remaining bindings.
+    """
+    try:
+        tmux.kill_window(window_id)
+    except TmuxError:
+        logger.warning(
+            "restore: failed to kill stale tmux window — leaving it for the operator",
+            extra={"chat_id": chat_id, "window_id": window_id},
+            exc_info=True,
+        )
+    active_card = entry.get("active_card")
+    if isinstance(active_card, dict):
+        _patch_orphan_card(chat_id, active_card, lark=lark)
 
 
 def _patch_orphan_card(chat_id: str, active_card: dict[str, Any], *, lark: LarkClient) -> None:
@@ -306,6 +383,7 @@ class Pocketcc:
     def _restore_bindings(self) -> None:
         """Bootstrap-side wrapper around :func:`restore_bindings`."""
         restore_bindings(
+            config=self._config,
             tmux=self._tmux,
             lark=self._lark,
             registry=self._registry,
