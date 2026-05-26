@@ -23,6 +23,7 @@ wheels/
 
 # Reference impl (not part of this project)
 ccgram/
+oapi-sdk-python/
 
 # Type checker / lint cache
 .mypy_cache/
