@@ -326,9 +326,7 @@ class TurnController:
                 logger.exception("send initial card failed")
                 return None
 
-            stream = CardStream(
-                self._lark, message_id, interval_s=self._config.patch_interval_s
-            )
+            stream = CardStream(self._lark, message_id, interval_s=self._config.patch_interval_s)
             stream.start()
             turn = TurnState(
                 card_message_id=message_id,
@@ -398,9 +396,7 @@ class TurnController:
                 turn.accumulator.ingest(ev)
             return len(events)
 
-    def apply_pane_state(
-        self, new_waiting: WaitingFor | None, detected_mode: str | None
-    ) -> None:
+    def apply_pane_state(self, new_waiting: WaitingFor | None, detected_mode: str | None) -> None:
         """Apply a pane-watcher observation to the active turn.
 
         ``new_waiting`` is the prompt parsed from the pane (None = no prompt

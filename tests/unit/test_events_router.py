@@ -182,9 +182,7 @@ def test_stop_fallback_matches_cwd_across_symlink(tmp_path: Path) -> None:
         on_stop=lambda b, _e: stopped.append(b),
     )
     # Event reports the resolved (real) cwd.
-    dispatcher.dispatch(
-        _event("Stop", transcript_path=str(real / "ours.jsonl"), cwd=str(real))
-    )
+    dispatcher.dispatch(_event("Stop", transcript_path=str(real / "ours.jsonl"), cwd=str(real)))
 
     assert stopped == [binding]
 

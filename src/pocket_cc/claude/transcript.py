@@ -231,9 +231,7 @@ def _parse_assistant(uuid: str, timestamp: str, message: dict[str, Any]) -> list
     return events
 
 
-def _parse_permission_mode(
-    uuid: str, timestamp: str, record: dict[str, Any]
-) -> list[Event]:
+def _parse_permission_mode(uuid: str, timestamp: str, record: dict[str, Any]) -> list[Event]:
     """permission-mode records have no `message`; the mode is at the top level.
 
     Example: ``{"type":"permission-mode","permissionMode":"acceptEdits", ...}``.

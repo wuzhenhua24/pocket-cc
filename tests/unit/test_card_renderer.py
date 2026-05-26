@@ -167,8 +167,7 @@ def test_render_waiting_card_plan_source_renders_plan_above_options() -> None:
     )
     waiting = WaitingFor(
         source="plan",
-        question="Claude has written up a plan and is ready to execute. "
-        "Would you like to proceed?",
+        question="Claude has written up a plan and is ready to execute. Would you like to proceed?",
         options=(
             WaitingOption(label="Yes, auto-accept edits", response=TextResponse(text="1")),
             WaitingOption(label="Yes, manually approve edits", response=TextResponse(text="2")),
@@ -306,10 +305,12 @@ def test_render_waiting_card_ask_user_shows_question_header_and_options() -> Non
         source="ask_user_question",
         question="日志主要来自哪里？",
         options=(
-            WaitingOption(label="本地文件", description="用 Read/Grep 直接读",
-                          response=TextResponse(text="1")),
-            WaitingOption(label="ELK", description="通过 Elasticsearch API",
-                          response=TextResponse(text="2")),
+            WaitingOption(
+                label="本地文件", description="用 Read/Grep 直接读", response=TextResponse(text="1")
+            ),
+            WaitingOption(
+                label="ELK", description="通过 Elasticsearch API", response=TextResponse(text="2")
+            ),
         ),
         fingerprint="fp",
     )
@@ -430,7 +431,15 @@ def test_render_card_running_keeps_tool_calls() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
     acc.ingest(AssistantText(uuid="a", timestamp="t", text="working on it"))
-    acc.ingest(ToolUse(uuid="b", timestamp="t", tool_use_id="t1", tool_name="Read", tool_input={"file_path": "foo.py"}))
+    acc.ingest(
+        ToolUse(
+            uuid="b",
+            timestamp="t",
+            tool_use_id="t1",
+            tool_name="Read",
+            tool_input={"file_path": "foo.py"},
+        )
+    )
     body = render_card(acc.snapshot(state="running"))["elements"][0]["content"]
     assert "工具调用" in body
     assert "foo.py" in body
@@ -440,7 +449,15 @@ def test_render_card_done_drops_tool_calls_when_text_present() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
     acc.ingest(AssistantText(uuid="a", timestamp="t", text="here is the answer"))
-    acc.ingest(ToolUse(uuid="b", timestamp="t", tool_use_id="t1", tool_name="Read", tool_input={"file_path": "foo.py"}))
+    acc.ingest(
+        ToolUse(
+            uuid="b",
+            timestamp="t",
+            tool_use_id="t1",
+            tool_name="Read",
+            tool_input={"file_path": "foo.py"},
+        )
+    )
     body = render_card(acc.snapshot(state="done"))["elements"][0]["content"]
     assert "here is the answer" in body
     assert "工具调用" not in body
@@ -450,7 +467,15 @@ def test_render_card_done_drops_tool_calls_when_text_present() -> None:
 def test_render_card_done_keeps_tool_calls_as_fallback_when_no_text() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
-    acc.ingest(ToolUse(uuid="b", timestamp="t", tool_use_id="t1", tool_name="Bash", tool_input={"command": "pytest"}))
+    acc.ingest(
+        ToolUse(
+            uuid="b",
+            timestamp="t",
+            tool_use_id="t1",
+            tool_name="Bash",
+            tool_input={"command": "pytest"},
+        )
+    )
     body = render_card(acc.snapshot(state="done"))["elements"][0]["content"]
     # No assistant text → keep tool calls so the body isn't just a placeholder.
     assert "工具调用" in body
@@ -460,7 +485,15 @@ def test_render_card_done_keeps_tool_calls_as_fallback_when_no_text() -> None:
 def test_render_card_failed_drops_tool_calls() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
-    acc.ingest(ToolUse(uuid="b", timestamp="t", tool_use_id="t1", tool_name="Read", tool_input={"file_path": "foo.py"}))
+    acc.ingest(
+        ToolUse(
+            uuid="b",
+            timestamp="t",
+            tool_use_id="t1",
+            tool_name="Read",
+            tool_input={"file_path": "foo.py"},
+        )
+    )
     body = render_card(acc.snapshot(state="failed", error="boom"))["elements"][0]["content"]
     assert "boom" in body
     assert "工具调用" not in body
@@ -1057,7 +1090,9 @@ def test_single_huge_assistant_text_splits_across_cards_on_seal() -> None:
             break
         te, toe, the = acc.find_fit_window(ROTATE_AT_CHARS)
         seal_snap = acc.snapshot_window(text_end=te, tool_end=toe, thinking_end=the)
-        bodies.append(render_card(seal_snap, ends_with_continuation_marker=True)["elements"][0]["content"])
+        bodies.append(
+            render_card(seal_snap, ends_with_continuation_marker=True)["elements"][0]["content"]
+        )
         acc.commit_to(text_end=te, tool_end=toe, thinking_end=the)
 
     # Final card: terminal state, rendered from the *uncommitted tail only*.

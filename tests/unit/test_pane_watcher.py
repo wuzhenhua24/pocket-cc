@@ -75,9 +75,7 @@ class _RecordingController:
 
     applied: list[tuple[WaitingFor | None, str | None]] = field(default_factory=list)
 
-    def apply_pane_state(
-        self, new_waiting: WaitingFor | None, detected_mode: str | None
-    ) -> None:
+    def apply_pane_state(self, new_waiting: WaitingFor | None, detected_mode: str | None) -> None:
         self.applied.append((new_waiting, detected_mode))
 
 
@@ -169,9 +167,7 @@ def test_build_waiting_for_maps_numbered_options_to_text_response() -> None:
         assert opt.response.text == str(i)
 
 
-def _make_binding_with_ask_user(
-    questions: Any, chat_id: str = "oc_ask"
-) -> ChatBinding:
+def _make_binding_with_ask_user(questions: Any, chat_id: str = "oc_ask") -> ChatBinding:
     """Binding whose accumulator carries _latest_ask_user_questions.
 
     Uses a real TurnAccumulator so the relay code path that reads the
@@ -263,8 +259,7 @@ def test_build_waiting_for_routes_plan_kind_to_plan_source() -> None:
 
     p = ParsedPrompt(
         kind="plan",
-        question="Claude has written up a plan and is ready to execute. "
-        "Would you like to proceed?",
+        question="Claude has written up a plan and is ready to execute. Would you like to proceed?",
         context="",  # plan never carries pane-side context
         options=(
             ParsedOption(number=1, label="Yes, auto-accept edits", selected=True),

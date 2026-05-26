@@ -413,11 +413,7 @@ class TurnAccumulator:
                 # Empty window only ever wins when nothing is uncommitted.
                 # When there *is* uncommitted content but it doesn't fit,
                 # force one leading part in so rotation makes progress.
-                if (
-                    text_end == text_lo
-                    and tool_end == tool_lo
-                    and thinking_end == thinking_lo
-                ):
+                if text_end == text_lo and tool_end == tool_lo and thinking_end == thinking_lo:
                     if text_lo < len(self._assistant_text_parts):
                         return text_lo + 1, tool_lo, thinking_lo
                     if tool_lo < len(self._tool_calls):
