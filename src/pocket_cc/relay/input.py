@@ -80,6 +80,10 @@ _MODE_READBACK_DELAY_S = 0.35
 # succession we don't want a notice per message — only re-notify after this many
 # seconds of quiet. Wall-clock-independent (uses time.monotonic).
 _REJECT_NOTICE_THROTTLE_S = 5.0
+# Unauthorized senders get one denial text with their open_id; if they keep
+# trying we throttle the reply hard (a not-on-whitelist user has nothing to do
+# but ping the admin, so re-spamming them is just noise). Per-sender, monotonic.
+_UNAUTH_NOTICE_THROTTLE_S = 60.0
 
 
 class InputRouter:
@@ -113,6 +117,11 @@ class InputRouter:
         # so a burst of messages while busy yields at most one notice per
         # `_REJECT_NOTICE_THROTTLE_S` window. See `_reject_busy`.
         self._last_reject_notice: dict[str, float] = {}
+        # sender_open_id → monotonic timestamp of the last unauthorized-denial
+        # text. Re-tries from the same un-whitelisted user within
+        # `_UNAUTH_NOTICE_THROTTLE_S` are silently ignored — they already got the
+        # message with their open_id; spamming back doesn't help.
+        self._last_unauth_notice: dict[str, float] = {}
 
     # =============================================================== messages
 
@@ -123,14 +132,21 @@ class InputRouter:
                 extra={"message_id": msg.message_id, "chat_id": msg.chat_id},
             )
             return
+        # Groups are out of scope (Phase 2 design: DM only). We silently drop
+        # instead of replying — a denial text in a group would just spam every
+        # member every time the bot is mentioned.
+        if msg.chat_type != "p2p":
+            logger.info(
+                "dropped non-p2p message",
+                extra={
+                    "chat_id": msg.chat_id,
+                    "chat_type": msg.chat_type,
+                    "sender_open_id": msg.sender_open_id,
+                },
+            )
+            return
         if not self._is_allowed(msg.sender_open_id):
-            try:
-                self._lark.send_text(
-                    msg.chat_id,
-                    "🚫 你不在 pocket-cc 白名单 — 请联系管理员添加你的 open_id。",
-                )
-            except LarkApiError:
-                logger.warning("failed to send denial", exc_info=True)
+            self._send_unauth_notice(msg)
             return
 
         if msg.message_type != "text" or not msg.text:
@@ -328,6 +344,29 @@ class InputRouter:
         # uncommitted tail across "(续)" cards before closing, so the final
         # card never tail-truncates the whole turn. No-op if no active turn.
         self._controller_for(binding).seal(state=state, error=error)
+
+    def _send_unauth_notice(self, msg: IncomingMessage) -> None:
+        """Tell an unauthorized sender how to get whitelisted, throttled.
+
+        We include the sender's ``open_id`` verbatim so they can just forward
+        it to the admin instead of having to look it up. Within
+        ``_UNAUTH_NOTICE_THROTTLE_S`` of the prior reply *for the same sender*
+        we drop silently — the user already has the message, re-spamming them
+        every time they retry isn't useful.
+        """
+        now = time.monotonic()
+        last = self._last_unauth_notice.get(msg.sender_open_id, 0.0)
+        if now - last < _UNAUTH_NOTICE_THROTTLE_S:
+            return
+        self._last_unauth_notice[msg.sender_open_id] = now
+        try:
+            self._lark.send_text(
+                msg.chat_id,
+                "🚫 你不在 pocket-cc 白名单 — 请把下面这个 open_id "
+                f"发给管理员加白：\n{msg.sender_open_id}",
+            )
+        except LarkApiError:
+            logger.warning("failed to send denial", exc_info=True)
 
     def _reject_busy(self, binding: ChatBinding) -> None:
         """Tell the user Claude is still busy, at most once per throttle window.

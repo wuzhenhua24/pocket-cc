@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path  # noqa: TC003 — used in test signatures
 from types import MappingProxyType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pocket_cc.app.config import Config, User
 from pocket_cc.app.persistence import ChatBinding, Registry
@@ -24,6 +24,9 @@ from pocket_cc.relay.waiting import (
     WaitingOption,
 )
 from pocket_cc.tmux import TmuxError, WindowInfo
+
+if TYPE_CHECKING:
+    import pytest
 
 # ----------------------------------------------------------------- fixtures
 
@@ -226,7 +229,7 @@ def test_whitelisted_user_creates_binding(tmp_path: Path) -> None:
     assert any(c.method == "send_text" for c in tmux.calls)
 
 
-def test_non_whitelisted_user_denied(tmp_path: Path) -> None:
+def test_non_whitelisted_user_denied_includes_open_id(tmp_path: Path) -> None:
     cfg = _make_config(workspace=tmp_path, open_id="ou_allowed")
     tmux = FakeTmuxManager()
     lark = FakeLarkClient()
@@ -237,11 +240,87 @@ def test_non_whitelisted_user_denied(tmp_path: Path) -> None:
 
     # No tmux side effects
     assert all(c.method != "new_window" for c in tmux.calls)
-    # User got a denial text
+    # User got a denial text with their open_id embedded, so they can hand it
+    # straight to the admin.
     assert len(lark.sent) == 1
     last = lark.last_sent()
     assert last.kind == "text"
     assert "白名单" in last.text
+    assert "ou_evil" in last.text
+
+
+def test_unauth_reply_throttled_within_window(tmp_path: Path) -> None:
+    """A user keeps hammering the bot — only one denial text is sent until the
+    throttle window elapses."""
+    cfg = _make_config(workspace=tmp_path, open_id="ou_allowed")
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    for i in range(4):
+        router.handle_message(_message(sender_open_id="ou_evil", text=f"hi-{i}"))
+
+    assert sum(1 for s in lark.sent if s.kind == "text") == 1
+
+
+def test_unauth_reply_resumes_after_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Once the throttle window elapses, another denial *is* sent — the user
+    might have forgotten the first reply or be on a new device."""
+    import pocket_cc.relay.input as input_mod
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.t = 1000.0
+
+        def __call__(self) -> float:
+            return self.t
+
+    clock = _Clock()
+    monkeypatch.setattr(input_mod.time, "monotonic", clock)
+
+    cfg = _make_config(workspace=tmp_path, open_id="ou_allowed")
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    router.handle_message(_message(sender_open_id="ou_evil", text="hi-1"))
+    clock.t += input_mod._UNAUTH_NOTICE_THROTTLE_S + 1.0
+    router.handle_message(_message(sender_open_id="ou_evil", text="hi-2"))
+
+    assert sum(1 for s in lark.sent if s.kind == "text") == 2
+
+
+# --------------------------------------------------------------- chat scope
+
+
+def test_group_message_silently_ignored(tmp_path: Path) -> None:
+    """Group chats are out of scope for the DM-only Phase 2 design — we drop
+    them silently rather than replying (which would spam every group member)."""
+    cfg = _make_config(workspace=tmp_path, open_id="ou_user1")
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+
+    msg = _message(sender_open_id="ou_user1")
+    msg = IncomingMessage(
+        message_id=msg.message_id,
+        chat_id="oc_group1",
+        chat_type="group",
+        sender_open_id=msg.sender_open_id,
+        message_type=msg.message_type,
+        text=msg.text,
+        raw_content=msg.raw_content,
+    )
+
+    router.handle_message(msg)
+
+    # No tmux side effects, no Lark reply at all.
+    assert all(c.method != "new_window" for c in tmux.calls)
+    assert lark.sent == []
+    assert registry.get("oc_group1") is None
 
 
 # ----------------------------------------------------------- binding creation
