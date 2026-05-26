@@ -344,8 +344,11 @@ def test_start_propagates_reconnect_handlers_to_ws_client(monkeypatch: Any) -> N
         started: bool = False
 
         def __init__(
-            self, app_id: str, app_secret: str, *, event_handler: Any, log_level: Any
+            self, app_id: str, app_secret: str, *, event_handler: Any, log_level: Any, **_: Any
         ) -> None:
+            # Accept extra kwargs (e.g. ``source="pocket-cc"``) so this fake
+            # stays loose against future LarkEventLoop.start() additions —
+            # this test only cares about the reconnect attribute wiring.
             self.app_id = app_id
             self.app_secret = app_secret
             self.event_handler = event_handler
@@ -381,3 +384,36 @@ def test_start_propagates_reconnect_handlers_to_ws_client(monkeypatch: Any) -> N
     # Unregistered handler stays as the SDK-installed no-op (callable, returns
     # None, doesn't raise).
     assert ws.on_reconnected() is None
+
+
+def test_start_tags_ws_client_with_pocket_cc_source(monkeypatch: Any) -> None:
+    """``start`` must pass ``source="pocket-cc"`` to ws.Client so the WS
+    handshake's User-Agent identifies our traffic the same way REST does.
+    Without this, WS requests in Lark's logs look anonymous and can't be
+    correlated to a REST log_id from the same process.
+    """
+    import lark_oapi
+
+    from pocket_cc.lark import event_loop as event_loop_module
+
+    captured: dict[str, Any] = {}
+
+    class FakeWsClient:
+        def __init__(self, app_id: str, app_secret: str, **kwargs: Any) -> None:
+            captured["app_id"] = app_id
+            captured["app_secret"] = app_secret
+            captured.update(kwargs)
+            self.on_reconnecting = lambda: None
+            self.on_reconnected = lambda: None
+
+        def start(self) -> None:
+            captured["started"] = True
+
+    fake_ws_module = type("FakeWsModule", (), {"Client": FakeWsClient})()
+    monkeypatch.setattr(lark_oapi, "ws", fake_ws_module)
+    monkeypatch.setattr(event_loop_module.lark, "ws", fake_ws_module)
+
+    loop = LarkEventLoop(app_id="cli_x", app_secret="secret")
+    loop.start()
+    assert captured["source"] == "pocket-cc"
+    assert captured["started"] is True

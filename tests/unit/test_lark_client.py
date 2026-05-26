@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from pocket_cc.lark.client import FakeLarkClient, LarkApiError, LarkClient
+from pocket_cc.lark.client import FakeLarkClient, LarkApiError, LarkClient, LarkOapiClient
 
 
 def test_fake_satisfies_protocol() -> None:
@@ -81,3 +81,17 @@ def test_lark_api_error_message_includes_log_id_when_present() -> None:
 def test_lark_api_error_message_omits_log_id_when_none() -> None:
     err = LarkApiError(code=99, msg="boom", log_id=None)
     assert "log_id" not in str(err)
+
+
+def test_oapi_client_tags_user_agent_with_pocket_cc_source() -> None:
+    """The SDK appends ``source/<sanitized>`` to its User-Agent — we set it
+    to ``pocket-cc`` so REST traffic is instantly identifiable in Lark's
+    request logs (helps Lark support correlate a log_id back to us).
+
+    Asserted via the SDK config the builder writes through to, not by
+    sniffing the wire — the underlying Transport pulls the value from
+    ``_config.source`` at request time, so verifying it landed there
+    guarantees every request will carry the tag.
+    """
+    client = LarkOapiClient(app_id="cli_x", app_secret="secret")
+    assert client._rest._config.source == "pocket-cc"

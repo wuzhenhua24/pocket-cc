@@ -133,6 +133,10 @@ class LarkEventLoop:
             self._app_secret,
             event_handler=dispatcher,
             log_level=self._log_level,
+            # See LarkOapiClient — same tag, applied to the WS endpoint
+            # handshake's User-Agent so REST and WS traffic carry a matching
+            # identifier in Lark's logs.
+            source="pocket-cc",
         )
         # Wire reconnect-lifecycle observers if the caller registered any. The
         # SDK exposes these as plain attributes (default to no-op lambdas); we

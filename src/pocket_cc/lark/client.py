@@ -72,7 +72,18 @@ class LarkOapiClient:
         domain: str = "https://open.feishu.cn",
         log_level: int | None = None,
     ) -> None:
-        builder = lark.Client.builder().app_id(app_id).app_secret(app_secret).domain(domain)
+        builder = (
+            lark.Client.builder()
+            .app_id(app_id)
+            .app_secret(app_secret)
+            .domain(domain)
+            # Identify pocket-cc in the SDK-built User-Agent — the SDK appends
+            # ``source/pocket-cc`` (sanitized), which surfaces in Lark's
+            # request logs. When pinging Lark support with a log_id, the
+            # source tag makes our traffic instantly distinguishable from
+            # other tenants of the same app.
+            .source("pocket-cc")
+        )
         # Lark uses an IntEnum-ish log level; let callers override if needed.
         if log_level is not None:
             builder = builder.log_level(log_level)
