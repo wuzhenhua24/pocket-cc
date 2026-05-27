@@ -94,6 +94,7 @@ def _make_binding_with_turn(chat_id: str = "oc_x") -> ChatBinding:
         cwd=Path("/tmp"),
     )
     binding.current_turn = TurnState(
+        card_id="card_x",
         card_message_id="om_x",
         card_stream=cast("Any", _FakeAny()),
         accumulator=cast("Any", _FakeAny()),
@@ -185,6 +186,7 @@ def _make_binding_with_ask_user(questions: Any, chat_id: str = "oc_ask") -> Chat
     acc = TurnAccumulator()
     acc._latest_ask_user_questions = questions
     binding.current_turn = TurnState(
+        card_id="card_x",
         card_message_id="om_x",
         card_stream=cast("Any", _FakeAny()),
         accumulator=acc,

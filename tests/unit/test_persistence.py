@@ -32,8 +32,9 @@ def _stub_binding(chat_id: str, *, open_id: str = "ou_user1") -> ChatBinding:
     )
 
 
-def _stub_turn(message_id: str) -> TurnState:
+def _stub_turn(message_id: str, *, card_id: str = "card_stub") -> TurnState:
     return TurnState(
+        card_id=card_id,
         card_message_id=message_id,
         card_stream=_FakeAny(),  # type: ignore[arg-type]
         accumulator=_FakeAny(),  # type: ignore[arg-type]

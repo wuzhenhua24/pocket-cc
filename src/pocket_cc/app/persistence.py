@@ -64,12 +64,24 @@ class TurnState:
 
     Card rotation (M2-F): when an active card's body grows past the
     rotation threshold, the bootstrap seals it (with a "⏬ 续下条" footer)
-    and opens a fresh card. ``card_message_id`` and ``card_stream`` are
-    replaced in place. ``is_continuation`` flips True after the first
-    rotation so subsequent cards get the "(续)" title prefix. The
-    accumulator's commit cursor tracks what's already been sealed.
+    and opens a fresh card. ``card_id``, ``card_message_id`` and
+    ``card_stream`` are all replaced in place. ``is_continuation`` flips
+    True after the first rotation so subsequent cards get the "(续)" title
+    prefix. The accumulator's commit cursor tracks what's already been
+    sealed.
+
+    Two ids are kept side-by-side because they index two different things:
+
+    * ``card_id`` is the cardkit handle — the streaming PUT target and
+      the persisted pointer used to flip an orphan card to "restart"
+      state on the next process boot.
+    * ``card_message_id`` is the IM message id — what card_action
+      callbacks come back on (the event carries message_id, not card_id),
+      and what the registry's ``find_by_card_message_id`` reverse lookup
+      keys on.
     """
 
+    card_id: str
     card_message_id: str
     card_stream: CardStream
     accumulator: TurnAccumulator

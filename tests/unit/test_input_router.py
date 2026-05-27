@@ -360,7 +360,7 @@ def test_first_message_creates_binding_and_sends_initial_card(tmp_path: Path) ->
 
     # Lark: one initial card sent
     assert len(lark.sent) == 1
-    assert lark.last_sent().kind == "card"
+    assert lark.last_sent().kind == "card_id"
 
     # Registry: binding stored, with current_turn
     binding = registry.get("oc_chat1")
@@ -408,7 +408,7 @@ def test_second_message_while_busy_is_rejected(tmp_path: Path) -> None:
     assert binding.current_turn is not None
     assert binding.current_turn.card_message_id == first_turn_id
     # No second card was opened; exactly one busy notice (text) was sent.
-    assert sum(1 for s in lark.sent if s.kind == "card") == 1
+    assert sum(1 for s in lark.sent if s.kind == "card_id") == 1
     assert sum(1 for s in lark.sent if s.kind == "text") == 1
     # The second prompt was never injected into tmux.
     assert [c.kwargs["text"] for c in tmux.calls if c.method == "send_text"] == ["first"]
@@ -816,7 +816,7 @@ def test_duplicate_message_id_is_dropped(tmp_path: Path) -> None:
     assert len(new_windows) == 1
     assert len(send_texts) == 1
     # Only one initial card sent — not two
-    cards_sent = [s for s in lark.sent if s.kind == "card"]
+    cards_sent = [s for s in lark.sent if s.kind == "card_id"]
     assert len(cards_sent) == 1
 
 
@@ -951,7 +951,7 @@ def test_message_during_waiting_does_not_open_new_card(tmp_path: Path) -> None:
 
     # First message: opens a turn and posts a card.
     router.handle_message(_message(text="please run X"))
-    cards_after_open = sum(1 for s in lark.sent if s.kind == "card")
+    cards_after_open = sum(1 for s in lark.sent if s.kind == "card_id")
     assert cards_after_open == 1
 
     # Pin a waiting state on the active turn (simulating M2-A/C detection).
@@ -960,7 +960,7 @@ def test_message_during_waiting_does_not_open_new_card(tmp_path: Path) -> None:
     # User replies in Lark — should be treated as continuation, no new card.
     router.handle_message(_message(text="1", message_id="om_reply"))
 
-    cards_after_reply = sum(1 for s in lark.sent if s.kind == "card")
+    cards_after_reply = sum(1 for s in lark.sent if s.kind == "card_id")
     assert cards_after_reply == 1, "no new card should be sent during waiting continuation"
 
 
@@ -1059,14 +1059,14 @@ def test_message_after_continuation_is_rejected_until_turn_completes(tmp_path: P
 
     # Turn is running again → a new request is rejected (no new card).
     router.handle_message(_message(text="next request", message_id="om_next"))
-    assert sum(1 for s in lark.sent if s.kind == "card") == 1
+    assert sum(1 for s in lark.sent if s.kind == "card_id") == 1
 
     # Now the turn completes → IDLE. The next message opens a new turn.
     binding = registry.get("oc_chat1")
     assert binding is not None
     provider(binding).seal(state="done")
     router.handle_message(_message(text="after done", message_id="om_after"))
-    assert sum(1 for s in lark.sent if s.kind == "card") == 2
+    assert sum(1 for s in lark.sent if s.kind == "card_id") == 2
 
 
 def test_card_action_waiting_response_text_dispatches_send_text(tmp_path: Path) -> None:

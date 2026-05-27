@@ -42,7 +42,7 @@ from pocket_cc.relay.card_renderer import (
     render_card,
     should_rotate,
 )
-from pocket_cc.relay.card_stream import CardStream
+from pocket_cc.relay.card_stream import CardStream, open_card_stream
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -314,21 +314,29 @@ class TurnController:
             # transcript `permission-mode` record lands.
             accumulator.current_mode = self._binding.current_mode
 
+            initial_card = render_card(
+                accumulator.snapshot(state="running"),
+                show_thinking=self._config.show_thinking,
+            )
             try:
-                message_id = self._lark.send_card(
+                card_id, message_id, stream = open_card_stream(
+                    self._lark,
                     self._binding.chat_id,
-                    render_card(
-                        accumulator.snapshot(state="running"),
-                        show_thinking=self._config.show_thinking,
-                    ),
+                    initial_card,
+                    interval_s=self._config.patch_interval_s,
                 )
             except LarkApiError:
-                logger.exception("send initial card failed")
+                # ``open_card_stream`` is two fallible calls back-to-back
+                # (create_card_entity then send_card_id). If create succeeded
+                # but send failed we leak a cardkit card_id, which is harmless
+                # (Lark GCs unreferenced cards) — not worth the rollback
+                # complexity of a "best-effort delete" RPC here.
+                logger.exception("open initial card stream failed")
                 return None
 
-            stream = CardStream(self._lark, message_id, interval_s=self._config.patch_interval_s)
             stream.start()
             turn = TurnState(
+                card_id=card_id,
                 card_message_id=message_id,
                 card_stream=stream,
                 accumulator=accumulator,
@@ -728,24 +736,29 @@ class TurnController:
             show_thinking=self._config.show_thinking,
         )
 
-        # Send the continuation card FIRST — it's the only fallible external
+        # Open the continuation stream FIRST — it's the only fallible external
         # call, and ordering it ahead of the irreversible local mutations
         # (closing the old stream, advancing the commit cursor) means a failed
         # send leaves the turn fully intact: the old stream stays live and the
         # tail stays uncommitted, so the next render just retries the rotation
         # instead of orphaning the card.
         try:
-            new_message_id = self._lark.send_card(binding.chat_id, new_card)
+            new_card_id, new_message_id, new_stream = open_card_stream(
+                self._lark,
+                binding.chat_id,
+                new_card,
+                interval_s=self._config.patch_interval_s,
+            )
         except LarkApiError:
             logger.warning(
-                "rotation: failed to send continuation card — keeping current "
-                "card live, will retry on next render",
+                "rotation: failed to open continuation card stream — keeping "
+                "current card live, will retry on next render",
                 extra={"chat_id": binding.chat_id},
                 exc_info=True,
             )
             return
 
-        # Send succeeded → now commit the irreversible local steps.
+        # Open succeeded → now commit the irreversible local steps.
         try:
             turn.card_stream.close(sealing_card)
         except Exception:
@@ -763,20 +776,20 @@ class TurnController:
             thinking_end=thinking_end,
         )
 
-        new_stream = CardStream(
-            self._lark, new_message_id, interval_s=self._config.patch_interval_s
-        )
         new_stream.start()
         turn.card_stream = new_stream
+        turn.card_id = new_card_id
         turn.card_message_id = new_message_id
         turn.is_continuation = True
-        # Persist the new active-card pointer — the previous message_id is no
-        # longer the orphan target; the continuation card is.
+        # Persist the new active-card pointer — the previous card_id /
+        # message_id are no longer the orphan target; the continuation
+        # card is.
         self._persist_state()
         logger.info(
             "rotated card (continuation)",
             extra={
                 "chat_id": binding.chat_id,
-                "new_card_id": new_message_id,
+                "new_card_id": new_card_id,
+                "new_message_id": new_message_id,
             },
         )

@@ -56,8 +56,9 @@ def _binding(tmp_path: Path) -> ChatBinding:
 def _attach_turn(binding: ChatBinding, lark: FakeLarkClient) -> TurnState:
     """Give the binding a current turn with a (not-started) CardStream so
     seal() can close it without spinning up a background thread."""
-    stream = CardStream(cast("Any", lark), "om_card", interval_s=10.0)
+    stream = CardStream(cast("Any", lark), "card_x", interval_s=10.0)
     turn = TurnState(
+        card_id="card_x",
         card_message_id="om_card",
         card_stream=stream,
         accumulator=TurnAccumulator(),
@@ -182,14 +183,23 @@ def test_stale_stop_does_not_seal_the_superseding_turn(tmp_path: Path) -> None:
 
 
 class _FlakyLark(FakeLarkClient):
-    """FakeLarkClient whose send_card can be made to fail on demand."""
+    """FakeLarkClient whose initial-card open path can fail on demand.
+
+    The rotation flow is now ``open_card_stream`` =
+    ``create_card_entity`` + ``send_card_id``. The recovery contract is
+    about the *aggregate* fallibility — either call going down must leave
+    the turn intact. We fail ``send_card_id`` here (the second of the
+    two) which models the worse case: a card_id was already minted on
+    the cardkit side, and the harness still has to leave the in-progress
+    turn untouched.
+    """
 
     fail_send: bool = False
 
-    def send_card(self, chat_id: str, card: dict[str, Any]) -> str:
+    def send_card_id(self, chat_id: str, card_id: str) -> str:
         if self.fail_send:
-            raise LarkApiError(500, "simulated send_card failure")
-        return super().send_card(chat_id, card)
+            raise LarkApiError(500, "simulated send_card_id failure")
+        return super().send_card_id(chat_id, card_id)
 
 
 def test_rotation_send_failure_is_recoverable(tmp_path: Path) -> None:
