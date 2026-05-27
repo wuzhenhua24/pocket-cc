@@ -240,8 +240,18 @@ def test_seal_final_patch_failure_sends_fallback_notice(tmp_path: Path, monkeypa
     monkeypatch.setattr(tc, "_FINAL_CLOSE_BACKOFF_S", 0.0)  # don't sleep in the test
 
     class _PatchFailLark(FakeLarkClient):
-        def patch_card(self, message_id: str, card: dict[str, Any]) -> None:
-            raise LarkApiError(500, "patch boom")
+        # CardStream's terminal flush now goes through update_card_entity
+        # (cardkit slow path). The test still names itself "patch failure"
+        # because it asserts on the same fallback-text user experience.
+        def update_card_entity(
+            self,
+            card_id: str,
+            card: dict[str, Any],
+            *,
+            sequence: int,
+            uuid: str | None = None,
+        ) -> None:
+            raise LarkApiError(500, "update boom")
 
     binding = _binding(tmp_path)
     lark = _PatchFailLark()
