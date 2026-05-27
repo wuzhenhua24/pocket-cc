@@ -792,7 +792,10 @@ def test_card_action_show_pane_dumps_capture_into_new_card(tmp_path: Path) -> No
     )
 
     assert len(lark.sent) == initial_card_count + 1
-    body = lark.last_sent().card["elements"][0]["content"]
+    # Pane-dump is now a cardkit one-shot: create_card_entity + send_card_id.
+    # The body lives on the most recent card entity, not inlined on the IM
+    # message record (which only references the card_id).
+    body = lark.card_entities[-1].card["body"]["elements"][0]["content"]
     assert "line3" in body  # tail wins
 
 

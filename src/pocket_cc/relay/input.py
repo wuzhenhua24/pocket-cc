@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 from pocket_cc.app.persistence import ChatBinding
 from pocket_cc.claude.pane_inspector import detect_mode
 from pocket_cc.claude.session_index import snapshot_existing_transcripts
-from pocket_cc.lark.card import build_text_card
+from pocket_cc.lark.card import build_text_card_v2
 from pocket_cc.lark.client import LarkApiError
 from pocket_cc.lark.error_codes import LarkErrorKind
 from pocket_cc.relay.turn_controller import TurnPhase
@@ -733,8 +733,12 @@ class InputRouter:
             return
         # Strip trailing blank lines tmux pads on capture
         body = pane.rstrip()[-_PANE_TAIL_CHARS:] if pane else "(空)"
+        # One-shot pane-dump notice: cardkit create + send_card_id. No
+        # streaming, no further updates — the card is informational.
+        card = build_text_card_v2(body=f"```\n{body}\n```")
         try:
-            self._lark.send_card(binding.chat_id, build_text_card(body=f"```\n{body}\n```"))
+            card_id = self._lark.create_card_entity(card)
+            self._lark.send_card_id(binding.chat_id, card_id)
         except LarkApiError as e:
             _log_lark_send_failure(
                 e, "send pane dump failed", chat_id=binding.chat_id,
