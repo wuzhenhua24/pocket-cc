@@ -59,6 +59,19 @@ _FORMAT_CODES = {
     230099,  # CardKit "failed to create card content"
 }
 
+# Cardkit / streaming endpoints (Phase 1 stub).
+#
+# The cardkit family (POST /cardkit/v1/cards, PUT
+# /cardkit/v1/cards/:id, PUT /cardkit/v1/cards/:id/elements/:eid/content)
+# surfaces its own business error codes — notably sequence-conflict and
+# card-not-found / element-not-found. We don't have an authoritative list
+# here yet; the safe default is to let unknown codes fall through to
+# :data:`LarkErrorKind.UNKNOWN`, where ``is_retryable`` only retries 5xx /
+# 50000–59999 (transient server-side) and surfaces business 4xx as
+# non-retryable. As Phase 2/3 exercises the cardkit endpoints, real codes
+# we observe get added below with their semantics. Search anchor:
+# CARDKIT_ERROR_CODES_TODO.
+
 
 def classify(raw_code: int) -> LarkErrorKind:
     """Map a Lark API ``code`` to a :class:`LarkErrorKind`.
