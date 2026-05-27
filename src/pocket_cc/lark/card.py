@@ -1,16 +1,27 @@
 """Lark interactive-card templates.
 
-Pure functions that build the card dict structure Lark's `/im/v1/messages`
-endpoint accepts (`msg_type=interactive`, `content` is the JSON of this dict).
-No I/O — `LarkClient` is responsible for actually sending it.
+Pure functions that build card dicts. No I/O — :class:`LarkClient` is what
+actually delivers them.
 
-We use the **legacy** card schema (no top-level `schema: "2.0"`) because:
-  - Lark's PATCH endpoint accepts both, but legacy renders identically across
-    older and newer Lark client versions.
-  - All elements we need (markdown, action+button, hr, expandable note) work
-    in the legacy schema without quirks.
+Two parallel families live here during the cardkit migration:
 
-Schema docs: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/im-v1/message-card/overview
+* **Legacy** (``build_status_card`` / ``build_text_card`` /
+  ``build_restart_notice_card``) — produces the ``config/header/elements``
+  shape consumed by IM's ``/im/v1/messages`` (``msg_type=interactive``) and
+  ``PATCH /im/v1/messages/:id``. In active use; will be removed in Phase 4.
+
+* **Cardkit Schema 2.0** (``build_status_card_v2`` / ``build_text_card_v2`` /
+  ``build_restart_notice_card_v2``) — produces the ``schema/config/header/body``
+  shape consumed by ``POST /cardkit/v1/cards`` and the streaming PUT
+  endpoints. Phase 2 ships these unused; Phase 3 switches the renderer
+  over.
+
+The v2 family attaches stable :data:`ELEMENT_ID_BODY` / :data:`ELEMENT_ID_DETAIL`
+/ :data:`ELEMENT_ID_ACTIONS` ids on each element it emits so the streaming
+layer can target the body markdown by name without parsing the JSON back.
+
+Legacy schema docs: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/im-v1/message-card/overview
+Cardkit Schema 2.0 docs: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/feishu-cards/card-overview
 """
 
 from __future__ import annotations
@@ -396,3 +407,165 @@ def build_running_actions(mode_suffix: str = "") -> tuple[CardButton, ...]:
 # permission mode (e.g. quick utility cards). The relay layer prefers
 # `build_running_actions(mode_label(...))` so the Mode button reflects state.
 DEFAULT_RUNNING_ACTIONS: tuple[CardButton, ...] = build_running_actions()
+
+
+# =========================================================================
+# Schema 2.0 (cardkit) builders — Phase 2 of the cardkit migration.
+# Coexist with the legacy builders above; not yet wired up to the renderer.
+# =========================================================================
+
+
+# Stable element ids assigned by the v2 builders. The streaming PUT endpoint
+# (``stream_element_content``) targets ``ELEMENT_ID_BODY`` exclusively to
+# append assistant text without re-sending the whole card; whole-card state
+# transitions (running → done, waiting card swap) go through
+# ``update_card_entity`` instead. Keep these names stable: Phase 3's
+# CardStream will hardcode them.
+ELEMENT_ID_BODY: Final[str] = "body"
+ELEMENT_ID_DETAIL_DIVIDER: Final[str] = "detail_divider"
+ELEMENT_ID_DETAIL_LABEL: Final[str] = "detail_label"
+ELEMENT_ID_DETAIL_CONTENT: Final[str] = "detail_content"
+ELEMENT_ID_ACTIONS_DIVIDER: Final[str] = "actions_divider"
+ELEMENT_ID_ACTIONS: Final[str] = "actions"
+
+
+def build_status_card_v2(
+    *,
+    title: str,
+    body: str,
+    state: CardState = "running",
+    actions: list[CardButton] | None = None,
+    detail: ExpandableSection | None = None,
+) -> dict[str, Any]:
+    """Build the cardkit Schema 2.0 equivalent of :func:`build_status_card`.
+
+    Differences from the legacy builder a caller must know about:
+
+    * Top-level ``schema: "2.0"`` declares the new format.
+    * ``config.streaming_mode`` is ``True`` for non-terminal states (running /
+      waiting) so the cardkit streaming PUT endpoint accepts updates;
+      terminal states (done / failed / cancelled) emit ``False`` so the IM
+      list-preview / forwarding behavior settles.
+    * ``config.summary.content`` carries the chat-list preview string —
+      derived from ``title`` so the preview reads as "{emoji} {title}"
+      without separate plumbing.
+    * Body elements live under ``body.elements`` (not top-level ``elements``)
+      and the body markdown carries :data:`ELEMENT_ID_BODY` so streaming
+      updates can target it by name.
+    * The v1 ``action`` container is gone in v2 — buttons go directly into
+      ``body.elements``; a multi-button row uses a ``column_set`` with one
+      ``column`` per button.
+    * Headings (``# / ##``) and other GFM features the legacy ``markdown``
+      tag dropped are rendered natively in v2 — callers can stop
+      pre-normalizing body content for those once Phase 4 lands.
+    """
+    color, emoji = _STATE_STYLE[state]
+    is_streaming = state in ("running", "waiting")
+
+    elements: list[dict[str, Any]] = [
+        {"tag": "markdown", "element_id": ELEMENT_ID_BODY, "content": body},
+    ]
+
+    if detail is not None:
+        elements.append({"tag": "hr", "element_id": ELEMENT_ID_DETAIL_DIVIDER})
+        # v2 dropped the ``note`` tag — flatten to a grey markdown line so the
+        # visual weight matches what legacy emitted.
+        elements.append(
+            {
+                "tag": "markdown",
+                "element_id": ELEMENT_ID_DETAIL_LABEL,
+                "content": f"<font color='grey'>▸ {detail.label}</font>",
+            }
+        )
+        elements.append(
+            {
+                "tag": "markdown",
+                "element_id": ELEMENT_ID_DETAIL_CONTENT,
+                "content": detail.content,
+            }
+        )
+
+    if actions:
+        elements.append({"tag": "hr", "element_id": ELEMENT_ID_ACTIONS_DIVIDER})
+        elements.append(_render_button_row_v2(actions))
+
+    summary_text = f"{emoji} {title}"
+    return {
+        "schema": "2.0",
+        "config": {
+            "streaming_mode": is_streaming,
+            # ``summary.content`` is the chat-list / notification preview.
+            # Empty string is valid; we feed the title-with-emoji so previews
+            # are scannable without opening the card.
+            "summary": {"content": summary_text},
+            # ``wide_screen_mode`` migrated to ``enable_forward`` / similar
+            # in v2; the legacy key is no-op here and we omit it.
+        },
+        "header": {
+            "template": color,
+            "title": {"tag": "plain_text", "content": summary_text},
+        },
+        "body": {"elements": elements},
+    }
+
+
+def build_text_card_v2(*, body: str) -> dict[str, Any]:
+    """v2 equivalent of :func:`build_text_card` — headerless, action-less.
+
+    No streaming_mode (these cards are one-shot notices), no summary header
+    overlay. Useful for "session ended" / orphan-restart notice cases.
+    """
+    return {
+        "schema": "2.0",
+        "config": {},
+        "body": {
+            "elements": [
+                {"tag": "markdown", "element_id": ELEMENT_ID_BODY, "content": body},
+            ],
+        },
+    }
+
+
+def build_restart_notice_card_v2() -> dict[str, Any]:
+    """v2 equivalent of :func:`build_restart_notice_card`.
+
+    Same intent as legacy: visually close out a card the previous (dead)
+    process left in a ⏳ state by flipping it to ⏹ cancelled with a notice.
+    """
+    return build_status_card_v2(
+        title="pocket-cc 已重启",
+        body="⚠️ 上一轮的状态未能保留——可发送新消息重新开始。",
+        state="cancelled",
+    )
+
+
+def _render_button_row_v2(actions: list[CardButton]) -> dict[str, Any]:
+    """Pack N buttons into a v2 ``column_set`` (the v2 multi-button idiom).
+
+    Each column contains one button. The cardkit renderer lays them out
+    side-by-side; on mobile they wrap as needed.
+    """
+    columns = [
+        {"tag": "column", "elements": [_render_button_v2(b)]} for b in actions
+    ]
+    return {
+        "tag": "column_set",
+        "element_id": ELEMENT_ID_ACTIONS,
+        "columns": columns,
+    }
+
+
+def _render_button_v2(button: CardButton) -> dict[str, Any]:
+    """v2 button element — shape mirrors legacy ``_render_button``.
+
+    The cardkit callback action picks up ``value`` verbatim, so the
+    ``card.action.trigger_v1`` event routing in :mod:`event_loop` keeps
+    working unchanged. ``type`` is the style key (default / primary /
+    danger), same as legacy.
+    """
+    return {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": button.text},
+        "type": button.style,
+        "value": dict(button.value),  # defensive copy — server may mutate
+    }

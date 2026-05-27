@@ -366,3 +366,185 @@ def test_build_status_card_normalizes_detail_content() -> None:
 def test_build_text_card_normalizes_body() -> None:
     card = build_text_card(body="## Note\n- one")
     assert "**Note**" in card["elements"][0]["content"]
+
+
+# =========================================================================
+# Schema 2.0 (cardkit) builders
+# =========================================================================
+
+from pocket_cc.lark.card import (  # noqa: E402  (grouped at end so legacy tests stay first)
+    ELEMENT_ID_ACTIONS,
+    ELEMENT_ID_ACTIONS_DIVIDER,
+    ELEMENT_ID_BODY,
+    ELEMENT_ID_DETAIL_CONTENT,
+    ELEMENT_ID_DETAIL_DIVIDER,
+    ELEMENT_ID_DETAIL_LABEL,
+    build_restart_notice_card_v2,
+    build_status_card_v2,
+    build_text_card_v2,
+)
+
+
+def test_v2_minimal_running_card_shape() -> None:
+    card = build_status_card_v2(title="task A", body="hello world")
+    assert card["schema"] == "2.0"
+    # Streaming on for running so cardkit's PUT endpoint accepts updates.
+    assert card["config"]["streaming_mode"] is True
+    assert card["config"]["summary"]["content"] == "⏳ task A"
+    assert card["header"]["template"] == "blue"
+    assert card["header"]["title"]["content"] == "⏳ task A"
+    # Body lives under body.elements, not top-level elements (v1 → v2 move).
+    assert "elements" not in card
+    elements = card["body"]["elements"]
+    assert elements == [
+        {"tag": "markdown", "element_id": ELEMENT_ID_BODY, "content": "hello world"},
+    ]
+
+
+def test_v2_streaming_mode_only_on_active_states() -> None:
+    """Terminal states (done/failed/cancelled) emit streaming_mode=False so
+    IM list-preview / forward behavior settles. waiting stays True because
+    the card is still awaiting user action."""
+    cases = {
+        "running": True,
+        "waiting": True,
+        "done": False,
+        "failed": False,
+        "cancelled": False,
+    }
+    for state, expected in cases.items():
+        card = build_status_card_v2(title="t", body="b", state=state)  # type: ignore[arg-type]
+        assert card["config"]["streaming_mode"] is expected, state
+
+
+def test_v2_state_drives_template_and_emoji() -> None:
+    cases = {
+        "running": ("blue", "⏳"),
+        "done": ("green", "✅"),
+        "failed": ("red", "❌"),
+        "waiting": ("orange", "❓"),
+        "cancelled": ("grey", "⏹"),
+    }
+    for state, (color, emoji) in cases.items():
+        card = build_status_card_v2(title="t", body="b", state=state)  # type: ignore[arg-type]
+        assert card["header"]["template"] == color, state
+        assert card["header"]["title"]["content"] == f"{emoji} t", state
+        assert card["config"]["summary"]["content"] == f"{emoji} t", state
+
+
+def test_v2_body_element_id_is_stable() -> None:
+    """Regression guard: Phase 3's CardStream hard-codes ELEMENT_ID_BODY as
+    the streaming target. If this constant ever drifts away from what the
+    builder actually emits, streaming PUTs would silently target a phantom
+    element id."""
+    card = build_status_card_v2(title="t", body="x")
+    body_element = card["body"]["elements"][0]
+    assert body_element["element_id"] == ELEMENT_ID_BODY
+    assert ELEMENT_ID_BODY == "body"  # frozen value — bumping requires a CardStream review
+
+
+def test_v2_actions_render_as_column_set_with_per_button_columns() -> None:
+    """v2 dropped the v1 ``action`` container — multi-button rows are a
+    column_set whose columns each hold a single button."""
+    actions = [
+        CardButton(text="A", value={"x": 1}),
+        CardButton(text="B", value={"x": 2}, style="primary"),
+        CardButton(text="C", value={"x": 3}, style="danger"),
+    ]
+    card = build_status_card_v2(title="t", body="b", actions=actions)
+    elements = card["body"]["elements"]
+    # body, hr-divider, column_set
+    tags = [e["tag"] for e in elements]
+    assert tags == ["markdown", "hr", "column_set"]
+    assert elements[1]["element_id"] == ELEMENT_ID_ACTIONS_DIVIDER
+    col_set = elements[2]
+    assert col_set["element_id"] == ELEMENT_ID_ACTIONS
+    cols = col_set["columns"]
+    assert len(cols) == 3
+    for col, expected in zip(cols, actions, strict=True):
+        assert col["tag"] == "column"
+        btn = col["elements"][0]
+        assert btn["tag"] == "button"
+        assert btn["text"]["content"] == expected.text
+        assert btn["type"] == expected.style
+        assert btn["value"] == expected.value
+
+
+def test_v2_button_value_is_defensively_copied() -> None:
+    payload = {"action": "cancel"}
+    card = build_status_card_v2(
+        title="t",
+        body="b",
+        actions=[CardButton(text="cancel", value=payload)],
+    )
+    rendered = card["body"]["elements"][-1]["columns"][0]["elements"][0]["value"]
+    rendered["action"] = "mutated"
+    assert payload == {"action": "cancel"}
+
+
+def test_v2_detail_section_uses_grey_markdown_label() -> None:
+    """v1 ``note`` tag is gone in v2 — we render the label as a grey
+    markdown line so the visual weight matches the legacy look."""
+    card = build_status_card_v2(
+        title="t",
+        body="b",
+        detail=ExpandableSection(label="Tool calls (4)", content="- Read foo.py"),
+    )
+    elements = card["body"]["elements"]
+    tags = [e["tag"] for e in elements]
+    assert tags == ["markdown", "hr", "markdown", "markdown"]
+    body, divider, label, content = elements
+    assert body["element_id"] == ELEMENT_ID_BODY
+    assert divider["element_id"] == ELEMENT_ID_DETAIL_DIVIDER
+    assert label["element_id"] == ELEMENT_ID_DETAIL_LABEL
+    assert "▸ Tool calls (4)" in label["content"]
+    assert "grey" in label["content"]
+    assert content["element_id"] == ELEMENT_ID_DETAIL_CONTENT
+    assert content["content"] == "- Read foo.py"
+
+
+def test_v2_detail_and_actions_combined_element_order() -> None:
+    card = build_status_card_v2(
+        title="t",
+        body="b",
+        detail=ExpandableSection(label="Detail", content="hidden info"),
+        actions=[CardButton(text="X", value={})],
+    )
+    tags = [e["tag"] for e in card["body"]["elements"]]
+    # body, detail_divider, detail_label, detail_content, actions_divider, actions
+    assert tags == ["markdown", "hr", "markdown", "markdown", "hr", "column_set"]
+
+
+def test_v2_text_card_has_no_header_no_streaming() -> None:
+    """One-shot notices: no header, no streaming_mode (the card has no
+    server-side updates planned)."""
+    card = build_text_card_v2(body="just a note")
+    assert card["schema"] == "2.0"
+    assert "header" not in card
+    assert "streaming_mode" not in card["config"]
+    elements = card["body"]["elements"]
+    assert elements == [
+        {"tag": "markdown", "element_id": ELEMENT_ID_BODY, "content": "just a note"},
+    ]
+
+
+def test_v2_restart_notice_card_is_grey_and_actionless() -> None:
+    card = build_restart_notice_card_v2()
+    assert card["schema"] == "2.0"
+    assert card["header"]["template"] == "grey"
+    assert "已重启" in card["header"]["title"]["content"]
+    # No interactive widgets — restart is informational.
+    assert not any(e.get("tag") == "column_set" for e in card["body"]["elements"])
+    assert not any(e.get("tag") == "button" for e in card["body"]["elements"])
+    # Terminal state ⇒ streaming_mode False.
+    assert card["config"]["streaming_mode"] is False
+
+
+def test_v2_does_not_pre_normalize_markdown_in_body() -> None:
+    """v2's markdown element renders GFM headings natively — the legacy
+    pre-normalize pass (`#` → `**`) is intentionally NOT applied here. If
+    Phase 3 still wants to normalize, it must do so before calling the
+    builder."""
+    raw = "## Heading\n- item"
+    card = build_status_card_v2(title="t", body=raw)
+    assert card["body"]["elements"][0]["content"] == raw
