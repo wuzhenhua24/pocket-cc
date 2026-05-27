@@ -139,6 +139,12 @@ class LarkEventLoop:
             self._app_secret,
             event_handler=dispatcher,
             log_level=self._log_level,
+            # Without this the SDK defaults to open.feishu.cn and the WS
+            # silently connects to the wrong tenant when LARK_DOMAIN points
+            # at Lark international / a self-hosted domain — REST goes to
+            # the configured domain, WS does not, and the handshake fails
+            # in a way that's hard to attribute.
+            domain=self._domain,
             # See LarkOapiClient — same tag, applied to the WS endpoint
             # handshake's User-Agent so REST and WS traffic carry a matching
             # identifier in Lark's logs.

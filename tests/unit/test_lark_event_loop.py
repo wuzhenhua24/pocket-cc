@@ -462,3 +462,67 @@ def test_start_tags_ws_client_with_pocket_cc_source(monkeypatch: Any) -> None:
     loop.start()
     assert captured["source"] == "pocket-cc"
     assert captured["started"] is True
+
+
+def test_start_propagates_domain_to_ws_client(monkeypatch: Any) -> None:
+    """``start`` must forward the configured ``domain`` to ws.Client.
+
+    Regression guard: bootstrap passes ``config.lark_domain`` to both REST
+    (LarkOapiClient) and WS (LarkEventLoop), but ``start`` used to drop it
+    on the floor and the SDK fell back to ``open.feishu.cn``. Lark
+    international / self-hosted deployments then saw REST hit the right
+    domain and WS hit the wrong one.
+    """
+    import lark_oapi
+
+    from pocket_cc.lark import event_loop as event_loop_module
+
+    captured: dict[str, Any] = {}
+
+    class FakeWsClient:
+        def __init__(self, app_id: str, app_secret: str, **kwargs: Any) -> None:
+            captured["app_id"] = app_id
+            captured.update(kwargs)
+            self.on_reconnecting = lambda: None
+            self.on_reconnected = lambda: None
+
+        def start(self) -> None:
+            captured["started"] = True
+
+    fake_ws_module = type("FakeWsModule", (), {"Client": FakeWsClient})()
+    monkeypatch.setattr(lark_oapi, "ws", fake_ws_module)
+    monkeypatch.setattr(event_loop_module.lark, "ws", fake_ws_module)
+
+    loop = LarkEventLoop(
+        app_id="cli_x", app_secret="secret", domain="https://open.larksuite.com"
+    )
+    loop.start()
+    assert captured["domain"] == "https://open.larksuite.com"
+
+
+def test_start_uses_default_domain_when_unspecified(monkeypatch: Any) -> None:
+    """Callers that don't pass ``domain`` get the feishu.cn default —
+    matches the constructor signature and avoids breaking existing deploys.
+    """
+    import lark_oapi
+
+    from pocket_cc.lark import event_loop as event_loop_module
+
+    captured: dict[str, Any] = {}
+
+    class FakeWsClient:
+        def __init__(self, app_id: str, app_secret: str, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            self.on_reconnecting = lambda: None
+            self.on_reconnected = lambda: None
+
+        def start(self) -> None:
+            pass
+
+    fake_ws_module = type("FakeWsModule", (), {"Client": FakeWsClient})()
+    monkeypatch.setattr(lark_oapi, "ws", fake_ws_module)
+    monkeypatch.setattr(event_loop_module.lark, "ws", fake_ws_module)
+
+    loop = LarkEventLoop(app_id="cli_x", app_secret="secret")
+    loop.start()
+    assert captured["domain"] == "https://open.feishu.cn"
