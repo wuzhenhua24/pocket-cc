@@ -267,7 +267,7 @@ def test_restore_drops_bindings_individually_on_malformed_entries(tmp_path: Path
             "chat-ok": _entry(window_id="@5"),
             "chat-no-window-id": {"cwd": "/tmp"},  # missing window_id
             "chat-no-open-id": bad_no_open_id,  # missing open_id → can't route
-            "chat-not-a-dict": "string instead of object",  # type: ignore[dict-item]
+            "chat-not-a-dict": "string instead of object",
         },
     )
     registry = Registry()

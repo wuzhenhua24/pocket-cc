@@ -376,8 +376,6 @@ def test_start_propagates_reconnect_handlers_to_ws_client(monkeypatch: Any) -> N
     """
     import lark_oapi
 
-    from pocket_cc.lark import event_loop as event_loop_module
-
     @dataclass
     class FakeWsClient:
         app_id: str
@@ -412,7 +410,11 @@ def test_start_propagates_reconnect_handlers_to_ws_client(monkeypatch: Any) -> N
 
     fake_ws_module = type("FakeWsModule", (), {"Client": FakeWsClient})()
     monkeypatch.setattr(lark_oapi, "ws", fake_ws_module)
-    monkeypatch.setattr(event_loop_module.lark, "ws", fake_ws_module)
+    # String target: ``lark`` is the lark_oapi alias re-imported inside
+    # event_loop, which mypy --strict refuses to read off the module by
+    # attribute (the alias isn't re-exported). Patching by path hits the
+    # same object.
+    monkeypatch.setattr("pocket_cc.lark.event_loop.lark.ws", fake_ws_module)
 
     loop = LarkEventLoop(app_id="x", app_secret="y")
     seen: list[str] = []
@@ -421,7 +423,7 @@ def test_start_propagates_reconnect_handlers_to_ws_client(monkeypatch: Any) -> N
     # handlers leave the SDK default untouched.
     loop.start()
 
-    ws: FakeWsClient = loop._ws  # type: ignore[assignment]
+    ws: FakeWsClient = loop._ws
     assert ws.started is True
     # Registered handler propagated.
     ws.on_reconnecting()
@@ -439,8 +441,6 @@ def test_start_tags_ws_client_with_pocket_cc_source(monkeypatch: Any) -> None:
     """
     import lark_oapi
 
-    from pocket_cc.lark import event_loop as event_loop_module
-
     captured: dict[str, Any] = {}
 
     class FakeWsClient:
@@ -456,7 +456,11 @@ def test_start_tags_ws_client_with_pocket_cc_source(monkeypatch: Any) -> None:
 
     fake_ws_module = type("FakeWsModule", (), {"Client": FakeWsClient})()
     monkeypatch.setattr(lark_oapi, "ws", fake_ws_module)
-    monkeypatch.setattr(event_loop_module.lark, "ws", fake_ws_module)
+    # String target: ``lark`` is the lark_oapi alias re-imported inside
+    # event_loop, which mypy --strict refuses to read off the module by
+    # attribute (the alias isn't re-exported). Patching by path hits the
+    # same object.
+    monkeypatch.setattr("pocket_cc.lark.event_loop.lark.ws", fake_ws_module)
 
     loop = LarkEventLoop(app_id="cli_x", app_secret="secret")
     loop.start()
@@ -475,8 +479,6 @@ def test_start_propagates_domain_to_ws_client(monkeypatch: Any) -> None:
     """
     import lark_oapi
 
-    from pocket_cc.lark import event_loop as event_loop_module
-
     captured: dict[str, Any] = {}
 
     class FakeWsClient:
@@ -491,7 +493,11 @@ def test_start_propagates_domain_to_ws_client(monkeypatch: Any) -> None:
 
     fake_ws_module = type("FakeWsModule", (), {"Client": FakeWsClient})()
     monkeypatch.setattr(lark_oapi, "ws", fake_ws_module)
-    monkeypatch.setattr(event_loop_module.lark, "ws", fake_ws_module)
+    # String target: ``lark`` is the lark_oapi alias re-imported inside
+    # event_loop, which mypy --strict refuses to read off the module by
+    # attribute (the alias isn't re-exported). Patching by path hits the
+    # same object.
+    monkeypatch.setattr("pocket_cc.lark.event_loop.lark.ws", fake_ws_module)
 
     loop = LarkEventLoop(
         app_id="cli_x", app_secret="secret", domain="https://open.larksuite.com"
@@ -506,8 +512,6 @@ def test_start_uses_default_domain_when_unspecified(monkeypatch: Any) -> None:
     """
     import lark_oapi
 
-    from pocket_cc.lark import event_loop as event_loop_module
-
     captured: dict[str, Any] = {}
 
     class FakeWsClient:
@@ -521,7 +525,11 @@ def test_start_uses_default_domain_when_unspecified(monkeypatch: Any) -> None:
 
     fake_ws_module = type("FakeWsModule", (), {"Client": FakeWsClient})()
     monkeypatch.setattr(lark_oapi, "ws", fake_ws_module)
-    monkeypatch.setattr(event_loop_module.lark, "ws", fake_ws_module)
+    # String target: ``lark`` is the lark_oapi alias re-imported inside
+    # event_loop, which mypy --strict refuses to read off the module by
+    # attribute (the alias isn't re-exported). Patching by path hits the
+    # same object.
+    monkeypatch.setattr("pocket_cc.lark.event_loop.lark.ws", fake_ws_module)
 
     loop = LarkEventLoop(app_id="cli_x", app_secret="secret")
     loop.start()

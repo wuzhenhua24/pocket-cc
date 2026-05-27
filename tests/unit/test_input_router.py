@@ -286,7 +286,10 @@ def test_unauth_reply_resumes_after_window(tmp_path: Path, monkeypatch: pytest.M
             return self.t
 
     clock = _Clock()
-    monkeypatch.setattr(input_mod.time, "monotonic", clock)
+    # String-target form: ``input_mod.time`` is a submodule reference that
+    # mypy --strict refuses to read off `input_mod` (time isn't re-exported
+    # from there). The string form patches the same attribute by path.
+    monkeypatch.setattr("pocket_cc.relay.input.time.monotonic", clock)
 
     cfg = _make_config(workspace=tmp_path, open_id="ou_allowed")
     tmux = FakeTmuxManager()
@@ -515,7 +518,10 @@ def test_unsupported_notice_resumes_after_window(
             return self.t
 
     clock = _Clock()
-    monkeypatch.setattr(input_mod.time, "monotonic", clock)
+    # String-target form: ``input_mod.time`` is a submodule reference that
+    # mypy --strict refuses to read off `input_mod` (time isn't re-exported
+    # from there). The string form patches the same attribute by path.
+    monkeypatch.setattr("pocket_cc.relay.input.time.monotonic", clock)
 
     cfg = _make_config(workspace=tmp_path)
     tmux = FakeTmuxManager()
@@ -542,7 +548,9 @@ def test_stale_message_is_dropped_silently(tmp_path: Path) -> None:
     registry = Registry()
     router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
 
-    now_ms = int(input_mod.time.time() * 1000)
+    import time as _time
+
+    now_ms = int(_time.time() * 1000)
     stale = now_ms - input_mod._STALE_MESSAGE_WINDOW_MS - 5_000  # 5s past window
     router.handle_message(_message(text="old prompt", create_time_ms=stale))
 
@@ -562,7 +570,9 @@ def test_fresh_message_at_window_edge_is_processed(tmp_path: Path) -> None:
     registry = Registry()
     router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
 
-    now_ms = int(input_mod.time.time() * 1000)
+    import time as _time
+
+    now_ms = int(_time.time() * 1000)
     just_fresh = now_ms - input_mod._STALE_MESSAGE_WINDOW_MS + 1_000  # 1s inside
     router.handle_message(_message(text="recent prompt", create_time_ms=just_fresh))
 

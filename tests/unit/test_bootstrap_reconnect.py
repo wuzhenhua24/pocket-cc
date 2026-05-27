@@ -62,7 +62,7 @@ def test_ws_reconnecting_logs_warning_and_starts_clock(
     records = [r for r in caplog.records if r.getMessage() == "ws reconnecting"]
     assert len(records) == 1
     assert records[0].levelno == logging.WARNING
-    assert records[0].event == "ws_reconnecting"  # type: ignore[attr-defined]
+    assert records[0].event == "ws_reconnecting"
 
 
 def test_ws_reconnected_logs_downtime_and_clears_clock(
@@ -71,11 +71,13 @@ def test_ws_reconnected_logs_downtime_and_clears_clock(
     """on_reconnected logs the downtime so operators can correlate user
     reports of dropped messages with WS outage windows. The clock is cleared
     after so a subsequent disconnect starts a fresh measurement."""
-    import pocket_cc.app.bootstrap as bootstrap_module
-
     # Deterministic monotonic clock so the assertion on downtime_s is exact.
+    # String target avoids reading the stdlib `time` reference off the
+    # bootstrap module (mypy --strict rejects that — time isn't re-exported).
     clock = iter([1000.0, 1037.42])
-    monkeypatch.setattr(bootstrap_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(
+        "pocket_cc.app.bootstrap.time.monotonic", lambda: next(clock)
+    )
 
     app = Pocketcc(_minimal_config(tmp_path))
     app._handle_ws_reconnecting()  # consumes 1000.0

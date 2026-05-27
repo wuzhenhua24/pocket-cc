@@ -35,7 +35,7 @@ class _FailingLark(FakeLarkClient):
         super().__init__()
         self._err = err
 
-    def send_text(self, chat_id: str, text: str) -> str:  # type: ignore[override]
+    def send_text(self, chat_id: str, text: str) -> str:
         raise self._err
 
 
