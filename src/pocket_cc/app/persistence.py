@@ -177,7 +177,13 @@ class Registry:
 # v2: ChatBinding gained the required `open_id` field (M3 step3) — pre-v2
 # snapshots can't be safely restored because the per-binding routing needs
 # it. Old snapshots get dropped and users re-create bindings on next message.
-_SCHEMA_VERSION: Final[int] = 2
+#
+# v3: active_card persists ``card_id`` alongside ``message_id``. The orphan
+# patch on restart now goes through cardkit (update_card_entity targets
+# card_id), so a snapshot without card_id can't be used. Phase 3.4 of the
+# cardkit migration; pre-v3 snapshots get dropped — early-stage project,
+# no compat requirement.
+_SCHEMA_VERSION: Final[int] = 3
 
 
 class StateStore:
@@ -280,6 +286,7 @@ class StateStore:
             turn = b.current_turn
             if turn is not None:
                 entry["active_card"] = {
+                    "card_id": turn.card_id,
                     "message_id": turn.card_message_id,
                     "is_continuation": turn.is_continuation,
                 }

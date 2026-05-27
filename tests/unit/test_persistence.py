@@ -158,7 +158,7 @@ def test_state_store_save_creates_file_with_versioned_envelope(tmp_path: Path) -
     store.save()
 
     data = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
-    assert data["version"] == 2
+    assert data["version"] == 3
     assert set(data["bindings"]) == {"chat-1"}
 
 
@@ -201,7 +201,11 @@ def test_state_store_active_card_present_when_turn_open(tmp_path: Path) -> None:
     store.save()
     entry = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))["bindings"]["chat-1"]
 
-    assert entry["active_card"] == {"message_id": "om_card_xyz", "is_continuation": True}
+    assert entry["active_card"] == {
+        "card_id": "card_stub",
+        "message_id": "om_card_xyz",
+        "is_continuation": True,
+    }
 
 
 def test_state_store_active_card_cleared_after_turn_seal(tmp_path: Path) -> None:
@@ -312,7 +316,7 @@ def test_state_store_load_returns_parsed_dict_round_trip(tmp_path: Path) -> None
 
     data = store.load()
     assert data is not None
-    assert data["version"] == 2
+    assert data["version"] == 3
     assert data["bindings"]["chat-1"]["current_mode"] == "bypassPermissions"
 
 

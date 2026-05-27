@@ -32,7 +32,7 @@ from pocket_cc.app.config import events_jsonl_path, pocket_cc_dir
 from pocket_cc.app.persistence import ChatBinding, Registry, StateStore
 from pocket_cc.claude.events import EventsReader
 from pocket_cc.claude.hooks import all_installed as hooks_all_installed
-from pocket_cc.lark.card import build_restart_notice_card
+from pocket_cc.lark.card import build_restart_notice_card_v2
 from pocket_cc.lark.client import LarkApiError, LarkClient, LarkOapiClient
 from pocket_cc.lark.event_loop import LarkEventLoop
 from pocket_cc.relay.events_router import EventsPoller, HookEventsDispatcher
@@ -248,15 +248,27 @@ def _cleanup_dropped_binding(
 
 
 def _patch_orphan_card(chat_id: str, active_card: dict[str, Any], *, lark: LarkClient) -> None:
-    message_id = active_card.get("message_id")
-    if not isinstance(message_id, str) or not message_id:
+    """Flip a dead-turn card to the ⏹ restart-notice state via cardkit.
+
+    The orphan's ``card_id`` is what cardkit's whole-card replacement
+    targets — no IM PATCH involved. We don't bother tracking a sequence
+    here because the old CardStream is gone and won't try to PUT anything
+    else: cardkit accepts ``sequence=1`` on a card it has never seen, and
+    after this call the card is logically retired.
+
+    ``message_id`` is still persisted for forensic / log correlation
+    (matches what users see in chat) but isn't used as an update handle.
+    """
+    card_id = active_card.get("card_id")
+    if not isinstance(card_id, str) or not card_id:
         return
+    message_id = active_card.get("message_id")
     try:
-        lark.patch_card(message_id, build_restart_notice_card())
+        lark.update_card_entity(card_id, build_restart_notice_card_v2(), sequence=1)
     except LarkApiError:
         logger.warning(
-            "restore: orphan card patch failed (Lark side)",
-            extra={"chat_id": chat_id, "message_id": message_id},
+            "restore: orphan card update failed (Lark side)",
+            extra={"chat_id": chat_id, "card_id": card_id, "message_id": message_id},
             exc_info=True,
         )
 

@@ -59,7 +59,9 @@ def _win(window_id: str, name: str = "chat-x", cwd: str = "/tmp/wsp") -> WindowI
 # schema shape (assertions can't pass by accident if the StateStore writer
 # drifts; the read side is independently exercised).
 def _write_state(path: Path, *, bindings: dict[str, Any]) -> None:
-    path.write_text(json.dumps({"version": 2, "bindings": bindings}), encoding="utf-8")
+    # Schema v3: active_card carries `card_id` for cardkit-driven orphan
+    # restart-notice updates (see persistence._SCHEMA_VERSION).
+    path.write_text(json.dumps({"version": 3, "bindings": bindings}), encoding="utf-8")
 
 
 def _entry(
@@ -197,7 +199,11 @@ def test_restore_patches_orphan_card_and_clears_pointer(tmp_path: Path) -> None:
         bindings={
             "chat-1": _entry(
                 window_id="@5",
-                active_card={"message_id": "om_orphan", "is_continuation": True},
+                active_card={
+                    "card_id": "card_orphan",
+                    "message_id": "om_orphan",
+                    "is_continuation": True,
+                },
             )
         },
     )
@@ -208,12 +214,15 @@ def test_restore_patches_orphan_card_and_clears_pointer(tmp_path: Path) -> None:
 
     restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
-    # Exactly one patch, against the orphaned message_id, with a cancelled card.
-    assert len(lark.patches) == 1
-    patch = lark.patches[0]
-    assert patch.message_id == "om_orphan"
-    assert patch.card["header"]["template"] == "grey"
-    assert "已重启" in patch.card["header"]["title"]["content"]
+    # Exactly one cardkit update, against the orphaned card_id, carrying the
+    # restart-notice v2 card (grey header, ⏹ cancelled state, no streaming).
+    assert len(lark.card_entity_updates) == 1
+    update = lark.card_entity_updates[0]
+    assert update.card_id == "card_orphan"
+    assert update.card["header"]["template"] == "grey"
+    assert "已重启" in update.card["header"]["title"]["content"]
+    # Legacy IM PATCH should not be touched.
+    assert lark.patches == []
 
     # State file was rewritten with active_card cleared (current_turn is None
     # on the restored binding, so StateStore's snapshot drops the pointer).
@@ -227,7 +236,12 @@ def test_restore_keeps_binding_even_when_orphan_patch_fails(tmp_path: Path) -> N
         state_path,
         bindings={
             "chat-1": _entry(
-                window_id="@5", active_card={"message_id": "om_dead", "is_continuation": False}
+                window_id="@5",
+                active_card={
+                    "card_id": "card_dead",
+                    "message_id": "om_dead",
+                    "is_continuation": False,
+                },
             )
         },
     )
@@ -321,7 +335,7 @@ def test_restore_drops_when_open_id_no_longer_in_users(tmp_path: Path) -> None:
             "chat-1": _entry(
                 open_id="ou_evicted",
                 window_id="@5",
-                active_card={"message_id": "om_orphan", "is_continuation": False},
+                active_card={"card_id": "card_orphan", "message_id": "om_orphan", "is_continuation": False},
             ),
         },
     )
@@ -337,8 +351,8 @@ def test_restore_drops_when_open_id_no_longer_in_users(tmp_path: Path) -> None:
 
     assert len(registry) == 0
     assert tmux.killed == ["@5"]
-    assert len(lark.patches) == 1
-    assert lark.patches[0].message_id == "om_orphan"
+    assert len(lark.card_entity_updates) == 1
+    assert lark.card_entity_updates[0].card_id == "card_orphan"
     # Disk snapshot now reflects the drop, so a second restart won't re-process it.
     assert json.loads(state_path.read_text(encoding="utf-8"))["bindings"] == {}
 
@@ -354,7 +368,7 @@ def test_restore_drops_when_workspace_changed_in_users_config(tmp_path: Path) ->
                 open_id="ou_user1",
                 window_id="@7",
                 cwd="/tmp/old-workspace",
-                active_card={"message_id": "om_orphan", "is_continuation": False},
+                active_card={"card_id": "card_orphan", "message_id": "om_orphan", "is_continuation": False},
             ),
         },
     )
@@ -369,8 +383,8 @@ def test_restore_drops_when_workspace_changed_in_users_config(tmp_path: Path) ->
 
     assert len(registry) == 0
     assert tmux.killed == ["@7"]
-    assert len(lark.patches) == 1
-    assert lark.patches[0].message_id == "om_orphan"
+    assert len(lark.card_entity_updates) == 1
+    assert lark.card_entity_updates[0].card_id == "card_orphan"
 
 
 def test_restore_reconcile_drop_survives_tmux_kill_failure(tmp_path: Path) -> None:
@@ -383,7 +397,7 @@ def test_restore_reconcile_drop_survives_tmux_kill_failure(tmp_path: Path) -> No
             "chat-1": _entry(
                 open_id="ou_evicted",
                 window_id="@5",
-                active_card={"message_id": "om_orphan", "is_continuation": False},
+                active_card={"card_id": "card_orphan", "message_id": "om_orphan", "is_continuation": False},
             ),
         },
     )
@@ -401,18 +415,27 @@ def test_restore_reconcile_drop_survives_tmux_kill_failure(tmp_path: Path) -> No
     # Binding is still dropped; orphan card is still patched despite kill failing.
     assert len(registry) == 0
     assert tmux.killed == ["@5"]  # we attempted
-    assert len(lark.patches) == 1
+    assert len(lark.card_entity_updates) == 1
 
 
 # ----------------------------------------------------------------- helpers
 
 
 class _RaisingPatchLark(FakeLarkClient):
-    """FakeLarkClient variant whose patch_card always raises — for testing the
-    orphan-patch failure path."""
+    """FakeLarkClient variant whose update_card_entity always raises —
+    exercises the orphan-update failure path. (Named "Patch" historically;
+    cardkit's whole-card replacement is conceptually the same operation
+    that ``patch_card`` was doing in the legacy path.)"""
 
-    def patch_card(self, message_id: str, card: dict[str, Any]) -> None:
-        raise LarkApiError(code=1234, msg="patch denied")
+    def update_card_entity(
+        self,
+        card_id: str,
+        card: dict[str, Any],
+        *,
+        sequence: int,
+        uuid: str | None = None,
+    ) -> None:
+        raise LarkApiError(code=1234, msg="update denied")
 
 
 # Touch ANY so the import is used (mypy --strict otherwise complains; we
