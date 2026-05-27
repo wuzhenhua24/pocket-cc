@@ -110,12 +110,16 @@ uv lock --upgrade                    # 升级锁文件
 - `im:message:send_as_bot`（**必填** — 以应用身份发消息）
 - `im:message`（消息读写伞形权限）
 - `im:message.p2p_msg` + `im:message.p2p_msg:readonly`（接收单聊消息）
+- `cardkit:card:write`（**必填** — 创建卡片实体）
+- `cardkit:card`（**必填** — 更新卡片实体；卡片流式追加、状态翻转都靠它）
 
 群聊场景再加：
 - `im:message.group_at_msg` + `im:message.group_at_msg:readonly`（群聊 `@bot` 消息）
 
 M2-D 文件回传时再加：
 - `im:resource`（上传/下载图片文件）
+
+> 改完权限**必须**重新发版，否则旧 token 仍按旧 scope 集合鉴权。新 scope 没生效时第一条消息就报 `99991672` / `99991679`（创建卡片被拒）或 `99991680` / `99991681`（更新卡片被拒）。
 
 完整、详细带「哪个功能依赖哪个权限点」的对照见 [`deploy/README.md` §5](./deploy/README.md#5-在飞书后台配应用)。
 

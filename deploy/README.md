@@ -115,15 +115,25 @@ uv run pocket-cc --version
 
 | 权限点 | 作用 | 哪个功能依赖 |
 |---|---|---|
-| `im:message:send_as_bot` | 以应用身份发消息（**必填**） | 发文本 / 发卡片 / PATCH 卡片 |
+| `im:message:send_as_bot` | 以应用身份发消息（**必填**） | 发文本 / 发卡片 |
 | `im:message` | 消息读写伞形权限 | 上面 send_as_bot 的兜底 |
 | `im:message.p2p_msg` | 接收单聊消息 | **单聊**收消息 |
 | `im:message.p2p_msg:readonly` | 同上只读版本 | 飞书有时要求 readonly 配套勾上 |
 | `im:message.group_at_msg` | 接收群聊 `@bot` 消息 | **群聊**场景才需要 |
 | `im:message.group_at_msg:readonly` | 同上只读版本 | 群聊场景 |
+| `cardkit:card:write` | **创建卡片实体**（**必填**） | 任何卡片：主对话卡 / 重启通知 / pane dump |
+| `cardkit:card` | **更新卡片实体**（**必填**） | 卡片流式追加内容、状态翻转（运行中→完成）、orphan 卡片重置 |
 | `im:resource`（可选） | 上传/下载文件、图片 | M2-D 文件回传时需要，M2 之前可不要 |
 
-最小可用集合（自用单聊场景）：前三个 + p2p_msg:readonly = 4 个权限点。
+最小可用集合（自用单聊场景）：`im:message:send_as_bot` + `im:message` +
+`im:message.p2p_msg` + `im:message.p2p_msg:readonly` +
+`cardkit:card:write` + `cardkit:card` = 6 个权限点。
+
+> ⚠️ cardkit 两项是 Phase 3 卡片系统迁到 Schema 2.0 之后引入的硬需求。
+> 没勾 `cardkit:card:write` 时第一条用户消息就报 `99991672` / `99991679`
+> （创建卡片被拒）；没勾 `cardkit:card` 时卡片能创建但更新不上（流式追
+> 加 / 完成态翻转走 `99991680` / `99991681` 路径）。改完权限**必须**到
+> 「版本管理与发布」重新发版，否则旧 token 还在用旧 scope 集合。
 
 ### 5.3 事件订阅（「事件与回调 → 事件订阅」）
 
