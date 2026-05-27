@@ -151,6 +151,46 @@ def test_close_final_flush_short_circuits_on_non_retryable_error() -> None:
     assert fake.attempts == 1
 
 
+def test_close_final_flush_short_circuits_on_unknown_4xx_business_code() -> None:
+    """Regression guard: unknown 4xx / business codes are now classified
+    non-retryable (matches SDK ``classify_error``). _flush_final must
+    surface failure on the first attempt — retrying just delays the
+    terminal-card failure return."""
+
+    class UnknownBusinessClient(FakeLarkClient):
+        attempts: int = 0
+
+        def patch_card(self, message_id: str, card: dict[str, object]) -> None:
+            self.attempts += 1
+            raise LarkApiError(code=424242, msg="unknown business error")
+
+    fake = UnknownBusinessClient()
+    stream = CardStream(fake, "om_abc", interval_s=10.0)
+    stream.start()
+    assert stream.close({"final": True}, retries=5, backoff_s=0.0) is False
+    assert fake.attempts == 1
+
+
+def test_close_final_flush_retries_unknown_5xx_error() -> None:
+    """UNKNOWN with a 5xx-shaped code stays retryable (transient server
+    failure) — verify _flush_final still consumes its retry budget."""
+
+    class TransientServerClient(FakeLarkClient):
+        attempts: int = 0
+
+        def patch_card(self, message_id: str, card: dict[str, object]) -> None:
+            self.attempts += 1
+            if self.attempts < 3:
+                raise LarkApiError(code=50001, msg="internal server error")
+            super().patch_card(message_id, card)
+
+    fake = TransientServerClient()
+    stream = CardStream(fake, "om_abc", interval_s=10.0)
+    stream.start()
+    assert stream.close({"final": True}, retries=3, backoff_s=0.0) is True
+    assert fake.attempts == 3
+
+
 def test_close_final_flush_retries_rate_limited_error() -> None:
     """RATE_LIMITED is retryable — verify we still consume retry budget
     on classified-but-retryable errors."""

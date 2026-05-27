@@ -61,7 +61,7 @@ class LarkApiError(RuntimeError):
 
     @property
     def retryable(self) -> bool:
-        return is_retryable(self.kind)
+        return is_retryable(self.kind, self.code)
 
 
 class LarkClient(Protocol):

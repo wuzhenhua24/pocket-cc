@@ -36,12 +36,29 @@ def test_invalid_content_is_format_not_revoked() -> None:
     assert classify(230001) is LarkErrorKind.FORMAT_ERROR
 
 
-def test_is_retryable_only_rate_limited_and_unknown() -> None:
-    assert is_retryable(LarkErrorKind.RATE_LIMITED)
-    assert is_retryable(LarkErrorKind.UNKNOWN)
-    assert not is_retryable(LarkErrorKind.FORMAT_ERROR)
-    assert not is_retryable(LarkErrorKind.TARGET_REVOKED)
-    assert not is_retryable(LarkErrorKind.PERMISSION_DENIED)
+def test_is_retryable_rate_limited_always_true() -> None:
+    """RATE_LIMITED is retryable regardless of raw_code."""
+    assert is_retryable(LarkErrorKind.RATE_LIMITED, 11020)
+    assert is_retryable(LarkErrorKind.RATE_LIMITED, 0)
+
+
+def test_is_retryable_unknown_only_for_5xx_ranges() -> None:
+    """UNKNOWN mirrors the SDK: only HTTP 5xx or 50000–59999 are retryable."""
+    assert is_retryable(LarkErrorKind.UNKNOWN, 500)
+    assert is_retryable(LarkErrorKind.UNKNOWN, 599)
+    assert is_retryable(LarkErrorKind.UNKNOWN, 50000)
+    assert is_retryable(LarkErrorKind.UNKNOWN, 59999)
+    # Unknown 4xx / business codes are NOT retryable — retrying just delays
+    # the final-failure surface.
+    assert not is_retryable(LarkErrorKind.UNKNOWN, 400)
+    assert not is_retryable(LarkErrorKind.UNKNOWN, 424242)
+    assert not is_retryable(LarkErrorKind.UNKNOWN, 60000)
+
+
+def test_is_retryable_classified_non_retryable_kinds() -> None:
+    assert not is_retryable(LarkErrorKind.FORMAT_ERROR, 230001)
+    assert not is_retryable(LarkErrorKind.TARGET_REVOKED, 230002)
+    assert not is_retryable(LarkErrorKind.PERMISSION_DENIED, 99991663)
 
 
 def test_lark_api_error_auto_classifies_kind() -> None:
@@ -50,10 +67,21 @@ def test_lark_api_error_auto_classifies_kind() -> None:
     assert err.retryable is True
 
 
-def test_lark_api_error_unknown_code_stays_retryable() -> None:
-    err = LarkApiError(code=500001, msg="boom")
+def test_lark_api_error_unknown_5xx_is_retryable() -> None:
+    """5-digit 50000–59999 are Lark's internal server-error range — the SDK
+    treats them as transient and retryable."""
+    err = LarkApiError(code=50001, msg="boom")
     assert err.kind is LarkErrorKind.UNKNOWN
     assert err.retryable is True
+
+
+def test_lark_api_error_unknown_4xx_is_not_retryable() -> None:
+    """Regression guard: unknown 4xx / business codes used to be retryable
+    under a coarse ``is_retryable(kind)`` check, so card_stream burned its
+    retry budget waiting for an impossible recovery. Now non-retryable."""
+    err = LarkApiError(code=424242, msg="unknown business error")
+    assert err.kind is LarkErrorKind.UNKNOWN
+    assert err.retryable is False
 
 
 def test_lark_api_error_format_error_is_not_retryable() -> None:

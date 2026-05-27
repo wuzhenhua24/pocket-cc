@@ -82,12 +82,19 @@ def classify(raw_code: int) -> LarkErrorKind:
     return LarkErrorKind.UNKNOWN
 
 
-def is_retryable(kind: LarkErrorKind) -> bool:
+def is_retryable(kind: LarkErrorKind, raw_code: int) -> bool:
     """True when the same call may succeed on a later attempt.
 
-    UNKNOWN is conservatively retryable: covers transient 5xx / network
-    blips that didn't map to a specific bucket. The card_stream final
-    flush already bounds total attempts, so an unretryable mis-tag here
-    just costs a few extra round trips, not an infinite loop.
+    Mirrors the SDK's per-code retry semantics (see
+    ``lark_oapi.channel.errors.classify_error``): an UNKNOWN classification
+    is only retryable when the raw code looks like a transient server-side
+    failure (HTTP 5xx, or Lark's 50000–59999 internal range). Unknown 4xx
+    / business codes are surfaced as non-retryable so card_stream's final
+    flush short-circuits instead of burning the retry budget on calls that
+    will keep failing.
     """
-    return kind in (LarkErrorKind.RATE_LIMITED, LarkErrorKind.UNKNOWN)
+    if kind is LarkErrorKind.RATE_LIMITED:
+        return True
+    if kind is LarkErrorKind.UNKNOWN:
+        return 500 <= raw_code < 600 or 50000 <= raw_code < 60000
+    return False
