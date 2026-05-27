@@ -4,12 +4,19 @@ Two layers:
   - :class:`TurnAccumulator` ingests an Event stream (from
     `claude.transcript.TranscriptReader`) and keeps a running snapshot of
     "what should the card look like right now".
-  - :func:`render_card` turns that snapshot into the dict format
-    `lark.card.build_status_card` produces.
+  - :func:`render_card` turns that snapshot into a Schema 2.0 (cardkit)
+    card dict via :func:`lark.card.build_status_card_v2`.
 
 A "turn" = one user prompt + everything Claude does until it stops. The
 accumulator is reset per turn so cards stay short. Long turns get **body
 truncation** (last 3000 chars wins) so we don't hit Lark's per-card limit.
+
+Step 3.1 of the cardkit migration moved this renderer from legacy
+``build_status_card`` to ``build_status_card_v2``; the v2 builder doesn't
+apply :func:`normalize_markdown_for_lark` internally, so the renderer now
+calls it explicitly on body / detail content. Both the explicit calls and
+``normalize_markdown_for_lark`` itself go away in Phase 4 once we trust
+v2's native heading / table rendering.
 """
 
 from __future__ import annotations
@@ -32,7 +39,8 @@ from pocket_cc.lark.card import (
     CardState,
     ExpandableSection,
     build_running_actions,
-    build_status_card,
+    build_status_card_v2,
+    normalize_markdown_for_lark,
 )
 
 if TYPE_CHECKING:
@@ -489,9 +497,9 @@ def render_card(
         # is otherwise static — only the Mode button label is dynamic.
         actions = list(build_running_actions(mode_label(snapshot.current_mode)))
 
-    return build_status_card(
+    return build_status_card_v2(
         title=title,
-        body=body,
+        body=normalize_markdown_for_lark(body),
         state=snapshot.state,
         detail=detail,
         actions=actions,
@@ -513,9 +521,9 @@ def _render_waiting_card(
     detail = _render_detail(snapshot) if show_thinking else None
     actions = _render_waiting_actions(waiting)
 
-    return build_status_card(
+    return build_status_card_v2(
         title=title,
-        body=body,
+        body=normalize_markdown_for_lark(body),
         state="waiting",
         detail=detail,
         actions=actions,
@@ -731,7 +739,10 @@ def _render_detail(snapshot: TurnSnapshot) -> ExpandableSection | None:
     thinking = snapshot.thinking
     if len(thinking) > _THINKING_MAX_CHARS:
         thinking = thinking[-_THINKING_MAX_CHARS:] + "\n\n…(截断)…"
-    return ExpandableSection(label="💭 思考链", content=thinking)
+    # Normalize here (not in the v2 builder) so Phase 4 only has to delete
+    # one call site to retire `normalize_markdown_for_lark` entirely. See
+    # module docstring.
+    return ExpandableSection(label="💭 思考链", content=normalize_markdown_for_lark(thinking))
 
 
 def _shorten(s: str, limit: int) -> str:

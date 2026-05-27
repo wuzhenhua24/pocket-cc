@@ -21,6 +21,19 @@ from pocket_cc.relay.card_renderer import (
 )
 
 
+def _action_buttons(card: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract the flat list of button dicts from a v2 card's column_set row.
+
+    Schema 2.0 has no ``action`` container — the action row is a
+    ``column_set`` with one ``column`` per button. Tests don't care about
+    the column wrapping; this flatten keeps assertions readable.
+    """
+    column_set = next(
+        e for e in card["body"]["elements"] if e.get("tag") == "column_set"
+    )
+    return [col["elements"][0] for col in column_set["columns"]]
+
+
 def test_accumulator_records_user_prompt_once() -> None:
     acc = TurnAccumulator()
     acc.ingest(UserText(uuid="u1", timestamp="t", text="first"))
@@ -175,7 +188,7 @@ def test_render_waiting_card_plan_source_renders_plan_above_options() -> None:
         fingerprint="fp",
     )
     card = render_card(acc.snapshot(state="waiting", waiting_for=waiting))
-    body = card["elements"][0]["content"]
+    body = card["body"]["elements"][0]["content"]
     # Plan markdown is in the body, above the option bullets.
     assert "重构方案" in body
     assert "拆 generation 出去" in body
@@ -209,7 +222,7 @@ def test_render_waiting_card_permission_source_does_not_inject_plan() -> None:
         options=(WaitingOption(label="Yes", response=TextResponse(text="1")),),
         fingerprint="fp-perm",
     )
-    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["body"]["elements"][0]["content"]
     # …but the permission card shouldn't surface it (it's not what this prompt
     # is about). Confirm with substring check.
     assert "stale plan from earlier" not in body
@@ -314,7 +327,7 @@ def test_render_waiting_card_ask_user_shows_question_header_and_options() -> Non
         ),
         fingerprint="fp",
     )
-    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["body"]["elements"][0]["content"]
     assert "日志来源" in body  # header
     assert "日志主要来自哪里" in body  # question text
     assert "多选" in body  # multi-select hint
@@ -344,7 +357,7 @@ def test_render_waiting_card_ask_user_surfaces_remaining_questions_hint() -> Non
         options=(WaitingOption(label="A", response=TextResponse(text="1")),),
         fingerprint="fp",
     )
-    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["body"]["elements"][0]["content"]
     assert "还问了 2 个问题" in body
     assert "运行形态" in body
     assert "分析目标" in body
@@ -369,7 +382,7 @@ def test_render_waiting_card_ask_user_single_question_no_remaining_hint() -> Non
         options=(WaitingOption(label="A", response=TextResponse(text="1")),),
         fingerprint="fp",
     )
-    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["body"]["elements"][0]["content"]
     assert "还问了" not in body
 
 
@@ -385,7 +398,7 @@ def test_render_waiting_card_ask_user_placeholder_when_accumulator_empty() -> No
         options=(),
         fingerprint="fp",
     )
-    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["body"]["elements"][0]["content"]
     # Doesn't crash; the placeholder question text appears.
     assert "Claude" in body
 
@@ -403,7 +416,7 @@ def test_render_waiting_card_plan_source_empty_plan_gracefully_omits_section() -
         options=(WaitingOption(label="Yes", response=TextResponse(text="1")),),
         fingerprint="fp",
     )
-    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["elements"][0]["content"]
+    body = render_card(acc.snapshot(state="waiting", waiting_for=waiting))["body"]["elements"][0]["content"]
     assert "📋 方案" not in body  # no empty heading
     assert "Yes" in body  # options still render
 
@@ -414,9 +427,9 @@ def test_render_card_running_state_has_blue_header_and_actions() -> None:
     card = render_card(acc.snapshot(state="running"))
     assert card["header"]["template"] == "blue"
     assert "fix the bug" in card["header"]["title"]["content"]
-    # running cards have an action row
-    tags = [e.get("tag") for e in card["elements"]]
-    assert "action" in tags
+    # running cards have an action row — v2 buttons live in a column_set.
+    tags = [e.get("tag") for e in card["body"]["elements"]]
+    assert "column_set" in tags
 
 
 def test_render_card_done_state_no_actions() -> None:
@@ -424,7 +437,7 @@ def test_render_card_done_state_no_actions() -> None:
     acc.user_prompt = "x"
     card = render_card(acc.snapshot(state="done"))
     assert card["header"]["template"] == "green"
-    assert "action" not in [e.get("tag") for e in card["elements"]]
+    assert "column_set" not in [e.get("tag") for e in card["body"]["elements"]]
 
 
 def test_render_card_running_keeps_tool_calls() -> None:
@@ -440,7 +453,7 @@ def test_render_card_running_keeps_tool_calls() -> None:
             tool_input={"file_path": "foo.py"},
         )
     )
-    body = render_card(acc.snapshot(state="running"))["elements"][0]["content"]
+    body = render_card(acc.snapshot(state="running"))["body"]["elements"][0]["content"]
     assert "工具调用" in body
     assert "foo.py" in body
 
@@ -458,7 +471,7 @@ def test_render_card_done_drops_tool_calls_when_text_present() -> None:
             tool_input={"file_path": "foo.py"},
         )
     )
-    body = render_card(acc.snapshot(state="done"))["elements"][0]["content"]
+    body = render_card(acc.snapshot(state="done"))["body"]["elements"][0]["content"]
     assert "here is the answer" in body
     assert "工具调用" not in body
     assert "foo.py" not in body
@@ -476,7 +489,7 @@ def test_render_card_done_keeps_tool_calls_as_fallback_when_no_text() -> None:
             tool_input={"command": "pytest"},
         )
     )
-    body = render_card(acc.snapshot(state="done"))["elements"][0]["content"]
+    body = render_card(acc.snapshot(state="done"))["body"]["elements"][0]["content"]
     # No assistant text → keep tool calls so the body isn't just a placeholder.
     assert "工具调用" in body
     assert "pytest" in body
@@ -494,7 +507,7 @@ def test_render_card_failed_drops_tool_calls() -> None:
             tool_input={"file_path": "foo.py"},
         )
     )
-    body = render_card(acc.snapshot(state="failed", error="boom"))["elements"][0]["content"]
+    body = render_card(acc.snapshot(state="failed", error="boom"))["body"]["elements"][0]["content"]
     assert "boom" in body
     assert "工具调用" not in body
 
@@ -505,31 +518,37 @@ def test_render_card_failed_includes_error_in_body() -> None:
     snap = acc.snapshot(state="failed", error="tmux not found")
     card = render_card(snap)
     assert card["header"]["template"] == "red"
-    body = card["elements"][0]["content"]
+    body = card["body"]["elements"][0]["content"]
     assert "tmux not found" in body
 
 
 def test_render_card_empty_running_shows_placeholder() -> None:
     acc = TurnAccumulator()
     card = render_card(acc.snapshot(state="running"))
-    body = card["elements"][0]["content"]
+    body = card["body"]["elements"][0]["content"]
     assert "运行中" in body
 
 
 def test_render_card_thinking_renders_as_detail_section_when_enabled() -> None:
+    from pocket_cc.lark.card import ELEMENT_ID_DETAIL_CONTENT, ELEMENT_ID_DETAIL_LABEL
+
     acc = TurnAccumulator()
     acc.user_prompt = "x"
     acc.ingest(AssistantThinking(uuid="a", timestamp="t", text="secret thoughts"))
     card = render_card(acc.snapshot(state="running"), show_thinking=True)
-    tags = [e.get("tag") for e in card["elements"]]
-    # body, hr, note, markdown (detail), hr, action — depending on state
-    assert "note" in tags
-    note_idx = tags.index("note")
-    note = card["elements"][note_idx]
-    assert "思考链" in note["elements"][0]["content"]
-    # the actual thinking content follows in the next markdown block
-    assert card["elements"][note_idx + 1]["tag"] == "markdown"
-    assert "secret thoughts" in card["elements"][note_idx + 1]["content"]
+    body_els = card["body"]["elements"]
+    # v2 detail section: body, detail_divider(hr), detail_label(markdown grey),
+    # detail_content(markdown), actions_divider(hr), column_set
+    label_idx = next(
+        i for i, e in enumerate(body_els) if e.get("element_id") == ELEMENT_ID_DETAIL_LABEL
+    )
+    label_el = body_els[label_idx]
+    assert label_el["tag"] == "markdown"
+    assert "思考链" in label_el["content"]
+    content_el = body_els[label_idx + 1]
+    assert content_el["element_id"] == ELEMENT_ID_DETAIL_CONTENT
+    assert content_el["tag"] == "markdown"
+    assert "secret thoughts" in content_el["content"]
 
 
 def test_render_card_thinking_hidden_by_default() -> None:
@@ -547,7 +566,7 @@ def test_render_card_body_truncated_when_huge() -> None:
     acc.user_prompt = "x"
     acc.ingest(AssistantText(uuid="a", timestamp="t", text="A" * 5000))
     card = render_card(acc.snapshot(state="running"))
-    body = card["elements"][0]["content"]
+    body = card["body"]["elements"][0]["content"]
     assert len(body) <= 3050  # ~_BODY_MAX_CHARS + truncation hint
     assert "截断" in body
 
@@ -591,7 +610,7 @@ def test_waiting_card_uses_orange_header_and_question_in_body() -> None:
     card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(question="Proceed?")))
     assert card["header"]["template"] == "orange"
     assert "❓" in card["header"]["title"]["content"]
-    body = card["elements"][0]["content"]
+    body = card["body"]["elements"][0]["content"]
     assert "Proceed?" in body
 
 
@@ -599,7 +618,7 @@ def test_waiting_card_lists_options_numbered_in_body() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
     card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(n=3)))
-    body = card["elements"][0]["content"]
+    body = card["body"]["elements"][0]["content"]
     assert "**1.** option-0" in body
     assert "**2.** option-1" in body
     assert "**3.** option-2" in body
@@ -620,7 +639,7 @@ def test_waiting_card_option_descriptions_appear() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
     card = render_card(acc.snapshot(state="waiting", waiting_for=waiting))
-    body = card["elements"][0]["content"]
+    body = card["body"]["elements"][0]["content"]
     assert "Outbound to feishu.cn OK" in body
 
 
@@ -628,14 +647,11 @@ def test_waiting_card_buttons_cap_options_at_4() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
     card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(n=10)))
-    action_row = card["elements"][-1]
-    assert action_row["tag"] == "action"
-    buttons = action_row["actions"]
+    buttons = _action_buttons(card)
     # 4 option buttons + cancel + esc
     assert len(buttons) == 6
     # First 4 are options
-    option_btns = buttons[:4]
-    for i, btn in enumerate(option_btns):
+    for i, btn in enumerate(buttons[:4]):
         assert btn["value"]["action"] == "waiting_response"
         assert btn["value"]["index"] == i
 
@@ -644,7 +660,7 @@ def test_waiting_card_first_option_is_primary() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
     card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(n=3)))
-    buttons = card["elements"][-1]["actions"]
+    buttons = _action_buttons(card)
     assert buttons[0]["type"] == "primary"
     assert buttons[1]["type"] == "default"
     assert buttons[2]["type"] == "default"
@@ -654,7 +670,7 @@ def test_waiting_card_always_has_cancel_and_esc() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
     card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(n=1)))
-    buttons = card["elements"][-1]["actions"]
+    buttons = _action_buttons(card)
     cancel = [b for b in buttons if b["value"].get("action") == "cancel"]
     # Esc button uses key_sequence (double-Escape to avoid Lark's
     # "操作太频繁" rate limit on consecutive single-Esc taps)
@@ -675,7 +691,7 @@ def test_waiting_card_truncates_long_button_label() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"
     card = render_card(acc.snapshot(state="waiting", waiting_for=waiting))
-    first_button = card["elements"][-1]["actions"][0]
+    first_button = _action_buttons(card)[0]
     assert len(first_button["text"]["content"]) <= 24
 
 
@@ -683,7 +699,7 @@ def test_waiting_card_no_options_shows_placeholder_body() -> None:
     waiting = WaitingFor(source="permission", question="")
     acc = TurnAccumulator()
     card = render_card(acc.snapshot(state="waiting", waiting_for=waiting))
-    body = card["elements"][0]["content"]
+    body = card["body"]["elements"][0]["content"]
     assert body == "_（Claude 在等你响应）_"
 
 
@@ -693,7 +709,7 @@ def test_waiting_card_keeps_assistant_text_context() -> None:
     acc.user_prompt = "x"
     acc.ingest(AssistantText(uuid="a", timestamp="t", text="I'm about to run rm"))
     card = render_card(acc.snapshot(state="waiting", waiting_for=_waiting(n=2)))
-    body = card["elements"][0]["content"]
+    body = card["body"]["elements"][0]["content"]
     assert "I'm about to run rm" in body
 
 
@@ -708,7 +724,7 @@ def test_waiting_option_can_carry_keys_response() -> None:
     acc.user_prompt = "x"
     card = render_card(acc.snapshot(state="waiting", waiting_for=waiting))
     # Just verify it renders and includes the option label
-    buttons = card["elements"][-1]["actions"]
+    buttons = _action_buttons(card)
     assert "Top" in buttons[0]["text"]["content"]
 
 
@@ -826,11 +842,11 @@ def test_render_card_with_continuation_marker_appends_footer() -> None:
         acc.snapshot(state="running"),
         ends_with_continuation_marker=True,
     )
-    body = card["elements"][0]["content"]
+    body = card["body"]["elements"][0]["content"]
     assert "续下条" in body
     assert "⏬" in body
     # Sealed continuation cards are historical → no action row.
-    assert "action" not in [e.get("tag") for e in card["elements"]]
+    assert "column_set" not in [e.get("tag") for e in card["body"]["elements"]]
 
 
 def test_render_card_no_continuation_marker_by_default() -> None:
@@ -838,7 +854,7 @@ def test_render_card_no_continuation_marker_by_default() -> None:
     acc.user_prompt = "x"
     acc.ingest(AssistantText(uuid="a", timestamp="t", text="some content"))
     card = render_card(acc.snapshot(state="running"))
-    body = card["elements"][0]["content"]
+    body = card["body"]["elements"][0]["content"]
     assert "续下条" not in body
 
 
@@ -861,7 +877,7 @@ def test_rotation_dataflow_end_to_end() -> None:
 
     # Step 2: render sealing card
     sealing = render_card(pre_snap, ends_with_continuation_marker=True)
-    assert "续下条" in sealing["elements"][0]["content"]
+    assert "续下条" in sealing["body"]["elements"][0]["content"]
 
     # Step 3: commit
     acc.commit()
@@ -999,14 +1015,14 @@ def test_chunked_rotation_no_truncation_message_when_split() -> None:
             text_end=text_end, tool_end=tool_end, thinking_end=thinking_end
         )
         sealed = render_card(seal_snap, ends_with_continuation_marker=True)
-        sealed_cards.append(sealed["elements"][0]["content"])
+        sealed_cards.append(sealed["body"]["elements"][0]["content"])
         acc.commit_to(text_end=text_end, tool_end=tool_end, thinking_end=thinking_end)
 
     # Final (open) card should fit without rotation.
     final_card = render_card(
         acc.snapshot(state="running", from_committed=True), is_continuation=True
     )
-    final_body = final_card["elements"][0]["content"]
+    final_body = final_card["body"]["elements"][0]["content"]
 
     # Must have produced at least one sealed card (otherwise rotation didn't fire)
     assert sealed_cards, "expected at least one sealed card from chunked rotation"
@@ -1091,14 +1107,14 @@ def test_single_huge_assistant_text_splits_across_cards_on_seal() -> None:
         te, toe, the = acc.find_fit_window(ROTATE_AT_CHARS)
         seal_snap = acc.snapshot_window(text_end=te, tool_end=toe, thinking_end=the)
         bodies.append(
-            render_card(seal_snap, ends_with_continuation_marker=True)["elements"][0]["content"]
+            render_card(seal_snap, ends_with_continuation_marker=True)["body"]["elements"][0]["content"]
         )
         acc.commit_to(text_end=te, tool_end=toe, thinking_end=the)
 
     # Final card: terminal state, rendered from the *uncommitted tail only*.
     final_snap = acc.snapshot(state="done", from_committed=True)
     final_card = render_card(final_snap, is_continuation=True)
-    final_body = final_card["elements"][0]["content"]
+    final_body = final_card["body"]["elements"][0]["content"]
 
     assert bodies, "a ~9k block must require at least one continuation card"
     for b in [*bodies, final_body]:
@@ -1131,9 +1147,7 @@ def test_seal_uses_from_committed_tail_not_full_history() -> None:
 
 def _mode_button_text(card: dict[str, Any]) -> str:
     """Pull the Mode button's text content out of a rendered running card."""
-    action_row = card["elements"][-1]
-    assert action_row["tag"] == "action"
-    buttons = action_row["actions"]
+    buttons = _action_buttons(card)
     mode_buttons = [
         b for b in buttons if b["value"].get("action") == "key" and b["value"].get("key") == "BTab"
     ]
@@ -1211,5 +1225,5 @@ def test_done_card_has_no_action_row() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "done thing"
     card = render_card(acc.snapshot(state="done"))
-    tags = [e.get("tag") for e in card["elements"]]
-    assert "action" not in tags
+    tags = [e.get("tag") for e in card["body"]["elements"]]
+    assert "column_set" not in tags
