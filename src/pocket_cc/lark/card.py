@@ -172,12 +172,22 @@ def build_running_actions(mode_suffix: str = "") -> tuple[CardButton, ...]:
         # Esc to fully abort a prompt + clear the input box; firing it from a
         # single Lark button click avoids the user having to double-tap (which
         # Lark rate-limits with "操作太频繁了" after the second click).
+        #
+        # ``seals_turn`` tells :meth:`InputRouter._handle_key_sequence` to
+        # also call :meth:`TurnController.cancel_active_turn`. Without this
+        # the controller stays "running" even though Escape interrupted
+        # Claude — same root cause as the ⏹ 中断 button needing its own
+        # self-seal (interrupting fires no Stop hook). Skipping the seal
+        # makes the next user message bounce with "Claude 还在处理上一条
+        # 消息", and pressing ⏹ 中断 afterwards lands Esc on an idle
+        # input which Claude TUI interprets as "open Rewind dialog".
         CardButton(
             text="⎋ Esc",
             value={
                 "action": "key_sequence",
                 "keys": ["Escape", "Escape"],
                 "delay_ms": 100,
+                "seals_turn": True,
             },
         ),
         CardButton(text=mode_text, value={"action": "key", "key": "BTab"}),

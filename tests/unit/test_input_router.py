@@ -1368,3 +1368,81 @@ def test_card_action_key_sequence_with_non_list_keys_is_noop(tmp_path: Path) -> 
 
     new_calls = tmux.calls[pre:]
     assert all(c.method != "send_key" for c in new_calls)
+
+
+def test_card_action_key_sequence_seals_turn_when_flag_set(tmp_path: Path) -> None:
+    """⎋ Esc button (key_sequence with ``seals_turn=True``) must seal the
+    active turn in the controller — interrupting Claude fires no Stop
+    hook, so without an explicit seal the next user message would bounce
+    with "Claude 还在处理上一条消息" and a follow-up ⏹ 中断 would land
+    Escape on an idle input (Rewind dialog).
+
+    Regression guard for the bug where ⎋ Esc only sent keys to tmux but
+    forgot to call cancel_active_turn — fixed by the ``seals_turn`` flag.
+    """
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+
+    binding = registry.get("oc_chat1")
+    assert binding is not None and binding.current_turn is not None
+
+    router.handle_card_action(
+        CardAction(
+            message_id=card_id,
+            chat_id="oc_chat1",
+            sender_open_id="ou_user1",
+            token="tok_esc",
+            tag="button",
+            value={
+                "action": "key_sequence",
+                "keys": ["Escape", "Escape"],
+                "delay_ms": 0,
+                "seals_turn": True,
+            },
+        )
+    )
+
+    # Controller-side: turn sealed.
+    assert binding.current_turn is None
+    # tmux-side: Escapes still sent (keys behavior is orthogonal to the seal).
+    keys = [c.kwargs["key"] for c in tmux.calls if c.method == "send_key"]
+    assert keys[-2:] == ["Escape", "Escape"]
+
+
+def test_card_action_key_sequence_without_seals_flag_leaves_turn_alone(tmp_path: Path) -> None:
+    """Default (no ``seals_turn``) preserves the original "just send keys"
+    behavior — used by waiting-prompt option buttons that send a single
+    keystroke without ending the turn (e.g. arrow keys for ask-user
+    questions)."""
+    cfg = _make_config(workspace=tmp_path)
+    tmux = FakeTmuxManager()
+    lark = FakeLarkClient()
+    registry = Registry()
+    router = _make_router(tmux=tmux, lark=lark, registry=registry, config=cfg)
+    router.handle_message(_message())
+    card_id = lark.last_sent().message_id
+    binding = registry.get("oc_chat1")
+    assert binding is not None and binding.current_turn is not None
+
+    router.handle_card_action(
+        CardAction(
+            message_id=card_id,
+            chat_id="oc_chat1",
+            sender_open_id="ou_user1",
+            token="tok_nav",
+            tag="button",
+            value={
+                "action": "key_sequence",
+                "keys": ["Up", "Enter"],
+                "delay_ms": 0,
+            },
+        )
+    )
+
+    # No ``seals_turn`` flag → turn stays active.
+    assert binding.current_turn is not None

@@ -638,7 +638,23 @@ class InputRouter:
         (Claude TUI requires double-Esc to fully clear the input box, and
         sending both from one Lark click avoids Lark's "操作太频繁" rate
         limit on rapid card action callbacks).
+
+        ``value["seals_turn"]`` opts a button into the same self-seal path
+        the ⏹ 中断 button takes: interrupting Claude (C-c **or** Escape)
+        fires no Stop hook (verified empirically — see the
+        ``project_interrupt_no_stop_hook`` memory), so a button that
+        interrupts has to tell the controller to seal the turn itself.
+        The ⎋ Esc button sets this flag; without it the controller would
+        stay "running" forever, the next user message would bounce as
+        "Claude 还在处理上一条消息", and a follow-up ⏹ 中断 would land
+        its Escape on an idle input, opening Claude TUI's Rewind dialog.
         """
+        if value.get("seals_turn"):
+            # Seal first, *then* send the keys — same ordering as
+            # ``_handle_cancel`` for the same reason: the keys can take
+            # ~200ms to land and we don't want a concurrent transcript
+            # tick to see "still running" in between.
+            self._controller_for(binding).cancel_active_turn()
         raw_keys = value.get("keys")
         if not isinstance(raw_keys, list):
             logger.info("key_sequence with non-list keys", extra={"value": value})

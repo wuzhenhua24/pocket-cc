@@ -696,6 +696,8 @@ def _render_waiting_actions(waiting: WaitingFor) -> list[CardButton]:
     actions.append(CardButton(text="⏹ 中断", value={"action": "cancel"}, style="danger"))
     # Double-Escape — matches DEFAULT_RUNNING_ACTIONS; one tap fully clears
     # Claude's prompt state without hitting Lark's "操作太频繁" rate limit.
+    # ``seals_turn`` keeps the controller in sync (see the same flag on the
+    # running-card Esc button for the why).
     actions.append(
         CardButton(
             text="⎋ Esc",
@@ -703,6 +705,7 @@ def _render_waiting_actions(waiting: WaitingFor) -> list[CardButton]:
                 "action": "key_sequence",
                 "keys": ["Escape", "Escape"],
                 "delay_ms": 100,
+                "seals_turn": True,
             },
         )
     )
