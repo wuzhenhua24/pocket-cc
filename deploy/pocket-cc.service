@@ -54,6 +54,13 @@ ExecStart={{UV_BIN}} run pocket-cc run
 KillSignal=SIGINT
 TimeoutStopSec=15
 
+# Only kill the main process on stop. Default `control-group` would also
+# reap the tmux server (it lives in this unit's cgroup because pocket-cc
+# was the first thing to spawn it), wiping every chat window. With
+# `process`, the daemonized tmux server survives a restart and
+# `ensure_session()` re-attaches to it on the next boot.
+KillMode=process
+
 # Restart on crash, back off so we don't hammer Lark if creds are wrong.
 Restart=on-failure
 RestartSec=10s
