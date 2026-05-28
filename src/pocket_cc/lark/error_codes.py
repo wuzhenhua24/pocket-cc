@@ -12,10 +12,10 @@ high-level channel module (newer, less stable than the core client).
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 
-class LarkErrorKind(str, Enum):
+class LarkErrorKind(StrEnum):
     """Coarse taxonomy of Lark IM API failures.
 
     Callers branch on these to decide retry / surface / fallback. The

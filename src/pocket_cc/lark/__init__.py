@@ -1,12 +1,13 @@
-"""Lark IM client + WS event loop + card templates."""
+"""Lark IM client + WS event loop + card templates (Schema 2.0 / cardkit)."""
 
 from pocket_cc.lark.card import (
     DEFAULT_RUNNING_ACTIONS,
     CardButton,
     CardState,
     ExpandableSection,
-    build_status_card,
-    build_text_card,
+    build_restart_notice_card_v2,
+    build_status_card_v2,
+    build_text_card_v2,
     normalize_markdown_for_lark,
 )
 from pocket_cc.lark.client import (
@@ -39,7 +40,8 @@ __all__ = [
     "LarkEventLoop",
     "LarkOapiClient",
     "MessageHandler",
-    "build_status_card",
-    "build_text_card",
+    "build_restart_notice_card_v2",
+    "build_status_card_v2",
+    "build_text_card_v2",
     "normalize_markdown_for_lark",
 ]

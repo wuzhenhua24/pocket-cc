@@ -1091,7 +1091,10 @@ def test_card_action_waiting_response_text_dispatches_send_text(tmp_path: Path) 
     router.handle_message(_message())
     card_id = lark.last_sent().message_id
     _set_waiting_on_active_turn(registry, "oc_chat1")
-    patches_before = len(lark.patches)
+    # Snapshot both cardkit write counters: the WS-response optimization
+    # must not trigger any follow-up cardkit traffic for the same rerender.
+    updates_before = len(lark.card_entity_updates)
+    streams_before = len(lark.element_content_updates)
 
     result = router.handle_card_action(
         CardAction(
@@ -1117,9 +1120,11 @@ def test_card_action_waiting_response_text_dispatches_send_text(tmp_path: Path) 
     # instantly when the user taps the option button.
     assert isinstance(result, dict)
     assert result["header"]["template"] == "blue"  # running state
-    # And we did NOT push a separate PATCH for that same rerender — the WS
-    # response carries it. (Future transcript ticks still PATCH normally.)
-    assert len(lark.patches) == patches_before
+    # And we did NOT push a separate cardkit update for that same rerender
+    # — the WS response carries it. (Future transcript ticks still PUT
+    # normally through CardStream.)
+    assert len(lark.card_entity_updates) == updates_before
+    assert len(lark.element_content_updates) == streams_before
 
 
 def test_card_action_waiting_response_keys_dispatches_send_key_sequence(

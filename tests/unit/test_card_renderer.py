@@ -551,6 +551,38 @@ def test_render_card_thinking_renders_as_detail_section_when_enabled() -> None:
     assert "secret thoughts" in content_el["content"]
 
 
+def test_render_card_body_is_normalized_before_v2_builder() -> None:
+    """v2's ``markdown`` element still drops GFM pipe-tables and (pending
+    verification) renders raw ``##`` literally. The renderer is responsible
+    for calling normalize_markdown_for_lark on body content so the user
+    sees ``**Heading**`` (and bullet-listed tables) instead of raw markup.
+    Regression guard for the legacy → cardkit migration."""
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="## Result\nAll good."))
+    card = render_card(acc.snapshot(state="running"))
+    body_content = card["body"]["elements"][0]["content"]
+    assert "**Result**" in body_content
+    assert "## " not in body_content
+
+
+def test_render_card_detail_is_normalized_before_v2_builder() -> None:
+    """Same contract as body: detail (thinking) content must be normalized
+    before the v2 builder embeds it. The v2 builder is intentionally a
+    no-op on its content fields (see test_v2_does_not_pre_normalize_…)."""
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantThinking(uuid="a", timestamp="t", text="## Inner\nthought"))
+    card = render_card(acc.snapshot(state="running"), show_thinking=True)
+    from pocket_cc.lark.card import ELEMENT_ID_DETAIL_CONTENT
+
+    content_el = next(
+        e for e in card["body"]["elements"] if e.get("element_id") == ELEMENT_ID_DETAIL_CONTENT
+    )
+    assert "**Inner**" in content_el["content"]
+    assert "## " not in content_el["content"]
+
+
 def test_render_card_thinking_hidden_by_default() -> None:
     acc = TurnAccumulator()
     acc.user_prompt = "x"

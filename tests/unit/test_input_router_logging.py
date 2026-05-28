@@ -22,7 +22,6 @@ from pocket_cc.relay.input import InputRouter
 from pocket_cc.relay.turn_controller import TurnController
 from pocket_cc.tmux import WindowInfo
 
-
 # ----------------------------------------------------------------- minimal fixtures
 # Re-implemented locally (instead of imported from test_input_router) so a
 # refactor of that file's internal helpers doesn't drag this suite along.
@@ -43,11 +42,11 @@ class _NoopTmux:
     """Tmux stub — not exercised on the unauth path (no window creation)."""
 
     def ensure_session(self) -> None: ...
-    def new_window(self, *, name: str, cwd: str | None = None, command: str | None = None) -> WindowInfo:  # noqa: ARG002
+    def new_window(self, *, name: str, cwd: str | None = None, command: str | None = None) -> WindowInfo:
         return WindowInfo(session="s", window_id="@1", name=name, cwd=cwd or "/", pane_id="%1")
     def send_text(self, window_id: str, text: str, *, with_enter: bool = True) -> None: ...
     def send_key(self, window_id: str, key: str) -> None: ...
-    def capture_pane(self, window_id: str, *, lines: int | None = None, include_history: bool = False) -> str:  # noqa: ARG002
+    def capture_pane(self, window_id: str, *, lines: int | None = None, include_history: bool = False) -> str:
         return ""
 
 

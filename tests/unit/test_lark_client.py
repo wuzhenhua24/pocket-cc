@@ -27,16 +27,6 @@ def test_send_text_records_call_and_returns_id() -> None:
     assert last.message_id == mid
 
 
-def test_send_card_records_card_dict() -> None:
-    fake = FakeLarkClient()
-    card = {"header": {"template": "blue"}, "elements": []}
-    mid = fake.send_card("oc_chat1", card)
-    last = fake.last_sent()
-    assert last.kind == "card"
-    assert last.card == card
-    assert last.message_id == mid
-
-
 def test_message_ids_are_unique_and_monotonic() -> None:
     fake = FakeLarkClient()
     ids = [fake.send_text("c", f"m{i}") for i in range(5)]
@@ -45,30 +35,10 @@ def test_message_ids_are_unique_and_monotonic() -> None:
     assert ids == sorted(ids)
 
 
-def test_patch_card_records_call() -> None:
-    fake = FakeLarkClient()
-    mid = fake.send_card("oc_chat1", {"x": 1})
-    fake.patch_card(mid, {"x": 2})
-    fake.patch_card(mid, {"x": 3})
-    assert len(fake.patches) == 2
-    assert fake.last_patch().card == {"x": 3}
-    assert fake.last_patch().message_id == mid
-
-
-def test_patch_card_is_defensive_copy() -> None:
-    fake = FakeLarkClient()
-    card = {"x": 1}
-    fake.patch_card("mid", card)
-    card["x"] = 99
-    assert fake.patches[0].card == {"x": 1}
-
-
-def test_last_helpers_raise_when_empty() -> None:
+def test_last_sent_helper_raises_when_empty() -> None:
     fake = FakeLarkClient()
     with pytest.raises(AssertionError):
         fake.last_sent()
-    with pytest.raises(AssertionError):
-        fake.last_patch()
 
 
 def test_lark_api_error_message_includes_log_id_when_present() -> None:
@@ -121,7 +91,6 @@ def test_send_card_id_records_reference_and_returns_message_id() -> None:
     assert last.kind == "card_id"
     assert last.chat_id == "oc_chat1"
     assert last.card_id == card_id
-    assert last.card == {}  # no inline card body on card_id references
 
 
 def test_send_card_id_id_namespace_independent_from_card_id_namespace() -> None:

@@ -133,7 +133,7 @@ def test_restore_noop_when_state_file_missing(tmp_path: Path) -> None:
     restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     assert len(registry) == 0
-    assert lark.patches == []
+    assert lark.card_entity_updates == []
     assert not (tmp_path / "state.json").exists()
 
 
@@ -158,7 +158,7 @@ def test_restore_attaches_binding_when_window_alive(tmp_path: Path) -> None:
     assert binding.cwd == Path("/tmp/wsp")
     assert binding.current_mode == "acceptEdits"
     # No active_card → no orphan patch.
-    assert lark.patches == []
+    assert lark.card_entity_updates == []
 
 
 def test_restore_drops_binding_when_window_gone(tmp_path: Path) -> None:
@@ -221,8 +221,6 @@ def test_restore_patches_orphan_card_and_clears_pointer(tmp_path: Path) -> None:
     assert update.card_id == "card_orphan"
     assert update.card["header"]["template"] == "grey"
     assert "已重启" in update.card["header"]["title"]["content"]
-    # Legacy IM PATCH should not be touched.
-    assert lark.patches == []
 
     # State file was rewritten with active_card cleared (current_turn is None
     # on the restored binding, so StateStore's snapshot drops the pointer).
@@ -318,7 +316,7 @@ def test_restore_skips_on_corrupt_state_file(tmp_path: Path) -> None:
     restore_bindings(config=_config(), tmux=tmux, lark=lark, registry=registry, state_store=store)  # type: ignore[arg-type]
 
     assert len(registry) == 0
-    assert lark.patches == []
+    assert lark.card_entity_updates == []
 
 
 # =========================================================== reconciliation

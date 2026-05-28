@@ -9,16 +9,11 @@ The Protocol exists so handlers depend on a narrow type, not on `lark_oapi`
 directly. Tests pass `FakeLarkClient` for assertions without network I/O.
 
 API surface:
-  Legacy IM (in use)
-  - send_text(chat_id, text)        — POST /im/v1/messages msg_type=text
-  - send_card(chat_id, card)        — POST /im/v1/messages msg_type=interactive
-  - patch_card(message_id, card)    — PATCH /im/v1/messages/:id
-
-  Cardkit / streaming (Phase 1 infrastructure — no callers yet)
-  - create_card_entity(card)               — POST /cardkit/v1/cards          → card_id
-  - send_card_id(chat_id, card_id)         — POST /im/v1/messages referencing card_id
-  - update_card_entity(card_id, card, …)   — PUT  /cardkit/v1/cards/:card_id
-  - stream_element_content(card_id, …)     — PUT  /cardkit/v1/cards/:id/elements/:eid/content
+  - send_text(chat_id, text)             — POST /im/v1/messages msg_type=text
+  - create_card_entity(card)             — POST /cardkit/v1/cards      → card_id
+  - send_card_id(chat_id, card_id)       — POST /im/v1/messages referencing card_id
+  - update_card_entity(card_id, card, …) — PUT  /cardkit/v1/cards/:card_id
+  - stream_element_content(card_id, …)   — PUT  /cardkit/v1/cards/:id/elements/:eid/content
 
 All API errors raise :class:`LarkApiError` carrying the Lark `code` / `msg` /
 `log_id` triple — log_id is what you give to Lark support to look up failures.
@@ -45,8 +40,6 @@ from lark_oapi.api.cardkit.v1 import (
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
-    PatchMessageRequest,
-    PatchMessageRequestBody,
 )
 
 from pocket_cc.lark.error_codes import LarkErrorKind, classify, is_retryable
@@ -86,17 +79,13 @@ class LarkClient(Protocol):
     """The IM + cardkit operations pocket-cc handlers need.
 
     Implementations: :class:`LarkOapiClient` (prod) + :class:`FakeLarkClient`
-    (tests). The legacy IM methods (send_card / patch_card) and the cardkit
-    methods (create_card_entity / send_card_id / update_card_entity /
-    stream_element_content) coexist during the migration — Phase 1 adds the
-    cardkit surface as infrastructure; Phase 3 swaps call sites to use it.
+    (tests). All interactive cards go through cardkit's Schema 2.0 path
+    (:meth:`create_card_entity` + :meth:`send_card_id` + streaming /
+    whole-card updates); text messages still use the IM
+    :meth:`send_text` endpoint.
     """
 
     def send_text(self, chat_id: str, text: str) -> str: ...
-
-    def send_card(self, chat_id: str, card: dict[str, Any]) -> str: ...
-
-    def patch_card(self, message_id: str, card: dict[str, Any]) -> None: ...
 
     # ----- cardkit / streaming -----
 
@@ -105,8 +94,7 @@ class LarkClient(Protocol):
 
         The returned id is what subsequent element-level / card-level updates
         target, and what :meth:`send_card_id` references when posting an IM
-        message. The card body uses the cardkit Schema 2.0 dict shape (not the
-        legacy ``config/header/elements`` shape consumed by :meth:`send_card`).
+        message. The card body uses the cardkit Schema 2.0 dict shape.
         """
 
     def send_card_id(self, chat_id: str, card_id: str) -> str:
@@ -209,30 +197,6 @@ class LarkOapiClient:
             .build()
         )
         return self._create_message(chat_id, body)
-
-    def send_card(self, chat_id: str, card: dict[str, Any]) -> str:
-        body = (
-            CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
-            .msg_type("interactive")
-            .content(json.dumps(card, ensure_ascii=False))
-            .build()
-        )
-        return self._create_message(chat_id, body)
-
-    def patch_card(self, message_id: str, card: dict[str, Any]) -> None:
-        req = (
-            PatchMessageRequest.builder()
-            .message_id(message_id)
-            .request_body(
-                PatchMessageRequestBody.builder()
-                .content(json.dumps(card, ensure_ascii=False))
-                .build()
-            )
-            .build()
-        )
-        resp = self._rest.im.v1.message.patch(req)
-        self._check(resp)
 
     # ----------------------------------------------------- cardkit / streaming
 
@@ -344,18 +308,11 @@ class LarkOapiClient:
 
 @dataclass
 class _FakeSentMessage:
-    kind: str  # "text" | "card" | "card_id"
+    kind: str  # "text" | "card_id"
     chat_id: str
     message_id: str
     text: str = ""
-    card: dict[str, Any] = field(default_factory=dict)
     card_id: str = ""  # set when kind == "card_id"
-
-
-@dataclass
-class _FakePatch:
-    message_id: str
-    card: dict[str, Any]
 
 
 @dataclass
@@ -394,7 +351,6 @@ class FakeLarkClient:
     """
 
     sent: list[_FakeSentMessage] = field(default_factory=list)
-    patches: list[_FakePatch] = field(default_factory=list)
     card_entities: list[_FakeCardEntity] = field(default_factory=list)
     card_entity_updates: list[_FakeCardEntityUpdate] = field(default_factory=list)
     element_content_updates: list[_FakeElementContentUpdate] = field(default_factory=list)
@@ -409,7 +365,7 @@ class FakeLarkClient:
         self._card_counter += 1
         return f"card_fake{self._card_counter:06d}"
 
-    # --- Protocol surface (legacy IM) ---
+    # --- Protocol surface ---
 
     def send_text(self, chat_id: str, text: str) -> str:
         message_id = self._alloc_id()
@@ -417,18 +373,6 @@ class FakeLarkClient:
             _FakeSentMessage(kind="text", chat_id=chat_id, message_id=message_id, text=text)
         )
         return message_id
-
-    def send_card(self, chat_id: str, card: dict[str, Any]) -> str:
-        message_id = self._alloc_id()
-        self.sent.append(
-            _FakeSentMessage(kind="card", chat_id=chat_id, message_id=message_id, card=dict(card))
-        )
-        return message_id
-
-    def patch_card(self, message_id: str, card: dict[str, Any]) -> None:
-        self.patches.append(_FakePatch(message_id=message_id, card=dict(card)))
-
-    # --- Protocol surface (cardkit) ---
 
     def create_card_entity(self, card: dict[str, Any]) -> str:
         card_id = self._alloc_card_id()
@@ -483,11 +427,6 @@ class FakeLarkClient:
         if not self.sent:
             raise AssertionError("no messages sent")
         return self.sent[-1]
-
-    def last_patch(self) -> _FakePatch:
-        if not self.patches:
-            raise AssertionError("no patches recorded")
-        return self.patches[-1]
 
     def last_card_entity(self) -> _FakeCardEntity:
         if not self.card_entities:

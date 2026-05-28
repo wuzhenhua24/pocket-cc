@@ -446,4 +446,4 @@ def test_open_card_stream_returns_non_started_stream() -> None:
     spin up the worker thread (matches the legacy CardStream contract)."""
     fake = FakeLarkClient()
     _, _, stream = open_card_stream(fake, "c", _v2_card("x"))
-    assert stream._started is False  # noqa: SLF001 (intent: assert factory contract)
+    assert stream._started is False

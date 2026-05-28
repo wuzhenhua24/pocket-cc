@@ -1,26 +1,26 @@
-"""Lark interactive-card templates.
+"""Lark interactive-card templates (Schema 2.0 / cardkit).
 
 Pure functions that build card dicts. No I/O — :class:`LarkClient` is what
 actually delivers them.
 
-Two parallel families live here during the cardkit migration:
+* :func:`build_status_card_v2` / :func:`build_text_card_v2` /
+  :func:`build_restart_notice_card_v2` produce the
+  ``schema/config/header/body`` shape consumed by
+  ``POST /cardkit/v1/cards`` and the streaming PUT endpoints. Stable
+  ``element_id`` constants (:data:`ELEMENT_ID_BODY`,
+  :data:`ELEMENT_ID_DETAIL_*`, :data:`ELEMENT_ID_ACTIONS`) let the
+  streaming layer target the body markdown by name without parsing the
+  JSON back.
 
-* **Legacy** (``build_status_card`` / ``build_text_card`` /
-  ``build_restart_notice_card``) — produces the ``config/header/elements``
-  shape consumed by IM's ``/im/v1/messages`` (``msg_type=interactive``) and
-  ``PATCH /im/v1/messages/:id``. In active use; will be removed in Phase 4.
+* :func:`normalize_markdown_for_lark` rewrites Claude/GFM markdown into
+  the subset Lark's v2 ``markdown`` element actually renders — same idea
+  as before the cardkit migration. v2 supports headings natively in
+  theory, but GFM pipe-tables are still silently dropped by Lark's
+  renderer, so we keep this normalization step (downgrades tables to
+  bullet lists / fixed-width code blocks). Callers in
+  :mod:`pocket_cc.relay.card_renderer` apply it to body / detail content
+  before handing them to the v2 builders.
 
-* **Cardkit Schema 2.0** (``build_status_card_v2`` / ``build_text_card_v2`` /
-  ``build_restart_notice_card_v2``) — produces the ``schema/config/header/body``
-  shape consumed by ``POST /cardkit/v1/cards`` and the streaming PUT
-  endpoints. Phase 2 ships these unused; Phase 3 switches the renderer
-  over.
-
-The v2 family attaches stable :data:`ELEMENT_ID_BODY` / :data:`ELEMENT_ID_DETAIL`
-/ :data:`ELEMENT_ID_ACTIONS` ids on each element it emits so the streaming
-layer can target the body markdown by name without parsing the JSON back.
-
-Legacy schema docs: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/im-v1/message-card/overview
 Cardkit Schema 2.0 docs: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/feishu-cards/card-overview
 """
 
@@ -67,98 +67,25 @@ class ExpandableSection:
     content: str  # markdown body
 
 
-def build_status_card(
-    *,
-    title: str,
-    body: str,
-    state: CardState = "running",
-    actions: list[CardButton] | None = None,
-    detail: ExpandableSection | None = None,
-) -> dict[str, Any]:
-    """Build a status-style card with a colored header, body and optional buttons.
-
-    Args:
-        title: Header text (emoji prefix added automatically based on state).
-        body: Main content. Markdown supported (bold, lists, code).
-        state: Visual state — controls header color and emoji prefix.
-        actions: Optional row of buttons (max 4 fits comfortably on mobile).
-        detail: Optional expandable section for verbose information that
-            shouldn't be in the always-visible body.
-
-    Returns:
-        A dict ready to be JSON-serialized into a Lark interactive message's
-        ``content`` field.
-    """
-    color, emoji = _STATE_STYLE[state]
-    elements: list[dict[str, Any]] = [
-        {"tag": "markdown", "content": normalize_markdown_for_lark(body)},
-    ]
-
-    if detail is not None:
-        elements.append({"tag": "hr"})
-        elements.append(
-            {
-                "tag": "note",
-                "elements": [{"tag": "plain_text", "content": f"▸ {detail.label}"}],
-            }
-        )
-        elements.append({"tag": "markdown", "content": normalize_markdown_for_lark(detail.content)})
-
-    if actions:
-        elements.append({"tag": "hr"})
-        elements.append(
-            {
-                "tag": "action",
-                "actions": [_render_button(b) for b in actions],
-            }
-        )
-
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "template": color,
-            "title": {"tag": "plain_text", "content": f"{emoji} {title}"},
-        },
-        "elements": elements,
-    }
-
-
-def build_text_card(*, body: str) -> dict[str, Any]:
-    """Build a minimal card with just markdown body — useful for one-off notices.
-
-    Headerless, action-less. Use for things like 'session ended' confirmations.
-    """
-    return {
-        "config": {"wide_screen_mode": True},
-        "elements": [{"tag": "markdown", "content": normalize_markdown_for_lark(body)}],
-    }
-
-
-def build_restart_notice_card() -> dict[str, Any]:
-    """Card patched onto an orphaned "running" card after a pocket-cc restart.
-
-    The previous process died holding this card stream, so Lark would have
-    left it stuck on ⏳ forever. Flipping it to ⏹ cancelled with a short
-    notice closes the loop visually and makes it obvious that the next user
-    message starts a fresh turn (rather than continuing the dead one).
-    """
-    return build_status_card(
-        title="pocket-cc 已重启",
-        body="⚠️ 上一轮的状态未能保留——可发送新消息重新开始。",
-        state="cancelled",
-    )
-
-
 # ----------------------------------------------------------- markdown normalize
-# Lark's interactive-card `markdown` tag renders only a subset of GFM:
+# Lark's Schema 2.0 ``markdown`` element renders most of GFM, but **GFM
+# pipe-tables are silently dropped** (confirmed on a real device after the
+# cardkit migration — same downgrade behavior as legacy). Heading support
+# in v2 has not been verified yet; we keep converting ``## heading`` →
+# ``**heading**`` conservatively so the migration didn't change the visual.
+# A future Phase 4-B can drop the heading branch after a real-device
+# A/B test.
+#
+# What v2 markdown supports natively (no normalization needed):
 #   ✓ **bold** / *italic* / `code` / ```code block``` / [link](…) / - lists /
 #     ~~strikethrough~~ / line breaks / <font color="…">
-#   ✗ # / ## / ### headings (rendered as literal text)
-#   ✗ GFM tables `| a | b |` (rendered as literal text)
+# What we still rewrite here:
+#   • # / ## / ### headings → **bold** (conservative, pending verification)
+#   • GFM tables `| a | b |` → bullet list or fixed-width code block
 # Claude Code's responses use both freely (especially when summarizing a
 # project — headings + tables). Without normalization the user sees the
-# raw markdown source, which is what triggered this fix. Anything the user
-# really needs in original form is still available via the [📜 内容] button.
+# raw markdown source. Anything the user really needs in original form is
+# still available via the [📜 内容] button.
 
 _HEADING_RE: Final[re.Pattern[str]] = re.compile(r"^(\s*)#{1,6}\s+(.+?)\s*$", re.MULTILINE)
 _TABLE_ROW_RE: Final[re.Pattern[str]] = re.compile(r"^\s*\|.*\|\s*$")
@@ -322,9 +249,7 @@ def _should_use_code_block_table(header: list[str], rows: list[list[str]]) -> bo
     all_cells = [*header, *(c for r in rows for c in r)]
     if any(_INLINE_MD_IN_CELL_RE.search(c) for c in all_cells):
         return False
-    if any(_display_width(c) > _CODE_BLOCK_CELL_WIDTH_LIMIT for c in all_cells):
-        return False
-    return True
+    return not any(_display_width(c) > _CODE_BLOCK_CELL_WIDTH_LIMIT for c in all_cells)
 
 
 def _render_as_code_block_table(header: list[str], rows: list[list[str]]) -> str:
@@ -348,26 +273,19 @@ def _render_as_code_block_table(header: list[str], rows: list[list[str]]) -> str
         return cell + " " * (width - _display_width(cell))
 
     sep_cells = ["-" * w for w in col_widths]
-    body_lines = [" | ".join(_pad(h, w) for h, w in zip(header, col_widths))]
+    body_lines = [" | ".join(_pad(h, w) for h, w in zip(header, col_widths, strict=True))]
     body_lines.append(" | ".join(sep_cells))
     for row in rows:
         padded = list(row) + [""] * max(0, n_cols - len(row))
         body_lines.append(
-            " | ".join(_pad(c, w) for c, w in zip(padded[:n_cols], col_widths))
+            " | ".join(
+                _pad(c, w) for c, w in zip(padded[:n_cols], col_widths, strict=True)
+            )
         )
     return "```\n" + "\n".join(body_lines) + "\n```"
 
 
 # -------------------------------------------------------------------- helpers
-
-
-def _render_button(button: CardButton) -> dict[str, Any]:
-    return {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": button.text},
-        "type": button.style,
-        "value": dict(button.value),  # defensive copy — Lark mutates this server-side
-    }
 
 
 def build_running_actions(mode_suffix: str = "") -> tuple[CardButton, ...]:
