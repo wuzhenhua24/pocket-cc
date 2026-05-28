@@ -11,12 +11,14 @@ A "turn" = one user prompt + everything Claude does until it stops. The
 accumulator is reset per turn so cards stay short. Long turns get **body
 truncation** (last 3000 chars wins) so we don't hit Lark's per-card limit.
 
-Step 3.1 of the cardkit migration moved this renderer from legacy
-``build_status_card`` to ``build_status_card_v2``; the v2 builder doesn't
-apply :func:`normalize_markdown_for_lark` internally, so the renderer now
-calls it explicitly on body / detail content. Both the explicit calls and
-``normalize_markdown_for_lark`` itself go away in Phase 4 once we trust
-v2's native heading / table rendering.
+Phase 4-C of the cardkit migration: body markdown goes through
+:func:`markdown_body_to_v2_elements`, which splits GFM pipe-tables out
+into v2 native ``{tag: "table"}`` elements and applies heading conversion
+to the surrounding markdown chunks. The renderer used to feed
+``build_status_card_v2`` a pre-normalized string; now it feeds it a list
+of pre-built body elements. Detail (thinking) content still goes through
+:func:`normalize_markdown_for_lark` because it stays inside a single
+markdown element (no table extraction).
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from pocket_cc.lark.card import (
     ExpandableSection,
     build_running_actions,
     build_status_card_v2,
+    markdown_body_to_v2_elements,
     normalize_markdown_for_lark,
 )
 
@@ -499,7 +502,7 @@ def render_card(
 
     return build_status_card_v2(
         title=title,
-        body=normalize_markdown_for_lark(body),
+        body_elements=markdown_body_to_v2_elements(body),
         state=snapshot.state,
         detail=detail,
         actions=actions,
@@ -523,7 +526,7 @@ def _render_waiting_card(
 
     return build_status_card_v2(
         title=title,
-        body=normalize_markdown_for_lark(body),
+        body_elements=markdown_body_to_v2_elements(body),
         state="waiting",
         detail=detail,
         actions=actions,

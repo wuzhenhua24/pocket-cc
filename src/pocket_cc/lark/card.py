@@ -347,42 +347,190 @@ ELEMENT_ID_ACTIONS_DIVIDER: Final[str] = "actions_divider"
 ELEMENT_ID_ACTIONS: Final[str] = "actions"
 
 
+# Cardkit v2 ``table`` element clamps page_size to 1..10. 5 fits one
+# screen of a typical mobile session without forcing horizontal scroll
+# while still showing enough rows to be useful.
+_TABLE_PAGE_SIZE: Final[int] = 5
+
+
+def markdown_body_to_v2_elements(text: str) -> list[dict[str, Any]]:
+    """Render a markdown body string as a list of cardkit v2 body elements.
+
+    Walks the text line-by-line, splitting on GFM pipe-tables: every
+    contiguous markdown chunk becomes a ``{tag: "markdown"}`` element (with
+    heading conversion applied), and every table becomes a standalone
+    ``{tag: "table"}`` element. Returns the elements in document order so
+    the renderer can drop them straight into ``body.elements``.
+
+    Element id scheme:
+
+    * The first element gets :data:`ELEMENT_ID_BODY`. This is what
+      :class:`CardStream` targets on its fast (streaming PUT) path — so the
+      common "body is just one markdown blob" case keeps the streaming
+      optimization. Once a table or trailing markdown segment exists,
+      skeleton-diff in CardStream notices the structural change and falls
+      back to the slow (whole-card update) path.
+    * Subsequent segments get ``body_1``, ``body_2`` … so cardkit can
+      address them individually if a future caller wants element-level
+      updates beyond the leading streaming target.
+
+    Why tables become standalone elements: Feishu's v2 ``markdown`` tag
+    silently drops GFM pipe-tables. v2's native ``table`` component
+    renders them as proper tables instead (with sortable columns and
+    pagination). Phase 4-C of the cardkit migration. The empty-input
+    case still emits one markdown element so the streaming target exists.
+    """
+    if not text:
+        return [_markdown_element("", element_id=ELEMENT_ID_BODY)]
+
+    segments: list[tuple[str, Any]] = []  # ("md", str) | ("table", element_dict)
+    lines = text.splitlines()
+    md_buffer: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        # GFM table = header row + separator row + zero+ data rows.
+        if (
+            i + 1 < n
+            and _TABLE_ROW_RE.match(lines[i])
+            and _TABLE_SEP_RE.match(lines[i + 1])
+        ):
+            if md_buffer:
+                segments.append(("md", "\n".join(md_buffer)))
+                md_buffer = []
+            header = _parse_row(lines[i])
+            i += 2  # consume header + separator
+            data_rows: list[list[str]] = []
+            while i < n and _TABLE_ROW_RE.match(lines[i]):
+                row = _parse_row(lines[i])
+                if row:
+                    data_rows.append(row)
+                i += 1
+            segments.append(("table", _build_v2_table_element(header, data_rows)))
+            continue
+        md_buffer.append(lines[i])
+        i += 1
+    if md_buffer:
+        segments.append(("md", "\n".join(md_buffer)))
+
+    # No segments only happens for input that's a single dangling table with
+    # no surrounding text — still need a leading markdown element to anchor
+    # CardStream's fast path target, so prepend an empty one.
+    if not segments or segments[0][0] != "md":
+        segments.insert(0, ("md", ""))
+
+    out: list[dict[str, Any]] = []
+    for kind, payload in segments:
+        # First segment owns the streaming target id; later ones are
+        # body_1, body_2, … so cardkit can address them individually if
+        # ever needed.
+        element_id = ELEMENT_ID_BODY if not out else f"body_{len(out)}"
+        if kind == "md":
+            out.append(_markdown_element(payload, element_id=element_id))
+        else:  # table — payload is already a dict, just stamp the id on it
+            payload["element_id"] = element_id
+            out.append(payload)
+    return out
+
+
+def _markdown_element(content: str, *, element_id: str) -> dict[str, Any]:
+    """Construct a single ``{tag: "markdown"}`` body element with heading
+    conversion already applied. Internal helper for
+    :func:`markdown_body_to_v2_elements`."""
+    return {
+        "tag": "markdown",
+        "element_id": element_id,
+        "content": _apply_heading_conversion(content),
+    }
+
+
+def _apply_heading_conversion(text: str) -> str:
+    """``## heading`` → ``**heading**``. Same logic
+    :func:`normalize_markdown_for_lark` uses, split out so
+    :func:`markdown_body_to_v2_elements` can apply just the heading half
+    without dragging the table downgrade through."""
+    if not text:
+        return text
+    return _HEADING_RE.sub(_heading_to_bold, text)
+
+
+def _build_v2_table_element(
+    header: list[str], rows: list[list[str]]
+) -> dict[str, Any]:
+    """Render a header + rows pair as a cardkit v2 ``table`` element.
+
+    Column ``data_type`` is auto-detected per column: ``lark_md`` when any
+    cell in that column contains inline markdown (bold / italic / inline
+    code / link), else ``text``. This matches the SDK reference builder
+    in ``lark_oapi.channel.card.builder.CardBuilder.table``.
+
+    Short / empty cells / mismatched row widths get padded to a uniform
+    column count so cardkit doesn't reject the payload.
+    """
+    n_cols = max(len(header), max((len(r) for r in rows), default=0))
+    header_padded = list(header) + [""] * (n_cols - len(header))
+    rows_padded = [list(r) + [""] * (n_cols - len(r)) for r in rows]
+
+    columns: list[dict[str, Any]] = []
+    for idx in range(n_cols):
+        col_cells = [r[idx] for r in rows_padded]
+        has_inline_md = any(
+            _INLINE_MD_IN_CELL_RE.search(c) for c in col_cells if c
+        )
+        columns.append(
+            {
+                "name": f"col_{idx}",
+                "display_name": header_padded[idx],
+                "data_type": "lark_md" if has_inline_md else "text",
+            }
+        )
+
+    rows_data = [
+        {f"col_{idx}": cell for idx, cell in enumerate(row)}
+        for row in rows_padded
+    ]
+    return {
+        "tag": "table",
+        "page_size": _TABLE_PAGE_SIZE,
+        "columns": columns,
+        "rows": rows_data,
+    }
+
+
 def build_status_card_v2(
     *,
     title: str,
-    body: str,
+    body_elements: list[dict[str, Any]],
     state: CardState = "running",
     actions: list[CardButton] | None = None,
     detail: ExpandableSection | None = None,
 ) -> dict[str, Any]:
-    """Build the cardkit Schema 2.0 equivalent of :func:`build_status_card`.
+    """Build a cardkit Schema 2.0 status card from pre-built body elements.
 
-    Differences from the legacy builder a caller must know about:
+    ``body_elements`` is the list :func:`markdown_body_to_v2_elements`
+    produces (or an equivalent shape constructed by tests / callers that
+    want full control). The first element MUST carry
+    :data:`ELEMENT_ID_BODY` — :class:`CardStream` targets that id for
+    streaming PUTs. ``markdown_body_to_v2_elements`` enforces this; if you
+    hand-build the list, mirror that contract or the streaming fast path
+    breaks silently.
 
-    * Top-level ``schema: "2.0"`` declares the new format.
-    * ``config.streaming_mode`` is ``True`` for non-terminal states (running /
-      waiting) so the cardkit streaming PUT endpoint accepts updates;
-      terminal states (done / failed / cancelled) emit ``False`` so the IM
-      list-preview / forwarding behavior settles.
-    * ``config.summary.content`` carries the chat-list preview string —
-      derived from ``title`` so the preview reads as "{emoji} {title}"
-      without separate plumbing.
-    * Body elements live under ``body.elements`` (not top-level ``elements``)
-      and the body markdown carries :data:`ELEMENT_ID_BODY` so streaming
-      updates can target it by name.
-    * The v1 ``action`` container is gone in v2 — buttons go directly into
-      ``body.elements``; a multi-button row uses a ``column_set`` with one
-      ``column`` per button.
-    * Headings (``# / ##``) and other GFM features the legacy ``markdown``
-      tag dropped are rendered natively in v2 — callers can stop
-      pre-normalizing body content for those once Phase 4 lands.
+    Other contracts:
+
+    * Top-level ``schema: "2.0"``.
+    * ``config.streaming_mode`` is ``True`` for non-terminal states
+      (running / waiting) so the cardkit streaming PUT endpoint accepts
+      updates; terminal states (done / failed / cancelled) emit ``False``
+      so the IM list-preview / forwarding behavior settles.
+    * ``config.summary.content`` carries the chat-list preview string,
+      derived from ``title`` as ``"{emoji} {title}"``.
+    * v1's ``action`` container is gone — buttons go directly into
+      ``body.elements`` as a ``column_set`` with one ``column`` per button.
     """
     color, emoji = _STATE_STYLE[state]
     is_streaming = state in ("running", "waiting")
 
-    elements: list[dict[str, Any]] = [
-        {"tag": "markdown", "element_id": ELEMENT_ID_BODY, "content": body},
-    ]
+    elements: list[dict[str, Any]] = list(body_elements)
 
     if detail is not None:
         elements.append({"tag": "hr", "element_id": ELEMENT_ID_DETAIL_DIVIDER})
@@ -428,31 +576,32 @@ def build_status_card_v2(
 
 
 def build_text_card_v2(*, body: str) -> dict[str, Any]:
-    """v2 equivalent of :func:`build_text_card` — headerless, action-less.
+    """v2 headerless / action-less one-shot notice card.
 
-    No streaming_mode (these cards are one-shot notices), no summary header
-    overlay. Useful for "session ended" / orphan-restart notice cases.
+    Body string still goes through :func:`markdown_body_to_v2_elements`
+    so a notice that happens to contain a GFM table renders correctly
+    (rare but possible, e.g. a pane dump of Claude's TUI showing a
+    formatted summary).
+
+    No streaming_mode (one-shot, no follow-up updates) and no summary
+    header overlay (no header at all).
     """
     return {
         "schema": "2.0",
         "config": {},
-        "body": {
-            "elements": [
-                {"tag": "markdown", "element_id": ELEMENT_ID_BODY, "content": body},
-            ],
-        },
+        "body": {"elements": markdown_body_to_v2_elements(body)},
     }
 
 
 def build_restart_notice_card_v2() -> dict[str, Any]:
-    """v2 equivalent of :func:`build_restart_notice_card`.
-
-    Same intent as legacy: visually close out a card the previous (dead)
-    process left in a ⏳ state by flipping it to ⏹ cancelled with a notice.
+    """⏹ grey notice card patched onto an orphan turn after pocket-cc
+    restarts. Visually closes out a card the previous (dead) process left
+    stuck on ⏳; the next user message starts a fresh turn from scratch.
     """
+    body = "⚠️ 上一轮的状态未能保留——可发送新消息重新开始。"
     return build_status_card_v2(
         title="pocket-cc 已重启",
-        body="⚠️ 上一轮的状态未能保留——可发送新消息重新开始。",
+        body_elements=markdown_body_to_v2_elements(body),
         state="cancelled",
     )
 

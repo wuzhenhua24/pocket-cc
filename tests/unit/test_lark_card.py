@@ -249,7 +249,7 @@ def test_normalize_mixed_content() -> None:
 # Schema 2.0 (cardkit) builders
 # =========================================================================
 
-from pocket_cc.lark.card import (  # noqa: E402  (grouped at end so legacy tests stay first)
+from pocket_cc.lark.card import (  # noqa: E402  (grouped after normalize tests)
     ELEMENT_ID_ACTIONS,
     ELEMENT_ID_ACTIONS_DIVIDER,
     ELEMENT_ID_BODY,
@@ -259,11 +259,18 @@ from pocket_cc.lark.card import (  # noqa: E402  (grouped at end so legacy tests
     build_restart_notice_card_v2,
     build_status_card_v2,
     build_text_card_v2,
+    markdown_body_to_v2_elements,
 )
 
 
+def _md_body(content: str) -> list[dict[str, object]]:
+    """Single-markdown-element body convenience for tests that don't
+    exercise the table-extraction path."""
+    return [{"tag": "markdown", "element_id": ELEMENT_ID_BODY, "content": content}]
+
+
 def test_v2_minimal_running_card_shape() -> None:
-    card = build_status_card_v2(title="task A", body="hello world")
+    card = build_status_card_v2(title="task A", body_elements=_md_body("hello world"))
     assert card["schema"] == "2.0"
     # Streaming on for running so cardkit's PUT endpoint accepts updates.
     assert card["config"]["streaming_mode"] is True
@@ -290,7 +297,7 @@ def test_v2_streaming_mode_only_on_active_states() -> None:
         "cancelled": False,
     }
     for state, expected in cases.items():
-        card = build_status_card_v2(title="t", body="b", state=state)  # type: ignore[arg-type]
+        card = build_status_card_v2(title="t", body_elements=_md_body("b"), state=state)  # type: ignore[arg-type]
         assert card["config"]["streaming_mode"] is expected, state
 
 
@@ -303,18 +310,18 @@ def test_v2_state_drives_template_and_emoji() -> None:
         "cancelled": ("grey", "⏹"),
     }
     for state, (color, emoji) in cases.items():
-        card = build_status_card_v2(title="t", body="b", state=state)  # type: ignore[arg-type]
+        card = build_status_card_v2(title="t", body_elements=_md_body("b"), state=state)  # type: ignore[arg-type]
         assert card["header"]["template"] == color, state
         assert card["header"]["title"]["content"] == f"{emoji} t", state
         assert card["config"]["summary"]["content"] == f"{emoji} t", state
 
 
 def test_v2_body_element_id_is_stable() -> None:
-    """Regression guard: Phase 3's CardStream hard-codes ELEMENT_ID_BODY as
-    the streaming target. If this constant ever drifts away from what the
-    builder actually emits, streaming PUTs would silently target a phantom
-    element id."""
-    card = build_status_card_v2(title="t", body="x")
+    """Regression guard: CardStream hard-codes ELEMENT_ID_BODY as the
+    streaming target. If this constant ever drifts away from what
+    markdown_body_to_v2_elements emits for the first segment, streaming
+    PUTs would silently target a phantom element id."""
+    card = build_status_card_v2(title="t", body_elements=_md_body("x"))
     body_element = card["body"]["elements"][0]
     assert body_element["element_id"] == ELEMENT_ID_BODY
     assert ELEMENT_ID_BODY == "body"  # frozen value — bumping requires a CardStream review
@@ -328,7 +335,7 @@ def test_v2_actions_render_as_column_set_with_per_button_columns() -> None:
         CardButton(text="B", value={"x": 2}, style="primary"),
         CardButton(text="C", value={"x": 3}, style="danger"),
     ]
-    card = build_status_card_v2(title="t", body="b", actions=actions)
+    card = build_status_card_v2(title="t", body_elements=_md_body("b"), actions=actions)
     elements = card["body"]["elements"]
     # body, hr-divider, column_set
     tags = [e["tag"] for e in elements]
@@ -351,7 +358,7 @@ def test_v2_button_value_is_defensively_copied() -> None:
     payload = {"action": "cancel"}
     card = build_status_card_v2(
         title="t",
-        body="b",
+        body_elements=_md_body("b"),
         actions=[CardButton(text="cancel", value=payload)],
     )
     rendered = card["body"]["elements"][-1]["columns"][0]["elements"][0]["value"]
@@ -364,7 +371,7 @@ def test_v2_detail_section_uses_grey_markdown_label() -> None:
     markdown line so the visual weight matches the legacy look."""
     card = build_status_card_v2(
         title="t",
-        body="b",
+        body_elements=_md_body("b"),
         detail=ExpandableSection(label="Tool calls (4)", content="- Read foo.py"),
     )
     elements = card["body"]["elements"]
@@ -383,7 +390,7 @@ def test_v2_detail_section_uses_grey_markdown_label() -> None:
 def test_v2_detail_and_actions_combined_element_order() -> None:
     card = build_status_card_v2(
         title="t",
-        body="b",
+        body_elements=_md_body("b"),
         detail=ExpandableSection(label="Detail", content="hidden info"),
         actions=[CardButton(text="X", value={})],
     )
@@ -417,11 +424,116 @@ def test_v2_restart_notice_card_is_grey_and_actionless() -> None:
     assert card["config"]["streaming_mode"] is False
 
 
-def test_v2_does_not_pre_normalize_markdown_in_body() -> None:
-    """v2's markdown element renders GFM headings natively — the legacy
-    pre-normalize pass (`#` → `**`) is intentionally NOT applied here. If
-    Phase 3 still wants to normalize, it must do so before calling the
+# ===================================================== markdown_body_to_v2_elements
+
+
+def test_md_body_plain_text_is_single_markdown_element() -> None:
+    """Common case: no tables → one markdown element with ELEMENT_ID_BODY."""
+    out = markdown_body_to_v2_elements("hello world")
+    assert len(out) == 1
+    assert out[0] == {
+        "tag": "markdown",
+        "element_id": ELEMENT_ID_BODY,
+        "content": "hello world",
+    }
+
+
+def test_md_body_empty_string_still_anchors_streaming_target() -> None:
+    """Empty body still emits one markdown element so CardStream's fast
+    path has a target to PUT to on the first streaming tick."""
+    out = markdown_body_to_v2_elements("")
+    assert out == [{"tag": "markdown", "element_id": ELEMENT_ID_BODY, "content": ""}]
+
+
+def test_md_body_applies_heading_conversion() -> None:
+    """v2 markdown renders GFM headings literally pending verification —
+    we conservatively convert ## → ** as the rendering enters the
     builder."""
-    raw = "## Heading\n- item"
-    card = build_status_card_v2(title="t", body=raw)
-    assert card["body"]["elements"][0]["content"] == raw
+    out = markdown_body_to_v2_elements("## Result\nAll good.")
+    assert len(out) == 1
+    assert "**Result**" in out[0]["content"]
+    assert "## " not in out[0]["content"]
+
+
+def test_md_body_extracts_gfm_table_as_v2_table_element() -> None:
+    src = (
+        "Some intro text.\n"
+        "\n"
+        "| 模块 | 说明 |\n"
+        "|---|---|\n"
+        "| api | Backend |\n"
+        "| ui  | Frontend |\n"
+        "\n"
+        "Wrap-up sentence."
+    )
+    out = markdown_body_to_v2_elements(src)
+    tags = [e["tag"] for e in out]
+    assert tags == ["markdown", "table", "markdown"]
+    # Leading markdown carries the streaming target id
+    assert out[0]["element_id"] == ELEMENT_ID_BODY
+    assert "Some intro text." in out[0]["content"]
+    # Table is a real v2 table element, not a markdown blob
+    table = out[1]
+    assert table["element_id"] == "body_1"
+    assert table["page_size"] == 5
+    assert [c["display_name"] for c in table["columns"]] == ["模块", "说明"]
+    assert [c["data_type"] for c in table["columns"]] == ["text", "text"]
+    assert table["rows"] == [
+        {"col_0": "api", "col_1": "Backend"},
+        {"col_0": "ui", "col_1": "Frontend"},
+    ]
+    # Trailing markdown gets a separate, auto-numbered id
+    assert out[2]["element_id"] == "body_2"
+    assert "Wrap-up" in out[2]["content"]
+
+
+def test_md_body_table_with_inline_md_picks_lark_md_data_type() -> None:
+    """The SDK's data_type auto-detect: any cell with bold / italic /
+    inline code / link → ``lark_md`` for that column. Plain columns stay
+    ``text``."""
+    src = (
+        "| 名称 | 文档 |\n"
+        "|---|---|\n"
+        "| api | [docs](http://x) |\n"
+        "| ui  | **WIP**  |\n"
+    )
+    out = markdown_body_to_v2_elements(src)
+    # First segment is empty leading markdown (table is at the start)
+    table = next(e for e in out if e["tag"] == "table")
+    assert [c["data_type"] for c in table["columns"]] == ["text", "lark_md"]
+
+
+def test_md_body_leading_table_gets_empty_md_first() -> None:
+    """When body starts with a table, we still emit a leading empty
+    markdown element first — CardStream's fast-path target must always
+    be a markdown element (the streaming PUT endpoint targets markdown
+    elements only). Without this prefix the streaming layer couldn't
+    keep growing text in front of the table."""
+    src = "| h |\n|---|\n"  # one-column "table" — separator regex needs ≥2 cols
+    # Single-column tables aren't recognized as GFM tables (intentional —
+    # `|---|` separator regex requires ≥2 columns). They stay markdown.
+    out = markdown_body_to_v2_elements(src)
+    assert len(out) == 1
+    assert out[0]["tag"] == "markdown"
+
+    src = "| h1 | h2 |\n|---|---|\n| a | b |\n"
+    out = markdown_body_to_v2_elements(src)
+    assert [e["tag"] for e in out] == ["markdown", "table"]
+    assert out[0]["element_id"] == ELEMENT_ID_BODY
+    assert out[0]["content"] == ""  # leading empty markdown
+    assert out[1]["element_id"] == "body_1"
+
+
+def test_md_body_pads_short_rows_to_match_column_count() -> None:
+    """Mismatched row widths must not crash the builder — pad with empty
+    strings so cardkit's payload is well-formed."""
+    src = (
+        "| a | b | c |\n"
+        "|---|---|---|\n"
+        "| 1 | 2 |\n"  # short row
+        "| 1 | 2 | 3 |\n"
+    )
+    out = markdown_body_to_v2_elements(src)
+    table = next(e for e in out if e["tag"] == "table")
+    assert table["rows"][0] == {"col_0": "1", "col_1": "2", "col_2": ""}
+    assert table["rows"][1] == {"col_0": "1", "col_1": "2", "col_2": "3"}
