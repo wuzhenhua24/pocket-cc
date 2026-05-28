@@ -23,6 +23,7 @@ markdown element (no table extraction).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any
@@ -764,6 +765,35 @@ def _shorten(s: str, limit: int) -> str:
     return s[: limit - 1] + "…"
 
 
+# A line that consists solely of a triple-backtick fence, optionally followed
+# by an info string (language hint, attributes, etc.). We're strict on
+# flush-left + exactly three backticks — that's what Claude emits in practice
+# and keeping the regex tight avoids false-positive toggles on stray text like
+# "``` see also ```". Tilde fences and indented code blocks are intentionally
+# out of scope (Claude doesn't use them; adding support is easy if that changes).
+_FENCE_LINE_RE = re.compile(r"^```([^\n`]*)$")
+
+
+def _scan_fences(text: str, in_fence: bool, fence_info: str) -> tuple[bool, str]:
+    """Walk ``text`` line-by-line and return the fence state at its end.
+
+    ``in_fence`` / ``fence_info`` describe the state *before* ``text``. Each
+    matching fence line toggles ``in_fence``; on an opening toggle we capture
+    the info string (e.g. ``"python"``) so a later reopen can replicate it.
+    """
+    for line in text.split("\n"):
+        m = _FENCE_LINE_RE.match(line)
+        if not m:
+            continue
+        if in_fence:
+            in_fence = False
+            fence_info = ""
+        else:
+            in_fence = True
+            fence_info = m.group(1)
+    return in_fence, fence_info
+
+
 def _split_text_part(text: str, limit: int = _TEXT_PART_MAX_CHARS) -> list[str]:
     """Split an assistant text block into chunks no longer than ``limit``.
 
@@ -774,9 +804,42 @@ def _split_text_part(text: str, limit: int = _TEXT_PART_MAX_CHARS) -> list[str]:
     at most a cosmetic blank line where a hard cut lands). The point is to
     keep every stored part small enough that chunked rotation can always fit
     at least one whole part in a card, so no card ever tail-truncates.
+
+    **Fenced code block awareness**: when a split lands inside a ```` ``` ````
+    fenced block (very common — Claude's Python blocks have internal blank
+    lines between imports and body), the chunk that ends inside the fence
+    gets a synthetic close fence appended, and the next chunk that continues
+    inside the fence gets a matching open fence (with the original info
+    string) prepended. Without this, the continuation card's body starts
+    *inside* a code block with no opening marker — and the original closing
+    ```` ``` ```` later in the body then gets reinterpreted as an *opening*
+    fence, swallowing every following section into a stray code block.
+    Chunks with no fences are unaffected, so the byte-exact rejoin guarantee
+    still holds for plain-text content.
     """
     if len(text) <= limit:
         return [text]
+    raw_chunks = _split_paragraphs(text, limit)
+    decorated: list[str] = []
+    in_fence = False
+    fence_info = ""
+    for raw in raw_chunks:
+        start_in_fence = in_fence
+        start_info = fence_info
+        in_fence, fence_info = _scan_fences(raw, in_fence, fence_info)
+        chunk = raw
+        if start_in_fence:
+            chunk = f"```{start_info}\n" + chunk
+        if in_fence:
+            chunk = chunk + "\n```"
+        decorated.append(chunk)
+    return decorated
+
+
+def _split_paragraphs(text: str, limit: int) -> list[str]:
+    """Paragraph-pack split with no fence awareness — pure ``\\n\\n``-packed
+    chunks under ``limit``. Extracted so :func:`_split_text_part` can do a
+    second pass to repair fence balance without entangling the size logic."""
     chunks: list[str] = []
     buf = ""
     for para in text.split("\n\n"):

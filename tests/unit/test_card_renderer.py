@@ -1131,6 +1131,58 @@ def test_split_text_part_hard_splits_single_giant_paragraph() -> None:
     assert "".join(chunks) == giant  # content fully preserved
 
 
+def _fence_balanced(chunk: str) -> bool:
+    """A chunk renders as well-formed markdown iff its ```` ``` ```` fences pair up."""
+    return sum(1 for line in chunk.split("\n") if line.startswith("```")) % 2 == 0
+
+
+def test_split_text_part_repairs_fence_split_across_chunks() -> None:
+    """Reproduces the bug from the screenshots: a fenced code block with an
+    internal blank line gets split on that blank line. Without repair, the
+    first chunk has an unclosed fence and the next chunk's original closing
+    ```` ``` ```` flips into an *opening* fence, swallowing the following
+    markdown. After the fix, both chunks must be fence-balanced standalone."""
+    from pocket_cc.relay.card_renderer import _split_text_part
+
+    head = "方案2: 自定义工具对接日志系统\n\n"
+    code_pre = "```python\n" + "from x import y\n" * 30  # ~600 chars
+    code_post = "# more code\n" + "do_thing()\n" * 60 + "```"  # ~700 chars
+    tail = "\n\n**✨ 额外优势**\n\n- bullet one\n- bullet two"
+    text = head + code_pre + "\n\n" + code_post + tail
+
+    chunks = _split_text_part(text, limit=900)
+    assert len(chunks) >= 2, "test setup must actually split"
+    for c in chunks:
+        assert _fence_balanced(c), f"unbalanced fences in chunk: {c[:80]!r}"
+
+
+def test_split_text_part_preserves_fence_language_on_reopen() -> None:
+    """The reopened fence on the continuation chunk must carry the original
+    info string (``python``), so syntax highlighting is preserved."""
+    from pocket_cc.relay.card_renderer import _split_text_part
+
+    code_body = "x = 1\n" * 200  # ~1200 chars, blank-line free
+    text = "intro\n\n```python\n" + code_body[:600] + "\n\n" + code_body[600:] + "```\n\nouter"
+    chunks = _split_text_part(text, limit=700)
+    # Find the chunk that *starts* with a synthetic reopen (continuation card).
+    continuations = [c for c in chunks[1:] if c.startswith("```")]
+    assert continuations, "expected at least one continuation chunk starting with a fence"
+    assert continuations[0].startswith("```python\n"), (
+        f"continuation should re-open with original language; got {continuations[0][:40]!r}"
+    )
+
+
+def test_split_text_part_no_fence_means_rejoin_exact() -> None:
+    """Sanity: content with no fences is untouched by the decoration pass —
+    the byte-exact rejoin guarantee still holds for plain markdown."""
+    from pocket_cc.relay.card_renderer import _split_text_part
+
+    original = "\n\n".join(f"paragraph {i} " + "x" * 400 for i in range(8))
+    chunks = _split_text_part(original, limit=1000)
+    assert len(chunks) >= 2
+    assert "\n\n".join(chunks) == original
+
+
 def test_ingest_huge_assistant_text_is_stored_in_bounded_parts() -> None:
     from pocket_cc.relay.card_renderer import _TEXT_PART_MAX_CHARS
 
