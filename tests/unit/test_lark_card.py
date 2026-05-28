@@ -92,157 +92,30 @@ def test_normalize_heading_with_partial_bold_kept_verbatim() -> None:
 
 
 def test_normalize_is_idempotent() -> None:
-    src = "## hello\n| a | b |\n|---|---|\n| 1 | 2 |\n"
+    """Heading conversion is idempotent — ``** ... **`` re-wraps cleanly
+    on a second pass (the unwrap-then-rewrap logic in _heading_to_bold
+    handles the already-bold case)."""
+    src = "## hello\n### world\n"
     once = normalize_markdown_for_lark(src)
     twice = normalize_markdown_for_lark(once)
     assert once == twice
 
 
-def test_normalize_converts_two_column_table_to_code_block() -> None:
-    """Narrow plain-text tables render as a fenced code block so Lark's
-    monospace font preserves column alignment — users *see* a table."""
-    src = (
-        "| 模块 | 说明 |\n"
-        "|---|---|\n"
-        "| ploto-bff | Backend for Frontend 层 |\n"
-        "| ploto-monitor | 监控指标功能 |\n"
-    )
-    out = normalize_markdown_for_lark(src)
-    # Old leftover syntax must be gone regardless of which rendering picked
-    assert "|---" not in out
-    assert "| 模块 | 说明 |" not in out
-    # Code-block fence opens and closes
-    assert "```" in out
-    assert out.count("```") == 2
-    # Header + separator + data rows all live inside the fence
-    assert "模块" in out and "说明" in out
-    assert "ploto-bff" in out
-    assert "ploto-monitor" in out
-    # Separator row uses dashes (no pipes-with-dashes since we rebuild it)
-    assert any(set(line.strip()) <= {"-", "|", " "} and "-" in line
-               for line in out.splitlines())
-    # Bullets path NOT taken — no `**模块**:` pairs
-    assert "**模块**:" not in out
-
-
-def test_normalize_converts_three_column_table_to_code_block() -> None:
-    src = "| h1 | h2 | h3 |\n|---|---|---|\n| a | b | c |\n"
-    out = normalize_markdown_for_lark(src)
-    assert "```" in out
-    assert "h1" in out and "h2" in out and "h3" in out
-    assert "a" in out and "b" in out and "c" in out
-
-
-def test_normalize_handles_separator_with_alignment() -> None:
-    """GFM tables may use `:---:` / `:---` / `---:` for alignment markers
-    in the separator row — those must still be recognized as a table."""
-    src = "| a | b |\n| :--- | ---: |\n| 1 | 2 |\n"
-    out = normalize_markdown_for_lark(src)
-    assert "```" in out
-    assert "a" in out and "b" in out
-    assert "1" in out and "2" in out
-
-
-def test_normalize_table_with_wide_cell_falls_back_to_bullets() -> None:
-    """A long-prose cell would force horizontal scroll inside a code
-    block (much worse than wrapped bullets on mobile) — fall back."""
-    long_prose = "Backend for Frontend 层负责承接前端请求并做模型聚合编排"  # >24 disp chars
-    src = (
-        "| 模块 | 说明 |\n"
-        "|---|---|\n"
-        f"| ploto-bff | {long_prose} |\n"
-    )
-    out = normalize_markdown_for_lark(src)
-    assert "```" not in out
-    assert "- **模块**: ploto-bff" in out
-    assert long_prose in out
-
-
-def test_normalize_table_with_inline_markdown_in_cell_falls_back_to_bullets() -> None:
-    """A code-block fence prints inline markdown as literal text —
-    regression vs the bullet form. Detect and fall back."""
-    src = (
-        "| 名称 | 文档 |\n"
-        "|---|---|\n"
-        "| api | [docs](http://x) |\n"
-        "| ui  | **WIP** |\n"
-    )
-    out = normalize_markdown_for_lark(src)
-    assert "```" not in out
-    # Both inline-md flavors preserved in bullet form (rendered live by Lark)
-    assert "[docs](http://x)" in out
-    assert "**WIP**" in out
-
-
-def test_normalize_single_column_pseudo_table_is_left_alone() -> None:
-    """One-column ``|---|`` blocks aren't recognized as GFM tables by the
-    detector at all (separator-row regex requires ≥2 columns) — they
-    pass through unchanged. Also documents the defensive
-    ``len(header) < 2 → bullets`` branch in ``_should_use_code_block_table``:
-    if the detector ever broadens we still avoid emitting a degenerate
-    1-column code-block."""
-    src = "| Tasks |\n|---|\n| build |\n| test |\n"
-    out = normalize_markdown_for_lark(src)
-    assert "```" not in out
-    # Unchanged passthrough — no bullets, no code block, no table rewrite
-    assert out == src
-
-
-def test_normalize_code_block_table_aligns_cjk_columns() -> None:
-    """CJK chars are 2 display cells wide — column alignment must
-    account for that or the table looks ragged."""
-    src = (
-        "| 名 | desc |\n"
-        "|---|---|\n"
-        "| 张三 | dev |\n"
-        "| 李 | qa |\n"
-    )
-    out = normalize_markdown_for_lark(src)
-    assert "```" in out
-    # The header / data rows that have a 2-char-CJK name should align
-    # with the data row that has a 1-char-CJK name (李) — both end at
-    # the same pipe column. Easiest invariant to assert: each data line
-    # inside the fence has the same display width up to the first ` | `.
-    lines = [line for line in out.splitlines() if "|" in line]
-    name_col_widths = {
-        sum(2 if ord(c) > 0x2E80 else 1 for c in line.split(" | ")[0])
-        for line in lines
-    }
-    # All lines pad to the same name-column width.
-    assert len(name_col_widths) == 1
-
-
-def test_normalize_leaves_non_table_pipes_alone() -> None:
-    """A line with `|` but no separator-row underneath isn't a table."""
-    src = "you can use `a | b` syntax in shell pipes\nand `find . | grep foo`"
+def test_normalize_leaves_tables_alone() -> None:
+    """Phase 4-C moved table handling to markdown_body_to_v2_elements.
+    normalize_markdown_for_lark only does heading conversion now — any
+    pipe-table content passes through unchanged."""
+    src = "| a | b |\n|---|---|\n| 1 | 2 |\n"
     assert normalize_markdown_for_lark(src) == src
 
 
-def test_normalize_mixed_content() -> None:
-    """A realistic Claude response — heading + para + table + list."""
-    src = (
-        "## 核心信息\n"
-        "- **技术栈**: Java 8\n"
-        "\n"
-        "## 主要模块\n"
-        "| 模块 | 说明 |\n"
-        "|---|---|\n"
-        "| ploto-bff | BFF 层 |\n"
-        "\n"
-        "结束。\n"
-    )
-    out = normalize_markdown_for_lark(src)
-    # Headings → bold
-    assert "**核心信息**" in out
-    assert "**主要模块**" in out
-    assert "## " not in out
-    # Existing bold list item stays
-    assert "- **技术栈**: Java 8" in out
-    # Table → fenced code block (narrow plain cells qualify)
-    assert "```" in out
-    assert "ploto-bff" in out and "BFF 层" in out
-    # Trailing text stays
-    assert "结束。" in out
+def test_normalize_leaves_non_table_pipes_alone() -> None:
+    """A line with `|` but no separator-row underneath isn't a table.
+    (Still passes through trivially — normalize no longer touches pipes
+    at all, but the test stays as a regression guard for the heading
+    pass not accidentally munging pipe-bearing text.)"""
+    src = "you can use `a | b` syntax in shell pipes\nand `find . | grep foo`"
+    assert normalize_markdown_for_lark(src) == src
 
 
 # =========================================================================
