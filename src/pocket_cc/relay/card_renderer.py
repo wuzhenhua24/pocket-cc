@@ -717,16 +717,22 @@ def _render_body(snapshot: TurnSnapshot) -> str:
     elif snapshot.assistant_text:
         sections.append(snapshot.assistant_text)
 
-    # Terminal cards (done/failed) drop the tool-call list — once the answer
-    # is in, it's just process noise (the user saw it scroll by while running,
-    # and the full trace lives in tmux). Fallback: if there's no other content
-    # to show, keep it so the card body isn't just a "(运行中…)" placeholder.
-    is_terminal = snapshot.state in ("done", "failed")
-    if snapshot.tool_calls and (not is_terminal or not sections):
+    # Terminal cards (done / failed / cancelled) always drop the tool-call
+    # list — once the turn is over it's just process noise (the user saw
+    # the calls scroll by while running, and the full trace lives in tmux).
+    # Even on rotation tail cards where assistant_text got committed to
+    # earlier seal cards and the body would otherwise be empty: leaving the
+    # body blank is correct — the header's emoji + title already conveys
+    # the terminal state.
+    is_terminal = snapshot.state in ("done", "failed", "cancelled")
+    if snapshot.tool_calls and not is_terminal:
         bullets = "\n".join(f"- {t}" for t in snapshot.tool_calls)
         sections.append(f"**🔧 工具调用** ({len(snapshot.tool_calls)})\n{bullets}")
 
-    if not sections:
+    if not sections and snapshot.state == "running":
+        # Only running cards get the "(运行中…)" placeholder — terminal cards
+        # with empty body render header-only, which is the desired UX (see
+        # the comment above).
         sections.append("_（运行中…）_")
 
     body = "\n\n".join(sections)

@@ -477,7 +477,16 @@ def test_render_card_done_drops_tool_calls_when_text_present() -> None:
     assert "foo.py" not in body
 
 
-def test_render_card_done_keeps_tool_calls_as_fallback_when_no_text() -> None:
+def test_render_card_done_drops_tool_calls_even_without_text() -> None:
+    """Terminal cards (done / failed / cancelled) never show the tool-call
+    list — even on rotation tail cards where assistant_text got committed
+    to earlier seal cards and the only thing left in the snapshot would be
+    tool calls. The body renders empty in that case; the header's emoji
+    conveys the terminal state.
+
+    Regression guard for the rotation-tail UX: a "(续) …" card after a
+    long turn used to display "工具调用 (N)" with no other body content,
+    which looked like the turn was still mid-action."""
     acc = TurnAccumulator()
     acc.user_prompt = "x"
     acc.ingest(
@@ -490,9 +499,31 @@ def test_render_card_done_keeps_tool_calls_as_fallback_when_no_text() -> None:
         )
     )
     body = render_card(acc.snapshot(state="done"))["body"]["elements"][0]["content"]
-    # No assistant text → keep tool calls so the body isn't just a placeholder.
-    assert "工具调用" in body
-    assert "pytest" in body
+    assert "工具调用" not in body
+    assert "pytest" not in body
+    # Body is empty (no placeholder either — the title's ✅ is enough).
+    assert body == ""
+
+
+def test_render_card_cancelled_drops_tool_calls() -> None:
+    """``cancelled`` was missing from the terminal-state set — make sure
+    a cancel-button-induced terminal card also hides tool calls."""
+    acc = TurnAccumulator()
+    acc.user_prompt = "x"
+    acc.ingest(AssistantText(uuid="a", timestamp="t", text="partial work"))
+    acc.ingest(
+        ToolUse(
+            uuid="b",
+            timestamp="t",
+            tool_use_id="t1",
+            tool_name="Bash",
+            tool_input={"command": "pytest"},
+        )
+    )
+    body = render_card(acc.snapshot(state="cancelled"))["body"]["elements"][0]["content"]
+    assert "partial work" in body
+    assert "工具调用" not in body
+    assert "pytest" not in body
 
 
 def test_render_card_failed_drops_tool_calls() -> None:
