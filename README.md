@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-**M1 切片 D — 端到端最小可用。** `pocket-cc run` 已就绪，可以在飞书里给 bot 发消息，看到 Claude 在远程跑、卡片流式刷新。
+**M2 — 交互式 UX 已实现。** `pocket-cc run` 可在飞书里给 bot 发消息、看 Claude 远程跑、卡片流式刷新；hooks 已装（完成/失败瞬时封板），Permission / Plan / AskUserQuestion 提示会翻成 ❓ waiting 卡片让你在飞书里直接选。
 
 进度对照 [DESIGN.md §9](./DESIGN.md#9-分阶段-milestone)：
 - [x] M0：飞书 API 调研（hello_lark.py 5 项验证）
@@ -16,13 +16,12 @@
 - [x] M1-B：Claude transcript 增量解析
 - [x] M1-C：飞书客户端 + 卡片 + WS 事件包装
 - [x] M1-D：relay 层 + bootstrap + `pocket-cc run`
-- [ ] **(需要你)** 端到端验收
-- [ ] M1-E：装 Claude hooks（让"完成"瞬时感知，不再靠 transcript 轮询）
-- [ ] M2：交互式 UX（AskUserQuestion / Plan / Permission）
+- [x] M1-E：装 Claude hooks（"完成"瞬时感知，不再靠 transcript 轮询）
+- [x] M2：交互式 UX（AskUserQuestion / Plan / Permission，pane + transcript 双路检测）
 
 ### M1 端到端验收清单
 
-前置：tmux 已装；`.env` 里有 `LARK_APP_ID` / `LARK_APP_SECRET`；网络能访问 `open.feishu.cn`（如有 SOCKS 代理需在跑命令前 `unset all_proxy http_proxy https_proxy`）。
+前置：tmux 已装；`.env` 里有 `LARK_APP_ID` / `LARK_APP_SECRET`；`~/.pocket-cc/users.toml` 里至少配了一个用户（见下方 M0 第 2 步）；网络能访问 `open.feishu.cn`（如有 SOCKS 代理需在跑命令前 `unset all_proxy http_proxy https_proxy`）。
 
 ```bash
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
@@ -33,10 +32,12 @@ uv run pocket-cc run
 ```
 pocket-cc starting…
   tmux session  : pocket-cc
-  workspace     : /Users/you/.pocket-cc/workspace
   claude command: claude --permission-mode bypassPermissions
-  whitelist     : open (any user)
-  ...
+  users         : 1
+    - alice (ou_xxxxxxxx) → /home/you/workspace/alice
+  patch interval: 1.5s
+  poll interval : 0.5s
+
 [INFO] pocket_cc.lark.event_loop: WS connecting ...
 ```
 
@@ -46,7 +47,7 @@ pocket-cc starting…
 |---|---|---|
 | 1 | 发 `"请用 ls -la 列出当前目录"` | 立刻收到一张 ⏳ 蓝色卡片（"运行中…"），1-2s 后开始 PATCH 出 Claude 的工作进展 + 工具调用列表 |
 | 2 | 在另一个终端 `tmux a -t pocket-cc` | 能看到一个名为 `chat-xxxxxxxx` 的 window，里面是真实的 Claude Code 在跑 |
-| 3 | 等 Claude 完成 | 卡片最终内容稳定（M1 阶段卡片不会自动变绿，因为还没装 hooks —— M1-E 修） |
+| 3 | 等 Claude 完成 | Stop hook 触发，卡片翻 🟩 ✅ 封板（前提：已跑过 `pocket-cc hook install`） |
 | 4 | 再发 `"再列下 tests 目录"` | 新一张卡片，上一张保持原样 |
 | 5 | 发 `"/clear"` | 直接透传给 Claude，Claude 自己处理（卡片可能没什么内容刷出来，但 tmux 里 Claude 已 clear） |
 | 6 | 点卡片上 ⏹ 中断 | tmux 里 Claude 收到 Ctrl-C |
@@ -130,6 +131,16 @@ cp .env.example .env
 # 编辑 .env，填入第 1 步拿到的 LARK_APP_ID / LARK_APP_SECRET
 ```
 
+再创建用户白名单 `~/.pocket-cc/users.toml`（**必填** —— 缺这个文件 `pocket-cc run` 会直接 `ConfigError` 退出）。每个用户一段，`open_id` 作 key，配各自独立的 workspace：
+
+```toml
+[users.ou_abc123]
+workspace = "/home/you/workspace/alice"
+display_name = "alice"
+```
+
+> 只有列在表里的 `open_id` 能跟 bot 说话；不同用户的 workspace 必须互不嵌套（两个 Claude 在同一目录树会抢 `.claude/` transcript）。路径可用 `$POCKET_CC_USERS_FILE` 覆盖。
+
 ### 3. 跑 M0 验证脚本
 
 ```bash
@@ -171,7 +182,7 @@ uv run python examples/hello_lark.py
 
 | 按钮 | 实际发的 tmux 键 | 适用场景 |
 |---|---|---|
-| **⏹ 中断** | `C-c` + 200ms + `Escape`（**双连**） | **彻底停止当前任务**：break task → 退出 Claude 的「Interrupted · 你想改成什么？」redirect prompt → 清空输入框。**下次发新消息时不会拼接残留** |
+| **⏹ 中断** | `C-c` + 200ms + `Escape` + 100ms + `Escape` | **彻底停止当前任务**：break task → 退出 Claude 的「Interrupted · 你想改成什么？」redirect prompt → 清空输入框。**下次发新消息时不会拼接残留** |
 | **⎋ Esc** | `Escape` + 100ms + `Escape`（**双发**） | **清空输入框 / 退当前 prompt**。Claude TUI 单 Esc 不彻底清，需要双发；从单按钮一次发完，避开飞书"操作太频繁"的连点频控 |
 | **⇧⭾ Mode** | `BTab`（Shift-Tab） | 切换 Claude 权限模式（plan / acceptEdits / bypassPermissions），跟终端按 Shift-Tab 一样的效果 |
 | **📜 内容** | （不发键）抓 `tmux capture-pane` 文本 → 飞书发新一条卡片 | 想看 Claude TUI 当前完整的屏幕内容（pocket-cc 投影漏的、ANSI 渲染细节等） |
@@ -223,27 +234,35 @@ pocket-cc/
 │   ├── hello_tmux.py       # tmux 烟测
 │   └── parse_transcript.py # transcript 解析演示
 ├── src/pocket_cc/
-│   ├── cli.py              # pocket-cc run / hook (M1-E)
+│   ├── cli.py              # pocket-cc run / hook install·uninstall·status
 │   ├── app/                # 应用层
-│   │   ├── config.py       # .env 配置
+│   │   ├── config.py       # .env + users.toml 配置
 │   │   ├── persistence.py  # chat ↔ window 绑定
 │   │   └── bootstrap.py    # Pocketcc 主对象
 │   ├── lark/               # 飞书层
 │   │   ├── client.py       # LarkClient Protocol + OAPI + Fake
 │   │   ├── card.py         # 卡片模板
+│   │   ├── error_codes.py  # 飞书业务码 → 错误分类
 │   │   └── event_loop.py   # WS 订阅
 │   ├── tmux/               # tmux subprocess 包装
 │   ├── claude/             # Claude Code 集成
 │   │   ├── transcript.py   # JSONL 增量解析
-│   │   └── session_index.py # cwd → active transcript
+│   │   ├── session_index.py # cwd → active transcript
+│   │   ├── events.py       # hook 事件模型
+│   │   ├── hooks.py        # ~/.claude/settings.json hook 装/卸/收
+│   │   └── pane_inspector.py # 解析 TUI pane 检测 prompt / mode
 │   └── relay/              # IM ↔ Claude 转发
 │       ├── input.py        # 入站消息/按钮 → tmux
 │       ├── output.py       # transcript poller thread
+│       ├── events_router.py # hook 事件 → 卡片封板
+│       ├── pane_watcher.py # 轮询 pane 驱动 waiting 状态
+│       ├── turn_controller.py # 每个 binding 的 turn 生命周期
+│       ├── waiting.py      # waiting 状态契约（选项 / 响应）
 │       ├── card_renderer.py # Event → card dict
 │       └── card_stream.py  # 节流 PATCH
 └── tests/
-    ├── unit/               # 91 cases，纯 fake，~3s
-    └── integration/        # 10 cases，真 tmux，~3s
+    ├── unit/               # 469 cases，纯 fake
+    └── integration/        # 10 cases，真 tmux
 ```
 
 ---
