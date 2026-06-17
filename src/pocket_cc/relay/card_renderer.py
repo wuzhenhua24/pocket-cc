@@ -163,6 +163,36 @@ class TurnSnapshot:
     latest_ask_user_questions: tuple[AskUserQuestion, ...] = ()
 
 
+def _dedup_key(event: Event) -> tuple[str, ...] | None:
+    """Stable per-event identity for :meth:`TurnAccumulator.ingest` dedup.
+
+    Keyed so that the several events one transcript record emits stay distinct
+    (they share the record's ``uuid``) while a *replay* of the same record
+    collapses:
+
+      - ``ToolUse`` / ``ToolResult`` → their globally-unique ``tool_use_id``
+        (``toolu_…``); falls back to ``uuid``+name if a malformed block carried
+        no id, so two different records never collide.
+      - text / thinking → ``(kind, uuid, text)`` — two genuinely different
+        blocks survive (different text), a re-read of the same block does not.
+      - ``ModeChange`` → ``None`` (last-write-wins; never deduped).
+
+    :param event: A parsed transcript event.
+    :returns: A hashable identity tuple, or ``None`` to skip dedup.
+    """
+    if isinstance(event, ToolUse):
+        return ("tool_use", event.tool_use_id or f"{event.uuid}:{event.tool_name}")
+    if isinstance(event, ToolResult):
+        return ("tool_result", event.tool_use_id or event.uuid)
+    if isinstance(event, UserText):
+        return ("user_text", event.uuid, event.text)
+    if isinstance(event, AssistantText):
+        return ("assistant_text", event.uuid, event.text)
+    if isinstance(event, AssistantThinking):
+        return ("thinking", event.uuid, event.text)
+    return None
+
+
 @dataclass
 class TurnAccumulator:
     """Stateful aggregator — fed Events, emits TurnSnapshot.
@@ -181,7 +211,11 @@ class TurnAccumulator:
     _assistant_text_parts: list[str] = field(default_factory=list)
     _tool_calls: list[str] = field(default_factory=list)
     _thinking_parts: list[str] = field(default_factory=list)
-    _seen_uuids: set[str] = field(default_factory=set)
+    # Dedup keys for events already folded in. NOT keyed on uuid alone: one
+    # Claude record (one uuid) emits several events — an assistant record →
+    # thinking + text + N tool_use, all sharing that uuid — so a uuid key
+    # would collapse them. See :func:`_dedup_key` for the per-event identity.
+    _seen_keys: set[tuple[str, ...]] = field(default_factory=set)
     # M2-F rotation cursors — number of parts/calls already shown in
     # previous cards (closed). snapshot(from_committed=True) returns only
     # items past these indices.
@@ -205,15 +239,18 @@ class TurnAccumulator:
     def ingest(self, event: Event) -> None:
         """Fold a single Event into the running snapshot.
 
-        Idempotent on `event.uuid`: replaying the same transcript twice (e.g.
-        after truncation reset) doesn't double-count. Claude assigns a single
-        uuid per record, and a record yields exactly one event of each kind
-        per content block — so duplicate uuids = re-reading.
+        Idempotent per event identity (see :func:`_dedup_key`): replaying the
+        same transcript content — after a ``read_new`` truncation reset, or a
+        mid-turn transcript swap into a forked file that copies prior history —
+        folds in each record only once instead of double-appending it to the
+        card. ``ModeChange`` is intentionally exempt (last-write-wins; replay
+        is harmless), so :func:`_dedup_key` returns ``None`` for it.
         """
-        # We only dedupe events that have an identity; ToolResult shares its
-        # uuid with the user record that wraps it, which is fine because we
-        # never re-process the same record line twice in normal operation.
-        # The set acts as belt-and-braces for the truncation-replay case.
+        key = _dedup_key(event)
+        if key is not None:
+            if key in self._seen_keys:
+                return
+            self._seen_keys.add(key)
         if isinstance(event, UserText):
             if not self.user_prompt:
                 self.user_prompt = event.text

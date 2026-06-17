@@ -80,6 +80,65 @@ def test_accumulator_thinking_collected() -> None:
     assert acc.snapshot().thinking == "hmm let me think\n\nok got it"
 
 
+def test_accumulator_replay_is_idempotent() -> None:
+    """Re-ingesting the same events (truncation reset / forked-transcript swap)
+    must not double-count assistant text or tool calls."""
+    acc = TurnAccumulator()
+    events = [
+        UserText(uuid="u", timestamp="t", text="run X"),
+        AssistantThinking(uuid="a1", timestamp="t", text="thinking"),
+        AssistantText(uuid="a1", timestamp="t", text="reading file"),
+        ToolUse(
+            uuid="a1",
+            timestamp="t",
+            tool_use_id="t1",
+            tool_name="Read",
+            tool_input={"file_path": "/tmp/foo.py"},
+        ),
+        AssistantText(uuid="a2", timestamp="t", text="done"),
+    ]
+    for ev in events:
+        acc.ingest(ev)
+    # Full replay (e.g. reader reset to offset 0, or swap into a forked file).
+    for ev in events:
+        acc.ingest(ev)
+
+    snap = acc.snapshot()
+    assert snap.assistant_text == "reading file\n\ndone"
+    assert len(snap.tool_calls) == 1
+    assert snap.thinking == "thinking"
+
+
+def test_accumulator_keeps_distinct_events_sharing_one_record_uuid() -> None:
+    """One assistant record (one uuid) emits thinking + text + multiple
+    tool_use events — dedup must not collapse them to one."""
+    acc = TurnAccumulator()
+    acc.ingest(AssistantThinking(uuid="a1", timestamp="t", text="plan"))
+    acc.ingest(AssistantText(uuid="a1", timestamp="t", text="doing two reads"))
+    acc.ingest(
+        ToolUse(
+            uuid="a1",
+            timestamp="t",
+            tool_use_id="t1",
+            tool_name="Read",
+            tool_input={"file_path": "/a.py"},
+        )
+    )
+    acc.ingest(
+        ToolUse(
+            uuid="a1",
+            timestamp="t",
+            tool_use_id="t2",
+            tool_name="Read",
+            tool_input={"file_path": "/b.py"},
+        )
+    )
+    snap = acc.snapshot()
+    assert snap.thinking == "plan"
+    assert snap.assistant_text == "doing two reads"
+    assert len(snap.tool_calls) == 2, "two tool_use blocks in one record must both survive"
+
+
 def test_format_tool_call_known_tools() -> None:
     assert "Read" in format_tool_call("Read", {"file_path": "/a/b/foo.py"})
     assert "foo.py" in format_tool_call("Read", {"file_path": "/a/b/foo.py"})
