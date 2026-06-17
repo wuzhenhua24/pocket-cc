@@ -359,11 +359,23 @@ class TurnController:
         """
         pending = None
         with self._lock:
-            if found is not None and self._binding.transcript_path != found:
+            # mtime adoption is a *fallback* for when hooks aren't installed
+            # (session_id stays None). Once a SessionStart hook has bound this
+            # chat to a session, that hook is the sole authority on
+            # (re)binding — chasing mtime here would let a second Claude
+            # writing in the same cwd hijack the mirror or clobber the hook
+            # lock. /clear and /compact are followed via bind_session()
+            # instead. See M-④.
+            hook_managed = self._binding.session_id is not None
+            if (
+                not hook_managed
+                and found is not None
+                and self._binding.transcript_path != found
+            ):
                 self._binding.transcript_path = found
                 self._binding.transcript_reader = TranscriptReader(path=found)
                 logger.info(
-                    "transcript switched",
+                    "transcript adopted (mtime fallback, no hook)",
                     extra={"chat_id": self._binding.chat_id, "path": str(found)},
                 )
             reader = self._binding.transcript_reader
@@ -372,19 +384,30 @@ class TurnController:
         if pending is not None:
             pending[0].update(pending[1])
 
-    def lock_transcript(self, path: Path) -> bool:
-        """Lock the binding's transcript path (idempotent). Returns True if it
-        was just locked (so the caller can log), False if already set.
+    def bind_session(self, path: Path, session_id: str) -> str:
+        """(Re)bind this chat to the Claude session a SessionStart announced.
 
-        Called from the SessionStart hook to pin the transcript early, before
-        the poller's mtime heuristic would otherwise pick it up.
+        The SessionStart hook is authoritative: it fires from a real Claude
+        that already passed the dispatcher's cwd/exclude disambiguation, so
+        unlike the poller's mtime guess it can't be fooled by a concurrent
+        Claude in the same cwd. Recording ``session_id`` flips the binding
+        into hook-managed mode (see :meth:`poll_transcript`).
+
+        :returns: ``"locked"`` (first bind), ``"rebound"`` (a new session
+            after ``/clear`` / ``/compact``), ``"promoted"`` (same path the
+            poller already adopted, now hook-confirmed), or ``"noop"``.
         """
         with self._lock:
-            if self._binding.transcript_path is not None:
-                return False
-            self._binding.transcript_path = path
-            self._binding.transcript_reader = TranscriptReader(path=path)
-            return True
+            binding = self._binding
+            if binding.transcript_path == path:
+                promoted = binding.session_id is None
+                binding.session_id = session_id
+                return "promoted" if promoted else "noop"
+            outcome = "locked" if binding.transcript_path is None else "rebound"
+            binding.transcript_path = path
+            binding.transcript_reader = TranscriptReader(path=path)
+            binding.session_id = session_id
+            return outcome
 
     def drain_and_ingest(self) -> int:
         """Pull any pending transcript events into the accumulator (no render).

@@ -102,11 +102,51 @@ class HookEventsDispatcher:
     # --------------------------------------------------------- session_start
 
     def _handle_session_start(self, event: HookEvent) -> None:
-        """Attribute the event's transcript_path to a waiting binding and lock
-        it early (before the poller's mtime heuristic would catch it)."""
-        binding = self._match_waiting_binding(event)
+        """Attribute a SessionStart to its binding and (re)bind its transcript.
+
+        Two authoritative cases (the hook fires from a real Claude that passed
+        cwd/exclude disambiguation):
+          - **first bind** — an unbound binding in this cwd adopts the path;
+          - **rebind / promote** — an already-bound binding whose Claude
+            started a *new* session (``/clear`` / ``/compact``) switches to the
+            new path, or re-confirms the path the poller already adopted.
+        The rebind case is what lets the transcript poller stay off mtime
+        guessing (see :meth:`TurnController.poll_transcript`) without missing
+        ``/clear``.
+        """
+        binding = self._match_session_start_binding(event)
         if binding is not None and self._on_session_start is not None:
             self._on_session_start(binding, event)
+
+    def _match_session_start_binding(self, event: HookEvent) -> ChatBinding | None:
+        """Resolve the binding a SessionStart belongs to (first-bind or rebind).
+
+        First tries an unbound waiting binding (:meth:`_match_waiting_binding`).
+        Failing that, looks for the unique *already-bound* binding in the same
+        cwd whose Claude this new session belongs to. Ambiguity (no unique
+        bound binding in the cwd) → None, so two Claudes sharing a cwd never
+        cross-bind — strictly safer than the poller's old "swap to max mtime".
+        """
+        binding = self._match_waiting_binding(event)
+        if binding is not None:
+            return binding
+        if not event.transcript_path:
+            return None
+        target = Path(event.transcript_path)
+        candidates = [
+            b
+            for b in self._registry.all()
+            if b.transcript_path is not None
+            and _same_dir(b.cwd, event.cwd)
+            and target not in b.excluded_transcripts
+        ]
+        if len(candidates) > 1:
+            logger.info(
+                "SessionStart matched multiple bound bindings — not rebinding",
+                extra={"cwd": event.cwd, "count": len(candidates)},
+            )
+            return None
+        return candidates[0] if candidates else None
 
     def _match_waiting_binding(self, event: HookEvent) -> ChatBinding | None:
         """Find the unique waiting binding an event's transcript belongs to.

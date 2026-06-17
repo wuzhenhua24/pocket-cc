@@ -104,6 +104,14 @@ class ChatBinding:
     cwd: Path
     transcript_path: Path | None = None
     transcript_reader: TranscriptReader | None = None
+    # Claude session id (the `<uuid>` in `<uuid>.jsonl`) once a SessionStart
+    # hook has bound this chat to a concrete session. Non-None means the hook
+    # channel is authoritative for (re)binding — the transcript poller then
+    # stops guessing the active file by mtime, so a second Claude writing in
+    # the same cwd can neither hijack the mirror nor override the hook lock.
+    # Stays None in degraded mode (hooks not installed), where the poller's
+    # mtime adoption remains the only binding mechanism. See M-④.
+    session_id: str | None = None
     current_turn: TurnState | None = None
     # UNIX timestamp captured when the binding was created. The transcript
     # poller uses this as a `after_ts` cutoff so historical jsonls from

@@ -248,19 +248,42 @@ def test_session_start_locks_waiting_binding(tmp_path: Path) -> None:
     assert captured[0][1] == fresh
 
 
-def test_session_start_ignores_binding_already_locked(tmp_path: Path) -> None:
+def test_session_start_rebinds_already_bound_binding_after_clear(tmp_path: Path) -> None:
+    """A SessionStart with a *new* path for an already-bound binding in the
+    same cwd is our Claude starting a new session (/clear, /compact) — it must
+    rebind, so the poller (now off mtime) keeps following the session."""
     binding = _binding(cwd=tmp_path, transcript_path=tmp_path / "already-locked.jsonl")
     registry = Registry()
     registry.set(binding)
 
+    captured: list[tuple[ChatBinding, str]] = []
+    dispatcher = HookEventsDispatcher(
+        registry,
+        on_session_start=lambda b, e: captured.append((b, e.transcript_path)),
+    )
+    new_path = str(tmp_path / "different.jsonl")
+    dispatcher.dispatch(_event("SessionStart", transcript_path=new_path, cwd=str(tmp_path)))
+
+    assert len(captured) == 1
+    assert captured[0][0] is binding
+    assert captured[0][1] == new_path
+
+
+def test_session_start_does_not_rebind_when_multiple_bound_bindings_share_cwd(
+    tmp_path: Path,
+) -> None:
+    """Two bound Claudes in one cwd → a new SessionStart there is ambiguous;
+    refuse to rebind either rather than cross-bind to the wrong session."""
+    b1 = _binding(chat_id="oc_1", cwd=tmp_path, transcript_path=tmp_path / "one.jsonl")
+    b2 = _binding(chat_id="oc_2", cwd=tmp_path, transcript_path=tmp_path / "two.jsonl")
+    registry = Registry()
+    registry.set(b1)
+    registry.set(b2)
+
     captured: list[ChatBinding] = []
     dispatcher = HookEventsDispatcher(registry, on_session_start=lambda b, _e: captured.append(b))
     dispatcher.dispatch(
-        _event(
-            "SessionStart",
-            transcript_path=str(tmp_path / "different.jsonl"),
-            cwd=str(tmp_path),
-        )
+        _event("SessionStart", transcript_path=str(tmp_path / "three.jsonl"), cwd=str(tmp_path))
     )
 
     assert captured == []

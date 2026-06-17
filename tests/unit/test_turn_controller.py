@@ -488,3 +488,72 @@ def test_apply_pane_state_noop_without_turn(tmp_path: Path) -> None:
     # No current turn → must not raise.
     controller.apply_pane_state(_waiting("fp1"), "plan")
     assert binding.current_turn is None
+
+
+# ----------------------------------------------------- M-④ session binding
+
+
+def test_bind_session_locks_then_rebinds(tmp_path: Path) -> None:
+    binding = _binding(tmp_path)
+    controller = TurnController(binding=binding, lark=FakeLarkClient(), config=_config(tmp_path))
+
+    first = tmp_path / "sess-a.jsonl"
+    assert controller.bind_session(first, "sid-a") == "locked"
+    assert binding.transcript_path == first
+    assert binding.session_id == "sid-a"
+
+    # Same path re-announced (resume/duplicate) → noop, id unchanged.
+    assert controller.bind_session(first, "sid-a") == "noop"
+
+    # /clear → new session in the same cwd → rebind to a fresh reader.
+    second = tmp_path / "sess-b.jsonl"
+    assert controller.bind_session(second, "sid-b") == "rebound"
+    assert binding.transcript_path == second
+    assert binding.session_id == "sid-b"
+    assert binding.transcript_reader is not None
+    assert binding.transcript_reader.path == second
+
+
+def test_bind_session_promotes_mtime_adopted_path(tmp_path: Path) -> None:
+    """No-hooks startup adopts a path by mtime (session_id None); a later
+    SessionStart for that same path promotes it to hook-managed."""
+    binding = _binding(tmp_path)
+    controller = TurnController(binding=binding, lark=FakeLarkClient(), config=_config(tmp_path))
+
+    adopted = tmp_path / "live.jsonl"
+    controller.poll_transcript(adopted)  # mtime fallback adopts it
+    assert binding.transcript_path == adopted
+    assert binding.session_id is None  # not hook-managed yet
+
+    assert controller.bind_session(adopted, "sid-1") == "promoted"
+    assert binding.session_id == "sid-1"
+
+
+def test_poll_transcript_does_not_swap_once_hook_managed(tmp_path: Path) -> None:
+    """The crux of M-④: once a SessionStart hook has bound the session, the
+    poller must not chase a more-recent file from a concurrent same-cwd Claude."""
+    binding = _binding(tmp_path)
+    controller = TurnController(binding=binding, lark=FakeLarkClient(), config=_config(tmp_path))
+
+    ours = tmp_path / "ours.jsonl"
+    controller.bind_session(ours, "sid-ours")
+
+    # A different (e.g. desktop) Claude's transcript wins the mtime race.
+    other = tmp_path / "someone-else.jsonl"
+    controller.poll_transcript(other)
+
+    assert binding.transcript_path == ours, "hook-managed binding must ignore mtime winner"
+
+
+def test_poll_transcript_swaps_by_mtime_when_not_hook_managed(tmp_path: Path) -> None:
+    """Degraded mode (hooks not installed): the mtime fallback still adopts."""
+    binding = _binding(tmp_path)
+    controller = TurnController(binding=binding, lark=FakeLarkClient(), config=_config(tmp_path))
+
+    first = tmp_path / "first.jsonl"
+    controller.poll_transcript(first)
+    assert binding.transcript_path == first
+
+    second = tmp_path / "second.jsonl"
+    controller.poll_transcript(second)
+    assert binding.transcript_path == second

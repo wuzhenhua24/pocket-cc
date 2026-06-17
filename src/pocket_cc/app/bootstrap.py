@@ -438,15 +438,23 @@ class Pocketcc:
     # ---------------------------------------------------- hook event callbacks
 
     def _handle_session_start(self, binding: ChatBinding, event: HookEvent) -> None:
-        """SessionStart for our Claude — lock the transcript path so the
-        transcript poller doesn't need to guess via mtime + snapshot exclude."""
+        """SessionStart for our Claude — (re)bind the transcript path so the
+        poller follows the session authoritatively instead of guessing by
+        mtime (which a concurrent same-cwd Claude could hijack). Handles
+        first-bind and the /clear /compact rebind alike."""
         if not event.transcript_path:
             return
         path = Path(event.transcript_path)
-        if self._controller_for(binding).lock_transcript(path):
+        outcome = self._controller_for(binding).bind_session(path, event.session_id)
+        if outcome != "noop":
             logger.info(
-                "transcript locked via SessionStart hook",
-                extra={"chat_id": binding.chat_id, "path": str(path)},
+                "transcript %s via SessionStart hook",
+                outcome,
+                extra={
+                    "chat_id": binding.chat_id,
+                    "path": str(path),
+                    "session_id": event.session_id,
+                },
             )
 
     def _handle_stop(self, binding: ChatBinding, event: HookEvent) -> None:
