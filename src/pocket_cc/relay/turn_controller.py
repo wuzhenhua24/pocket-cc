@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from pocket_cc.app.persistence import TurnState
-from pocket_cc.claude.transcript import ModeChange, TranscriptReader
+from pocket_cc.claude.transcript import ModeChange, TranscriptReader, fork_prefix_offset
 from pocket_cc.lark.client import LarkApiError
 from pocket_cc.relay.card_renderer import (
     ROTATE_AT_CHARS,
@@ -404,8 +404,13 @@ class TurnController:
                 binding.session_id = session_id
                 return "promoted" if promoted else "noop"
             outcome = "locked" if binding.transcript_path is None else "rebound"
+            # On a rebind the new file may be a /branch /fork transcript that
+            # opens with the source conversation copied in — seek past that
+            # prefix so we don't replay it as new card content. /clear and
+            # /compact carry no fork marker, so this is 0 for them. See M-③.
+            start_offset = fork_prefix_offset(path) if outcome == "rebound" else 0
             binding.transcript_path = path
-            binding.transcript_reader = TranscriptReader(path=path)
+            binding.transcript_reader = TranscriptReader(path=path, byte_offset=start_offset)
             binding.session_id = session_id
             return outcome
 

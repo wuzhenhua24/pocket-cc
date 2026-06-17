@@ -557,3 +557,29 @@ def test_poll_transcript_swaps_by_mtime_when_not_hook_managed(tmp_path: Path) ->
     second = tmp_path / "second.jsonl"
     controller.poll_transcript(second)
     assert binding.transcript_path == second
+
+
+def test_bind_session_rebind_onto_fork_skips_copied_prefix(tmp_path: Path) -> None:
+    """M-③: rebinding onto a /branch transcript seeds the reader past the
+    copied source conversation so it isn't replayed as new card content."""
+    binding = _binding(tmp_path)
+    controller = TurnController(binding=binding, lark=FakeLarkClient(), config=_config(tmp_path))
+
+    # First session.
+    first = tmp_path / "sess-a.jsonl"
+    first.write_text("", encoding="utf-8")
+    controller.bind_session(first, "sid-a")
+
+    # /branch → new transcript opening with copied (forkedFrom) records.
+    fork = tmp_path / "sess-fork.jsonl"
+    copied = (
+        '{"type":"assistant","uuid":"old1","timestamp":"t","forkedFrom":{"sessionId":"sid-a"},'
+        '"message":{"role":"assistant","content":[{"type":"text","text":"COPIED"}]}}\n'
+    )
+    fork.write_text(copied, encoding="utf-8")
+
+    assert controller.bind_session(fork, "sid-fork") == "rebound"
+    reader = binding.transcript_reader
+    assert reader is not None
+    assert reader.byte_offset == len(copied.encode("utf-8"))
+    assert reader.read_new() == [], "copied prefix must not replay"

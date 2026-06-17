@@ -12,6 +12,7 @@ from pocket_cc.claude.transcript import (
     ToolUse,
     TranscriptReader,
     UserText,
+    fork_prefix_offset,
     parse_line,
     parse_record,
 )
@@ -458,3 +459,57 @@ def test_reader_skips_invalid_json_lines(tmp_path: Path) -> None:
     assert len(events) == 1
     assert isinstance(events[0], UserText)
     assert events[0].text == "ok"
+
+
+# ----------------------------------------------------- fork_prefix_offset (M-③)
+
+
+def _assistant_record(uuid: str, text: str, *, forked_from: str | None = None) -> str:
+    rec: dict[str, object] = {
+        "type": "assistant",
+        "uuid": uuid,
+        "timestamp": "t",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+    }
+    if forked_from is not None:
+        rec["forkedFrom"] = {"sessionId": forked_from}
+    return json.dumps(rec)
+
+
+def test_fork_prefix_offset_zero_for_missing_file(tmp_path: Path) -> None:
+    assert fork_prefix_offset(tmp_path / "nope.jsonl") == 0
+
+
+def test_fork_prefix_offset_zero_for_normal_session(tmp_path: Path) -> None:
+    """A /clear or /compact new session carries no forkedFrom — read from top."""
+    path = tmp_path / "fresh.jsonl"
+    path.write_text(
+        _assistant_record("a1", "hello") + "\n" + _assistant_record("a2", "world") + "\n",
+        encoding="utf-8",
+    )
+    assert fork_prefix_offset(path) == 0
+
+
+def test_fork_prefix_offset_skips_copied_prefix(tmp_path: Path) -> None:
+    """A fork transcript opens with forkedFrom-marked copied records; the seek
+    must land past them so a reader started there replays none of them."""
+    path = tmp_path / "fork.jsonl"
+    prefix = (
+        _assistant_record("old1", "OLD COPIED A", forked_from="src")
+        + "\n"
+        + _assistant_record("old2", "OLD COPIED B", forked_from="src")
+        + "\n"
+    )
+    path.write_text(prefix, encoding="utf-8")
+
+    offset = fork_prefix_offset(path)
+    assert offset == len(prefix.encode("utf-8"))
+
+    # A reader seeded at the fork offset sees nothing yet, then only the
+    # genuinely-new post-fork record once it is appended.
+    reader = TranscriptReader(path=path, byte_offset=offset)
+    assert reader.read_new() == []
+    with path.open("a", encoding="utf-8") as fp:
+        fp.write(_assistant_record("new1", "post-fork answer") + "\n")
+    events = reader.read_new()
+    assert [e.text for e in events] == ["post-fork answer"]

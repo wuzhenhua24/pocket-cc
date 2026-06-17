@@ -329,3 +329,50 @@ class TranscriptReader:
         """Forget read progress. Next `read_new()` re-parses from the top."""
         self.byte_offset = 0
         self.events_emitted = 0
+
+
+# Records to scan from the top when sniffing for a fork marker. A Claude
+# branch/fork transcript begins with the records copied from its source
+# session, so the marker is always near the start; 50 is ample headroom.
+_FORK_SCAN_LINES: Final[int] = 50
+
+
+def fork_prefix_offset(path: Path) -> int:
+    """Byte offset past a fork transcript's copied prefix, else 0.
+
+    A Claude ``/branch`` / ``/fork`` session starts a *new* transcript that
+    begins with the records copied from its source session (each marked with a
+    ``forkedFrom`` object), then diverges. A fresh :class:`TranscriptReader`
+    started at offset 0 would replay that whole copied conversation as if it
+    were new card content. Seeding the reader past the copied prefix avoids it.
+
+    The seek is deliberately gated on an actual ``forkedFrom`` marker: a normal
+    new session (``/clear``, ``/compact``) has none and returns 0, so it reads
+    from the top — and so we never risk skipping a genuine first turn that a
+    fast ``/clear`` follow-up may have already appended.
+
+    :param path: The new (forked) transcript JSONL path.
+    :returns: Offset of the last complete-line boundary when ``path`` is a fork
+        transcript (new post-fork records are appended after it); 0 for a
+        normal new session or when the file can't be read.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return 0
+    is_fork = False
+    for raw in data.splitlines()[:_FORK_SCAN_LINES]:
+        try:
+            record = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(record, dict) and isinstance(record.get("forkedFrom"), dict):
+            is_fork = True
+            break
+    if not is_fork:
+        return 0
+    # Start at the last complete line: skip everything copied into the fork so
+    # far. A partial trailing line (if Claude is mid-write) is left for the
+    # reader, which already tolerates incomplete lines.
+    last_newline = data.rfind(b"\n")
+    return last_newline + 1 if last_newline >= 0 else 0
